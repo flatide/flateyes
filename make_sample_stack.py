@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Generate a sample mip-map stack for testing tdviewer --stack.
+"""Generate a sample mip-map stack for testing flateyes --stack.
 
 Standard library only (no PIL), so it runs on the closed-network targets.
 Creates sample/level{1,2,3}.png (2000x2000, ppu 0.8/3.2/8.0) plus
@@ -132,7 +132,7 @@ def main(argv):
     with open(tds, "w") as out:
         out.write("\n".join(manifest) + "\n")
     print("wrote %s" % tds)
-    print("try: tdviewer --stack %s" % tds)
+    print("try: flateyes --stack %s" % tds)
     return 0
 
 

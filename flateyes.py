@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""tdviewer - minimal single-instance-per-display image viewer.
+"""flateyes - minimal single-instance-per-display image viewer.
 
 Designed for closed-network Linux hosts where only stock GNOME libraries
 (GTK3, GdkPixbuf, PyGObject) are available.
@@ -13,7 +13,7 @@ Behaviour:
     can be served at the same time.
 
 Usage:
-  DISPLAY=:1 tdviewer.py /path/to/image.jpg
+  DISPLAY=:1 flateyes.py /path/to/image.jpg
 """
 
 import errno
@@ -25,7 +25,7 @@ import sys
 import tempfile
 import time
 
-APP = "tdviewer"
+APP = "flateyes"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -305,10 +305,10 @@ class Viewer(object):
             widget.set_halign(Gtk.Align.START)
             widget.set_valign(Gtk.Align.START)
             widget.set_no_show_all(True)
-        self.ruler_label.set_name("tdviewer-ruler")
+        self.ruler_label.set_name("flateyes-ruler")
         css = Gtk.CssProvider()
         css.load_from_data(
-            b"#tdviewer-ruler { background-color: rgba(0,0,0,0.78);"
+            b"#flateyes-ruler { background-color: rgba(0,0,0,0.78);"
             b" color: #ffffff; padding: 2px 7px; border-radius: 3px;"
             b" font-weight: bold; }")
         self.ruler_label.get_style_context().add_provider(
