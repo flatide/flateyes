@@ -779,11 +779,16 @@ class Viewer(object):
         dist = math.hypot(end[0] - self.ruler_start[0],
                           end[1] - self.ruler_start[1])
         self.ruler_label.set_text(self.format_distance(dist))
+        # get_preferred_size includes the widget margins, and the margins
+        # hold the label's PREVIOUS position; measure the text alone or
+        # the label bounces between its spot and the top of the window.
         _, nat = self.ruler_label.get_preferred_size()
+        text_w = nat.width - self.ruler_label.get_margin_start()
+        text_h = nat.height - self.ruler_label.get_margin_top()
         x = (a[0] + b[0]) / 2 + 12
-        y = (a[1] + b[1]) / 2 - nat.height - 12
-        x = max(2, min(x, view.width - nat.width - 2))
-        y = max(2, min(y, view.height - nat.height - 2))
+        y = (a[1] + b[1]) / 2 - text_h - 12
+        x = max(2, min(x, view.width - text_w - 2))
+        y = max(2, min(y, view.height - text_h - 2))
         self.ruler_label.set_margin_start(int(x))
         self.ruler_label.set_margin_top(int(y))
         self.ruler_label.show()
