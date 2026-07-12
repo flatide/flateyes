@@ -49,6 +49,14 @@ DISPLAY=:1 tdviewer --legend /path/to/legend.png /path/to/image.jpg
 
 # ruler 환산 배율 지정: 3.2 픽셀 = 1 um
 DISPLAY=:1 tdviewer --ppu 3.2 /path/to/image.jpg
+
+# 다중 배율 스택(mip-map 방식) 표시
+DISPLAY=:1 tdviewer --stack /path/to/site.tds
+
+# 스택을 manifest 파일 없이 명령줄로 직접 구성
+DISPLAY=:1 tdviewer --level site_5x.png --ppu 0.8 \
+                    --level site_20x.png --ppu 3.2 \
+                    --level site_50x.png --ppu 8.0
 ```
 
 - 첫 실행: 해당 디스플레이에 창을 열고 계속 떠 있음 (백그라운드 상주).
@@ -75,6 +83,33 @@ DISPLAY=:1 tdviewer --ppu 3.2 /path/to/image.jpg
 - **PPU(pixels per unit)**: `--ppu` 옵션 또는 `p` 키 대화상자로 "1 단위 = 몇 픽셀"을 입력하면 `12.34 um  (307 px)` 형태로 환산 표시된다. 단위 이름은 `--unit`으로 변경 (기본 `um`). PPU를 지정하지 않으면 픽셀 거리만 표시된다.
 - PPU/단위는 창에 유지된다(sticky): 이후 요청에 `--ppu`가 없어도 마지막 값이 남고, 있으면 교체된다.
 
+### 다중 배율 스택 (mip-map)
+
+같은 지점을 여러 배율로 촬영한 이미지들을 하나의 세트로 보여준다. 확대할수록 더
+높은 배율(더 높은 PPU)의 이미지로 자동 전환되어 확대 정밀도가 올라간다.
+
+두 가지 방법으로 구성한다: `--stack`(`-s`)에 manifest 파일을 넘기거나, `--level IMG --ppu N [--center X,Y]`를 반복해서 명령줄로 직접 지정한다 (`--ppu`/`--center`는 직전 `--level`에 적용). manifest 파일은 한 줄에 `key=value` 하나씩:
+
+```
+# site.tds — 배율 순서는 무관 (ppu 기준으로 자동 정렬)
+unit=um
+level=site_5x.png      # 경로는 이 파일 위치 기준 상대경로 가능
+ppu=0.8                # 이 레벨의 pixels per um
+level=site_20x.png
+ppu=3.2
+level=site_50x.png
+ppu=8.0
+center=1.5,-2.0        # 선택: 촬영 중심이 미세하게 어긋난 경우 보정(um)
+```
+
+- 모든 레벨은 같은 중심을 공유한다고 가정하며(`center=`로 레벨별 보정 가능), 내부적으로 um 기준 공통 좌표계로 정합된다.
+- **레벨 자동 전환**: 확대/축소 시 뷰포트를 커버하면서 업스케일이 필요 없는 가장 낮은 배율 레벨을 선택한다. 전환 시 화면 중앙의 지점이 유지된다. 확대 위치가 고배율 이미지의 커버리지 밖(가장자리)이면 저배율 이미지를 계속 쓴다.
+- **다음 레벨 영역 표시**: 한 단계 높은 배율 레벨이 커버하는 영역이 하늘색 외곽선으로 표시된다 (최고 배율 레벨에서는 표시 없음). 외곽선 안쪽으로 확대하면 자동 전환된다. `o` 키로 토글할 수 있다.
+- 실효 최대 확대율은 "최고 배율 레벨의 200%"까지 커진다.
+- `[` / `]` 키로 이전/다음 배율 레벨의 100% 크기로 바로 이동할 수 있다.
+- **Ruler 연동**: 측정점이 um 좌표에 고정되므로 측정 도중 레벨이 바뀌어도 유지되고, 환산은 manifest의 ppu가 자동 적용된다 (`p` 입력 불필요). 타이틀에 활성 레벨 번호/파일/배율이 표시된다.
+- 레벨 이미지는 요청 시 전부 디코드된다 (2000x2000 3레벨 기준 약 50MB). 하나라도 실패하면 기존 화면이 유지된다.
+
 ### 런처(기존 eog 실행 프로그램)에서 호출
 
 eog를 호출하던 자리에 그대로 치환하면 된다. 첫 실행 프로세스는 창이 닫힐 때까지 살아 있으므로, 런처가 종료를 기다리지 않도록 분리 실행 권장:
@@ -96,8 +131,11 @@ sudo -u tduser DISPLAY=:1 XAUTHORITY=/home/tduser/.Xauthority \
 | `F11` | 전체 화면 토글 |
 | 방향키 / 휠 / 마우스 드래그 | 스크롤(패닝) |
 | `l` | 범례(legend) 표시/숨김 |
+| `o` | 다음 레벨 영역 외곽선 표시/숨김 |
+| `Tab` | 부가 표시 전체(legend·외곽선·측정 표시) 숨김/복원 — 개별 on/off 상태는 유지, `r`로 측정 시작 시 자동 복원 |
 | `r` | ruler 측정 모드 시작/종료 (`Shift` 자유 방향) |
-| `p` | PPU(pixels per unit) 입력 |
+| `p` | PPU(pixels per unit) 입력 (스택 모드에서는 manifest 값 사용) |
+| `[` / `]` | 스택 이전/다음 배율 레벨로 이동 |
 | `q` / `Esc` | 종료 (ruler 모드 중 `Esc`는 ruler만 종료) |
 
 ## 지원 포맷
