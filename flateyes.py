@@ -304,6 +304,33 @@ class HangulComposer(object):
         return self.preedit()
 
 
+class TextViewEditable(object):
+    """Entry-like facade over a Gtk.TextView for the hangul composer."""
+
+    def __init__(self, view):
+        self.buffer = view.get_buffer()
+
+    def get_text(self):
+        return self.buffer.get_text(self.buffer.get_start_iter(),
+                                    self.buffer.get_end_iter(), True)
+
+    def set_text(self, text):
+        self.buffer.set_text(text)
+
+    def get_position(self):
+        return self.buffer.get_property("cursor-position")
+
+    def set_position(self, position):
+        if position < 0:
+            where = self.buffer.get_end_iter()
+        else:
+            where = self.buffer.get_iter_at_offset(position)
+        self.buffer.place_cursor(where)
+
+    def delete_selection(self):
+        self.buffer.delete_selection(True, True)
+
+
 # ---------------------------------------------------------------------------
 # viewer window (GTK)
 # ---------------------------------------------------------------------------
@@ -494,7 +521,8 @@ class Viewer(object):
         self.anno_rev = 0           # bumped on add/remove for the key cache
         self.anno_drawn = None
         self.anno_font_size = 16    # last used text size (pt), sticky
-        self.anno_color_index = 0   # ","/"." cycle ANNO_COLORS
+        self.anno_text_bg = True    # translucent backdrop, sticky
+        self.anno_color_index = 0   # "c" cycles ANNO_COLORS
         self.anno_image = Gtk.Image()
         self.anno_image.set_halign(Gtk.Align.START)
         self.anno_image.set_valign(Gtk.Align.START)
@@ -1313,9 +1341,15 @@ class Viewer(object):
         dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
         dialog.add_button("OK", Gtk.ResponseType.OK)
         dialog.set_default_response(Gtk.ResponseType.OK)
-        entry = Gtk.Entry()
-        entry.set_width_chars(28)
-        entry.set_activates_default(True)
+        view = Gtk.TextView()
+        view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        editable = TextViewEditable(view)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC,
+                          Gtk.PolicyType.AUTOMATIC)
+        scroll.set_shadow_type(Gtk.ShadowType.IN)
+        scroll.set_size_request(340, 90)  # room for a few lines
+        scroll.add(view)
         spin = Gtk.SpinButton.new_with_range(6, 96, 1)
         spin.set_value(self.anno_font_size)
         # Built-in hangul input for hosts without an input method.
@@ -1324,38 +1358,57 @@ class Viewer(object):
                  "anchor": None}
         hangul.connect("toggled",
                        lambda *a: state["composer"].reset())
-        entry.connect("key-press-event", self.on_text_entry_key, state)
+
+        def on_view_key(widget, event):
+            name = Gdk.keyval_name(event.keyval)
+            if name in ("Return", "KP_Enter") and \
+                    event.state & Gdk.ModifierType.CONTROL_MASK:
+                dialog.response(Gtk.ResponseType.OK)  # plain Enter: new line
+                return True
+            return self.on_text_entry_key(editable, event, state)
+
+        view.connect("key-press-event", on_view_key)
+        bgcheck = Gtk.CheckButton(label="배경")
+        bgcheck.set_active(self.anno_text_bg)
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         row.pack_start(Gtk.Label(label="size (pt)"), False, False, 0)
         row.pack_start(spin, False, False, 0)
+        row.pack_start(bgcheck, False, False, 6)
         row.pack_start(hangul, False, False, 12)
+        hint = Gtk.Label()
+        hint.set_markup("<small>Enter: new line · Ctrl+Enter: OK</small>")
+        hint.set_halign(Gtk.Align.START)
         box = dialog.get_content_area()
         box.set_border_width(10)
         box.set_spacing(6)
-        box.pack_start(entry, False, False, 0)
+        box.pack_start(scroll, True, True, 0)
         box.pack_start(row, False, False, 0)
+        box.pack_start(hint, False, False, 0)
         dialog.show_all()
         confirmed = dialog.run() == Gtk.ResponseType.OK
-        text = entry.get_text().strip()
+        text = editable.get_text().strip()
         size = int(spin.get_value())
+        bg = bgcheck.get_active()
         dialog.destroy()
         if not confirmed or not text:
             return
         self.anno_font_size = size
-        self.add_text_annotation(point, text, size, self.anno_color())
+        self.anno_text_bg = bg
+        self.add_text_annotation(point, text, size, self.anno_color(), bg)
         self.anno_undo.append(("add", self.annotations[-1], None))
         self.update_anno_overlay()
         self.save_annotations()
 
-    def add_text_annotation(self, point, text, size, color):
+    def add_text_annotation(self, point, text, size, color, bg=True):
         label = Gtk.Label()
         label.set_halign(Gtk.Align.START)
         label.set_valign(Gtk.Align.START)
         label.set_no_show_all(True)
         label.set_markup('<span font="%d" foreground="%s">%s</span>'
                          % (size, color, GLib.markup_escape_text(text)))
-        label.get_style_context().add_provider(
-            self.anno_css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        if bg:
+            label.get_style_context().add_provider(
+                self.anno_css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.overlay.add_overlay(label)
         try:
             self.overlay.set_overlay_pass_through(label, True)
@@ -1363,7 +1416,7 @@ class Viewer(object):
             pass
         self.annotations.append({"kind": "text", "at": point,
                                  "text": text, "size": size,
-                                 "color": color, "label": label})
+                                 "color": color, "bg": bg, "label": label})
         self.anno_rev += 1
 
     def on_text_entry_key(self, entry, event, state):
@@ -1487,9 +1540,11 @@ class Viewer(object):
         for anno in self.annotations:
             color = anno.get("color", self.ANNO_COLORS[0])
             if anno["kind"] == "text":
-                lines.append("text=%.10g,%.10g,%d,%s,%s"
+                lines.append("text=%.10g,%.10g,%d,%s,%d,%s"
                              % (anno["at"][0], anno["at"][1],
-                                anno["size"], color, anno["text"]))
+                                anno["size"], color,
+                                1 if anno.get("bg", True) else 0,
+                                self.escape_meta(anno["text"])))
             else:
                 lines.append("%s=%.10g,%.10g,%.10g,%.10g,%s"
                              % (anno["kind"], anno["a"][0], anno["a"][1],
@@ -1532,12 +1587,14 @@ class Viewer(object):
                     continue
                 try:
                     if key == "text":
-                        x, y, size, color, text = value.split(",", 4)
+                        x, y, size, color, bg, text = value.split(",", 5)
+                        text = self.unescape_meta(text)
                         if text:
                             self.add_text_annotation(
                                 (float(x), float(y)), text,
                                 max(6, min(int(size), 96)),
-                                self.parse_color(color))
+                                self.parse_color(color),
+                                bg=(bg.strip() != "0"))
                     elif key in ("box", "ellipse", "line"):
                         ax, ay, bx, by, color = value.split(",", 4)
                         self.annotations.append({
@@ -1554,6 +1611,28 @@ class Viewer(object):
             self.show_toast("%d annotation%s restored"
                             % (len(self.annotations),
                                "" if len(self.annotations) == 1 else "s"))
+
+    @staticmethod
+    def escape_meta(text):
+        """Keep multi-line texts on one metadata line."""
+        return text.replace("\\", "\\\\").replace("\n", "\\n")
+
+    @staticmethod
+    def unescape_meta(text):
+        out, i = [], 0
+        while i < len(text):
+            if text[i] == "\\" and i + 1 < len(text):
+                if text[i + 1] == "n":
+                    out.append("\n")
+                    i += 2
+                    continue
+                if text[i + 1] == "\\":
+                    out.append("\\")
+                    i += 2
+                    continue
+            out.append(text[i])
+            i += 1
+        return "".join(out)
 
     @staticmethod
     def parse_color(text):
