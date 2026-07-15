@@ -1473,13 +1473,11 @@ class Viewer(object):
             self.apply_help_visibility()
             self.apply_legend_visibility()
             self.update_hint_overlay()
-        elif key == "Escape":
+        elif key == "Escape":  # leaves tool modes only; quitting is "q"
             if self.ruler_active:
                 self.set_ruler_active(False)
             elif self.anno_tool is not None:
                 self.set_anno_tool(None)
-            else:
-                Gtk.main_quit()
         elif key in ("r", "R"):
             self.set_ruler_active(not self.ruler_active)
         elif key in ("b", "B"):
@@ -1788,7 +1786,7 @@ def usage(stream):
         "      b/e box/ellipse (Shift = square/circle),\n"
         "      l line (Shift = horizontal/vertical/45), t text,\n"
         "      BackSpace remove last annotation,\n"
-        "      c copy the visible view to the clipboard, q/Esc quit\n"
+        "      c copy the visible view to the clipboard, q quit\n"
         % (APP, APP, APP))
 
 
