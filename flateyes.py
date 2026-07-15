@@ -236,11 +236,14 @@ class Viewer(object):
     HINT_CASING = 0x00000090     # next-level coverage outline
     HINT_CORE = 0x33BBFFFF
     DRAG_SLOP = 4                # px: press-release within this is a click
+    ANNO_CASING = 0x000000A0     # shape annotation outline
+    ANNO_CORE = 0xFF5040FF       # shape annotation core / text color
     HELP_KEYS = (("+/-", "zoom"), ("0", "1:1"), ("f", "fit"),
                  ("Enter", "full"), ("drag", "pan"), ("Ctrl+wheel", "zoom"),
-                 ("r", "ruler"), ("p", "PPU"), ("l", "legend"),
-                 ("o", "outline"), ("[/]", "level"), ("Tab", "hide"),
-                 ("q", "quit"))
+                 ("r", "ruler"), ("b/e", "shape"), ("t", "text"),
+                 ("BkSp", "undo"), ("c", "copy"), ("p", "PPU"),
+                 ("l", "legend"), ("o", "outline"), ("[/]", "level"),
+                 ("Tab", "hide"), ("q", "quit"))
 
     def __init__(self, server_sock, first_path, first_legend=None,
                  ppu=None, unit=None, stack=False, levels=None):
@@ -330,6 +333,15 @@ class Viewer(object):
         self.help_label.set_justify(Gtk.Justification.CENTER)
         self.help_label.set_no_show_all(True)
 
+        # Transient feedback message (e.g. after copying to the clipboard).
+        self.toast_timeout = None
+        self.toast_label = Gtk.Label()
+        self.toast_label.set_name("flateyes-toast")
+        self.toast_label.set_halign(Gtk.Align.CENTER)
+        self.toast_label.set_valign(Gtk.Align.END)
+        self.toast_label.set_margin_bottom(24)
+        self.toast_label.set_no_show_all(True)
+
         css = Gtk.CssProvider()
         css.load_from_data(
             b"#flateyes-ruler { background-color: rgba(0,0,0,0.78);"
@@ -337,10 +349,31 @@ class Viewer(object):
             b" font-weight: bold; }"
             b"#flateyes-help { background-color: rgba(0,0,0,0.6);"
             b" color: #f0f0f0; padding: 2px 9px; border-radius: 4px;"
-            b" font-size: 11px; }")
-        for widget in (self.ruler_label, self.help_label):
+            b" font-size: 11px; }"
+            b"#flateyes-toast { background-color: rgba(0,0,0,0.78);"
+            b" color: #ffffff; padding: 4px 12px; border-radius: 4px; }")
+        for widget in (self.ruler_label, self.help_label, self.toast_label):
             widget.get_style_context().add_provider(
                 css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        # Annotations: boxes/ellipses stamped into one viewport-sized
+        # overlay pixbuf, texts as Pango labels; all anchored in world
+        # coordinates like the ruler.
+        self.anno_tool = None       # "box" | "ellipse" | "text"
+        self.anno_start = None      # first corner (world)
+        self.anno_cursor = None     # preview corner (world)
+        self.annotations = []       # committed shapes and texts
+        self.anno_rev = 0           # bumped on add/remove for the key cache
+        self.anno_drawn = None
+        self.anno_font_size = 16    # last used text size (pt), sticky
+        self.anno_image = Gtk.Image()
+        self.anno_image.set_halign(Gtk.Align.START)
+        self.anno_image.set_valign(Gtk.Align.START)
+        self.anno_image.set_no_show_all(True)
+        self.anno_css = Gtk.CssProvider()
+        self.anno_css.load_from_data(
+            b"label { background-color: rgba(0,0,0,0.35);"
+            b" padding: 0px 3px; border-radius: 2px; }")
+
         for adj in (self.scroll.get_hadjustment(),
                     self.scroll.get_vadjustment()):
             adj.connect("value-changed",
@@ -362,11 +395,14 @@ class Viewer(object):
         self.overlay.add(self.scroll)
         self.overlay.add_overlay(self.legend_frame)
         self.overlay.add_overlay(self.hint_image)
+        self.overlay.add_overlay(self.anno_image)
         self.overlay.add_overlay(self.ruler_line)
         self.overlay.add_overlay(self.ruler_label)
         self.overlay.add_overlay(self.help_label)
-        for child in (self.legend_frame, self.hint_image,
-                      self.ruler_line, self.ruler_label, self.help_label):
+        self.overlay.add_overlay(self.toast_label)
+        for child in (self.legend_frame, self.hint_image, self.anno_image,
+                      self.ruler_line, self.ruler_label, self.help_label,
+                      self.toast_label):
             try:
                 # Let clicks/wheel over the overlays fall through to the image.
                 self.overlay.set_overlay_pass_through(child, True)
@@ -470,6 +506,7 @@ class Viewer(object):
         if unit is not None:
             self.unit = unit
         self.set_ruler_active(False)
+        self.clear_annotations()
         self.legend_pixbuf = legend_pixbuf
         self.legend_rendered = None
         if legend_pixbuf is not None:
@@ -494,8 +531,11 @@ class Viewer(object):
     def set_initial_size(self):
         max_w, max_h = [int(v * 0.9) for v in workarea_size()]
         img_w, img_h = self.image_size()
-        self.window.set_default_size(max(min(img_w + 4, max_w), 320),
-                                     max(min(img_h + 4, max_h), 240))
+        # Follow the image's aspect ratio so the window opens without
+        # large empty margins on either axis.
+        scale = min(float(max_w) / img_w, float(max_h) / img_h, 1.0)
+        self.window.set_default_size(max(int(img_w * scale) + 4, 320),
+                                     max(int(img_h * scale) + 4, 240))
 
     # -- scaling -----------------------------------------------------------
 
@@ -706,6 +746,35 @@ class Viewer(object):
             self.legend_image.set_from_pixbuf(self.legend_pixbuf.scale_simple(
                 width, height, GdkPixbuf.InterpType.BILINEAR))
 
+    def copy_view_to_clipboard(self):
+        """Copy the visible viewport, overlays included, to the clipboard."""
+        win = self.window.get_window()
+        if win is None:
+            return
+        alloc = self.overlay.get_allocation()
+        pixbuf = Gdk.pixbuf_get_from_window(win, alloc.x, alloc.y,
+                                            alloc.width, alloc.height)
+        if pixbuf is None:
+            self.show_toast("copy failed")
+            return
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clipboard.set_image(pixbuf)
+        clipboard.store()
+        self.show_toast("copied  %dx%d" % (pixbuf.get_width(),
+                                           pixbuf.get_height()))
+
+    def show_toast(self, text):
+        self.toast_label.set_text(text)
+        self.toast_label.show()
+        if self.toast_timeout is not None:
+            GLib.source_remove(self.toast_timeout)
+        self.toast_timeout = GLib.timeout_add(1500, self.hide_toast)
+
+    def hide_toast(self):
+        self.toast_timeout = None
+        self.toast_label.hide()
+        return False
+
     def apply_help_visibility(self):
         if self.aux_visible:
             self.help_label.show()
@@ -728,13 +797,17 @@ class Viewer(object):
     def set_ruler_active(self, active):
         if active and self.pixbuf is None:
             return  # animations are shown unscaled and unmeasured
+        if active and self.anno_tool is not None:
+            self.anno_tool = None   # tools are exclusive
+            self.anno_start = self.anno_cursor = None
+            self.update_anno_overlay()
         if active and not self.aux_visible:
             self.aux_visible = True  # measuring needs the overlays back
             self.apply_legend_visibility()
             self.apply_help_visibility()
         self.ruler_active = active
         self.ruler_start = self.ruler_end = self.ruler_cursor = None
-        self.set_viewport_cursor("crosshair" if active else None)
+        self.set_viewport_cursor(self.tool_cursor())
         self.update_view_overlays()
 
     def event_to_image_px(self, event):
@@ -897,6 +970,180 @@ class Viewer(object):
     def update_view_overlays(self):
         self.update_ruler_overlay()
         self.update_hint_overlay()
+        self.update_anno_overlay()
+
+    # -- shape/text annotations ------------------------------------------
+
+    def set_anno_tool(self, tool):
+        if tool is not None and self.pixbuf is None:
+            return  # animations are shown unscaled and unannotated
+        if tool is not None:
+            if self.ruler_active:   # tools are exclusive
+                self.ruler_active = False
+                self.ruler_start = self.ruler_end = self.ruler_cursor = None
+                self.update_ruler_overlay()
+            if not self.aux_visible:
+                self.aux_visible = True  # annotating needs the overlays back
+                self.apply_legend_visibility()
+                self.apply_help_visibility()
+        self.anno_tool = tool
+        self.anno_start = self.anno_cursor = None
+        self.set_viewport_cursor(self.tool_cursor())
+        self.update_view_overlays()
+
+    def constrain_corner(self, point, state):
+        """Shift constrains the shape to a square / circle."""
+        if not state & Gdk.ModifierType.SHIFT_MASK:
+            return point
+        ax, ay = self.anno_start
+        side = max(abs(point[0] - ax), abs(point[1] - ay))
+        return (ax + (side if point[0] >= ax else -side),
+                ay + (side if point[1] >= ay else -side))
+
+    def update_anno_overlay(self):
+        texts = [x for x in self.annotations if x["kind"] == "text"]
+        shapes = [x for x in self.annotations if x["kind"] != "text"]
+        preview = None
+        if self.anno_tool in ("box", "ellipse") \
+                and self.anno_start is not None \
+                and self.anno_cursor is not None:
+            preview = {"kind": self.anno_tool, "a": self.anno_start,
+                       "b": self.anno_cursor}
+        if not self.aux_visible or self.rendered_size is None \
+                or not (shapes or preview or texts):
+            self.anno_drawn = None
+            self.anno_image.hide()
+            for anno in texts:
+                anno["label"].hide()
+            return
+        view = self.scroll.get_allocation()
+        # The image allocation belongs in the key: right after a zoom/fit
+        # change the overlays are drawn once against the STALE allocation,
+        # and without it the corrected layout pass would hit the cache and
+        # leave annotations displaced.
+        img_alloc = self.image.get_allocation()
+        key = (self.anno_rev,
+               preview and (preview["a"], preview["b"]),
+               self.scroll.get_hadjustment().get_value(),
+               self.scroll.get_vadjustment().get_value(),
+               self.scale_shown, self.level_index, self.rendered_size,
+               img_alloc.width, img_alloc.height,
+               view.width, view.height)
+        if key == self.anno_drawn:
+            return  # also breaks the redraw->allocate->redraw cycle
+        self.anno_drawn = key
+        buf = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8,
+                                   max(view.width, 1), max(view.height, 1))
+        buf.fill(0x00000000)
+        for shape in shapes:
+            self.stamp_annotation(buf, shape)
+        if preview is not None:
+            self.stamp_annotation(buf, preview)
+        for anno in texts:
+            x, y = self.image_px_to_view(self.px_from_world(anno["at"]))
+            if -20 <= x <= view.width and -10 <= y <= view.height:
+                anno["label"].set_margin_start(int(max(0, x)))
+                anno["label"].set_margin_top(int(max(0, y)))
+                anno["label"].show()
+            else:
+                anno["label"].hide()
+        self.anno_image.set_from_pixbuf(buf)
+        self.anno_image.set_margin_start(0)
+        self.anno_image.set_margin_top(0)
+        self.anno_image.show()
+
+    def stamp_annotation(self, buf, shape):
+        a = self.image_px_to_view(self.px_from_world(shape["a"]))
+        b = self.image_px_to_view(self.px_from_world(shape["b"]))
+        x0, x1 = sorted((a[0], b[0]))
+        y0, y1 = sorted((a[1], b[1]))
+        if shape["kind"] == "box":
+            for width, rgba in ((3, self.ANNO_CASING), (1, self.ANNO_CORE)):
+                off = width // 2
+                self.fill_rect(buf, x0 - off, y0 - off,
+                               x1 - x0 + width, width, rgba)   # top
+                self.fill_rect(buf, x0 - off, y1 - off,
+                               x1 - x0 + width, width, rgba)   # bottom
+                self.fill_rect(buf, x0 - off, y0 - off,
+                               width, y1 - y0 + width, rgba)   # left
+                self.fill_rect(buf, x1 - off, y0 - off,
+                               width, y1 - y0 + width, rgba)   # right
+            return
+        # ellipse: dense square dabs along the perimeter
+        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        rx, ry = (x1 - x0) / 2.0, (y1 - y0) / 2.0
+        steps = min(max(int(3.2 * max(rx, ry)), 16), 4000)
+        points = [(cx + rx * math.cos(2 * math.pi * i / steps),
+                   cy + ry * math.sin(2 * math.pi * i / steps))
+                  for i in range(steps)]
+        for x, y in points:
+            self.fill_rect(buf, x - 1, y - 1, 3, 3, self.ANNO_CASING)
+        for x, y in points:
+            self.fill_rect(buf, x, y, 1, 1, self.ANNO_CORE)
+
+    def ask_annotation_text(self, point):
+        dialog = Gtk.Dialog(title="Text", transient_for=self.window,
+                            modal=True)
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("OK", Gtk.ResponseType.OK)
+        dialog.set_default_response(Gtk.ResponseType.OK)
+        entry = Gtk.Entry()
+        entry.set_width_chars(28)
+        entry.set_activates_default(True)
+        spin = Gtk.SpinButton.new_with_range(6, 96, 1)
+        spin.set_value(self.anno_font_size)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        row.pack_start(Gtk.Label(label="size (pt)"), False, False, 0)
+        row.pack_start(spin, False, False, 0)
+        box = dialog.get_content_area()
+        box.set_border_width(10)
+        box.set_spacing(6)
+        box.pack_start(entry, False, False, 0)
+        box.pack_start(row, False, False, 0)
+        dialog.show_all()
+        confirmed = dialog.run() == Gtk.ResponseType.OK
+        text = entry.get_text().strip()
+        size = int(spin.get_value())
+        dialog.destroy()
+        if not confirmed or not text:
+            return
+        self.anno_font_size = size
+        label = Gtk.Label()
+        label.set_halign(Gtk.Align.START)
+        label.set_valign(Gtk.Align.START)
+        label.set_no_show_all(True)
+        label.set_markup('<span font="%d" foreground="#FF5040">%s</span>'
+                         % (size, GLib.markup_escape_text(text)))
+        label.get_style_context().add_provider(
+            self.anno_css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self.overlay.add_overlay(label)
+        try:
+            self.overlay.set_overlay_pass_through(label, True)
+        except AttributeError:  # GTK < 3.18
+            pass
+        self.annotations.append({"kind": "text", "at": point,
+                                 "text": text, "size": size, "label": label})
+        self.anno_rev += 1
+        self.update_anno_overlay()
+
+    def remove_last_annotation(self):
+        if not self.annotations:
+            return
+        anno = self.annotations.pop()
+        if anno["kind"] == "text":
+            self.overlay.remove(anno["label"])
+        self.anno_rev += 1
+        self.update_anno_overlay()
+
+    def clear_annotations(self):
+        for anno in self.annotations:
+            if anno["kind"] == "text":
+                self.overlay.remove(anno["label"])
+        self.annotations = []
+        self.anno_rev += 1
+        self.anno_tool = None
+        self.anno_start = self.anno_cursor = None
+        self.update_anno_overlay()
 
     def update_hint_overlay(self):
         """Outline the area the next magnification level covers."""
@@ -990,10 +1237,23 @@ class Viewer(object):
         elif key == "Escape":
             if self.ruler_active:
                 self.set_ruler_active(False)
+            elif self.anno_tool is not None:
+                self.set_anno_tool(None)
             else:
                 Gtk.main_quit()
         elif key in ("r", "R"):
             self.set_ruler_active(not self.ruler_active)
+        elif key in ("b", "B"):
+            self.set_anno_tool(None if self.anno_tool == "box" else "box")
+        elif key in ("e", "E"):
+            self.set_anno_tool(None if self.anno_tool == "ellipse"
+                               else "ellipse")
+        elif key in ("t", "T"):
+            self.set_anno_tool(None if self.anno_tool == "text" else "text")
+        elif key in ("BackSpace", "Delete"):
+            self.remove_last_annotation()
+        elif key in ("c", "C"):  # plain c and Ctrl+C both land here
+            self.copy_view_to_clipboard()
         elif key in ("p", "P"):
             if not self.stack_mode:  # stack ppu comes from the manifest
                 self.ask_ppu()
@@ -1080,8 +1340,7 @@ class Viewer(object):
                     abs(event.x_root - x0) + abs(event.y_root - y0) \
                     > self.DRAG_SLOP:
                 self.drag_panned = True  # crossed the click/drag threshold
-                if self.ruler_active:
-                    self.set_viewport_cursor("grabbing")
+                self.set_viewport_cursor("grabbing")
             if self.drag_panned:
                 self.scroll.get_hadjustment().set_value(
                     h0 - (event.x_root - x0))
@@ -1095,6 +1354,14 @@ class Viewer(object):
                     self.ruler_cursor = self.snap_point(point, event.state)
                     self.update_ruler_overlay()
             return True
+        if self.anno_tool is not None:
+            if self.anno_tool != "text" and self.anno_start is not None:
+                point = self.event_to_world(event)
+                if point is not None:
+                    self.anno_cursor = self.constrain_corner(point,
+                                                             event.state)
+                    self.update_anno_overlay()
+            return True
         return False
 
     def on_button_release(self, widget, event):
@@ -1103,20 +1370,42 @@ class Viewer(object):
         self.drag_origin = None
         panned = self.drag_panned
         self.drag_panned = False
-        if not self.ruler_active:
+        if not self.ruler_active and self.anno_tool is None:
             self.set_viewport_cursor(None)
             return True
-        self.set_viewport_cursor("crosshair")
-        if not panned:  # a click, not a pan: place a point where released
-            point = self.event_to_world(event)
-            if point is not None:
-                if self.ruler_start is None or self.ruler_end is not None:
-                    self.ruler_start = point       # start a new measurement
-                    self.ruler_end = self.ruler_cursor = None
-                else:
-                    self.ruler_end = self.snap_point(point, event.state)
-                self.update_ruler_overlay()
+        self.set_viewport_cursor(self.tool_cursor())
+        if panned:
+            return True
+        point = self.event_to_world(event)  # a click places a point
+        if point is None:
+            return True
+        if self.ruler_active:
+            if self.ruler_start is None or self.ruler_end is not None:
+                self.ruler_start = point           # start a new measurement
+                self.ruler_end = self.ruler_cursor = None
+            else:
+                self.ruler_end = self.snap_point(point, event.state)
+            self.update_ruler_overlay()
+        elif self.anno_tool == "text":
+            self.ask_annotation_text(point)
+        elif self.anno_start is None:
+            self.anno_start = point                # first corner
+            self.anno_cursor = None
+        else:
+            self.annotations.append({
+                "kind": self.anno_tool, "a": self.anno_start,
+                "b": self.constrain_corner(point, event.state)})
+            self.anno_rev += 1
+            self.anno_start = self.anno_cursor = None
+            self.update_anno_overlay()
         return True
+
+    def tool_cursor(self):
+        """Cursor for the active tool, or None for the default pointer."""
+        if self.ruler_active:
+            return "crosshair"
+        return {"box": "cell", "ellipse": "cell",
+                "text": "text"}.get(self.anno_tool)
 
     def set_viewport_cursor(self, name):
         win = self.scroll.get_window()
@@ -1128,7 +1417,9 @@ class Viewer(object):
             cursor = Gdk.Cursor.new_from_name(display, name)
             if cursor is None:  # theme without named cursors
                 fallback = {"grabbing": Gdk.CursorType.FLEUR,
-                            "crosshair": Gdk.CursorType.CROSSHAIR}[name]
+                            "crosshair": Gdk.CursorType.CROSSHAIR,
+                            "cell": Gdk.CursorType.PLUS,
+                            "text": Gdk.CursorType.XTERM}[name]
                 cursor = Gdk.Cursor.new_for_display(display, fallback)
         win.set_cursor(cursor)
 
@@ -1253,7 +1544,10 @@ def usage(stream):
         "keys: +/- zoom, 0 actual size, f fit, Enter/F11 fullscreen,\n"
         "      Ctrl+wheel zoom, drag to pan, l legend, o next-level outline,\n"
         "      Tab all overlays on/off, [/] stack level, p set PPU,\n"
-        "      r ruler (Shift = free angle, Esc ends), q/Esc quit\n"
+        "      r ruler (Shift = free angle, Esc ends),\n"
+        "      b/e box/ellipse (Shift = square/circle), t text,\n"
+        "      BackSpace remove last annotation,\n"
+        "      c copy the visible view to the clipboard, q/Esc quit\n"
         % (APP, APP, APP))
 
 
