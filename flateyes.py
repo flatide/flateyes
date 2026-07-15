@@ -195,6 +195,115 @@ def parse_stack_file(path):
 
 
 # ---------------------------------------------------------------------------
+# built-in dubeolsik hangul composer
+# ---------------------------------------------------------------------------
+
+class HangulComposer(object):
+    """Composes hangul syllables from dubeolsik key strokes.
+
+    The closed-network hosts usually run the viewer through sudo/setsid
+    launchers without an input method connection, so GTK entries cannot
+    compose hangul on their own.  This is a minimal stand-in: feed() takes
+    one compatibility jamo and returns (committed, preedit) where
+    committed is finalized text and preedit is the syllable still being
+    composed (always the trailing characters of the entry).
+    """
+
+    KEYMAP = {
+        "q": "ㅂ", "w": "ㅈ", "e": "ㄷ", "r": "ㄱ", "t": "ㅅ",
+        "y": "ㅛ", "u": "ㅕ", "i": "ㅑ", "o": "ㅐ", "p": "ㅔ",
+        "a": "ㅁ", "s": "ㄴ", "d": "ㅇ", "f": "ㄹ", "g": "ㅎ",
+        "h": "ㅗ", "j": "ㅓ", "k": "ㅏ", "l": "ㅣ",
+        "z": "ㅋ", "x": "ㅌ", "c": "ㅊ", "v": "ㅍ", "b": "ㅠ",
+        "n": "ㅜ", "m": "ㅡ",
+        "Q": "ㅃ", "W": "ㅉ", "E": "ㄸ", "R": "ㄲ", "T": "ㅆ",
+        "O": "ㅒ", "P": "ㅖ",
+    }
+    CONSONANTS = set("ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ")
+    LEADS = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ"
+    VOWEL_ORDER = "ㅏㅐㅑㅒㅓㅔㅕㅖㅗㅘㅙㅚㅛㅜㅝㅞㅟㅠㅡㅢㅣ"
+    TAIL_ORDER = "ㄱㄲㄳㄴㄵㄶㄷㄹㄺㄻㄼㄽㄾㄿㅀㅁㅂㅄㅅㅆㅇㅈㅊㅋㅌㅍㅎ"
+    VOWEL_COMBO = {("ㅗ", "ㅏ"): "ㅘ", ("ㅗ", "ㅐ"): "ㅙ", ("ㅗ", "ㅣ"): "ㅚ",
+                   ("ㅜ", "ㅓ"): "ㅝ", ("ㅜ", "ㅔ"): "ㅞ", ("ㅜ", "ㅣ"): "ㅟ",
+                   ("ㅡ", "ㅣ"): "ㅢ"}
+    TAIL_COMBO = {("ㄱ", "ㅅ"): "ㄳ", ("ㄴ", "ㅈ"): "ㄵ", ("ㄴ", "ㅎ"): "ㄶ",
+                  ("ㄹ", "ㄱ"): "ㄺ", ("ㄹ", "ㅁ"): "ㄻ", ("ㄹ", "ㅂ"): "ㄼ",
+                  ("ㄹ", "ㅅ"): "ㄽ", ("ㄹ", "ㅌ"): "ㄾ", ("ㄹ", "ㅍ"): "ㄿ",
+                  ("ㄹ", "ㅎ"): "ㅀ", ("ㅂ", "ㅅ"): "ㅄ"}
+    TAIL_SPLIT = dict((v, k) for k, v in TAIL_COMBO.items())
+    VOWEL_SPLIT = dict((v, k[0]) for k, v in VOWEL_COMBO.items())
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.lead = self.vowel = self.tail = ""
+
+    def pending(self):
+        return bool(self.lead or self.vowel)
+
+    def preedit(self):
+        if not self.vowel:
+            return self.lead
+        if not self.lead:
+            return self.vowel
+        code = 0xAC00 + (self.LEADS.index(self.lead) * 21
+                         + self.VOWEL_ORDER.index(self.vowel)) * 28
+        if self.tail:
+            code += self.TAIL_ORDER.index(self.tail) + 1
+        return chr(code)
+
+    def feed(self, jamo):
+        if jamo in self.CONSONANTS:
+            if not self.lead and not self.vowel:
+                self.lead = jamo
+                return "", self.preedit()
+            if self.lead and not self.vowel:
+                out = self.preedit()      # lone consonant: emit as jamo
+                self.lead = jamo
+                return out, self.preedit()
+            if self.lead and not self.tail and jamo in self.TAIL_ORDER:
+                self.tail = jamo
+                return "", self.preedit()
+            if self.tail:
+                combo = self.TAIL_COMBO.get((self.tail, jamo))
+                if combo:
+                    self.tail = combo
+                    return "", self.preedit()
+            out = self.preedit()
+            self.lead, self.vowel, self.tail = jamo, "", ""
+            return out, self.preedit()
+        # vowel
+        if self.tail:
+            # the (last part of the) tail becomes the next syllable's lead
+            keep, move = self.TAIL_SPLIT.get(self.tail, ("", self.tail))
+            self.tail = keep
+            out = self.preedit()
+            self.lead, self.vowel, self.tail = move, jamo, ""
+            return out, self.preedit()
+        if self.vowel:
+            combo = self.VOWEL_COMBO.get((self.vowel, jamo))
+            if combo:
+                self.vowel = combo
+                return "", self.preedit()
+            out = self.preedit()
+            self.lead, self.vowel, self.tail = "", jamo, ""
+            return out, self.preedit()
+        self.vowel = jamo
+        return "", self.preedit()
+
+    def backspace(self):
+        """Removes one component; returns the remaining preedit text."""
+        if self.tail:
+            self.tail = self.TAIL_SPLIT.get(self.tail, ("", ""))[0]
+        elif self.vowel:
+            self.vowel = self.VOWEL_SPLIT.get(self.vowel, "")
+        else:
+            self.lead = ""
+        return self.preedit()
+
+
+# ---------------------------------------------------------------------------
 # viewer window (GTK)
 # ---------------------------------------------------------------------------
 
@@ -1092,9 +1201,16 @@ class Viewer(object):
         entry.set_activates_default(True)
         spin = Gtk.SpinButton.new_with_range(6, 96, 1)
         spin.set_value(self.anno_font_size)
+        # Built-in hangul input for hosts without an input method.
+        hangul = Gtk.CheckButton(label="한글 (Shift+Space)")
+        state = {"composer": HangulComposer(), "check": hangul}
+        hangul.connect("toggled",
+                       lambda *a: state["composer"].reset())
+        entry.connect("key-press-event", self.on_text_entry_key, state)
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         row.pack_start(Gtk.Label(label="size (pt)"), False, False, 0)
         row.pack_start(spin, False, False, 0)
+        row.pack_start(hangul, False, False, 12)
         box = dialog.get_content_area()
         box.set_border_width(10)
         box.set_spacing(6)
@@ -1125,6 +1241,46 @@ class Viewer(object):
                                  "text": text, "size": size, "label": label})
         self.anno_rev += 1
         self.update_anno_overlay()
+
+    def on_text_entry_key(self, entry, event, state):
+        """Hangul composition for the annotation text entry."""
+        name = Gdk.keyval_name(event.keyval)
+        shift = event.state & Gdk.ModifierType.SHIFT_MASK
+        if name in ("Hangul", "Hangul_Hanja") or (name == "space" and shift):
+            state["check"].set_active(not state["check"].get_active())
+            return True
+        if not state["check"].get_active():
+            return False
+        if event.state & (Gdk.ModifierType.CONTROL_MASK |
+                          Gdk.ModifierType.MOD1_MASK):
+            return False  # keep shortcuts like Ctrl+A/C/V working
+        composer = state["composer"]
+        if name == "BackSpace":
+            if not composer.pending():
+                return False
+            old_len = len(composer.preedit())
+            self.entry_apply(entry, old_len, "", composer.backspace())
+            return True
+        code = Gdk.keyval_to_unicode(event.keyval)
+        char = chr(code) if code else ""
+        jamo = HangulComposer.KEYMAP.get(char) \
+            or HangulComposer.KEYMAP.get(char.lower())
+        if jamo is None:
+            composer.reset()  # syllable done; the entry handles the key
+            return False
+        old_len = len(composer.preedit())
+        committed, preedit = composer.feed(jamo)
+        self.entry_apply(entry, old_len, committed, preedit)
+        return True
+
+    @staticmethod
+    def entry_apply(entry, old_preedit_len, committed, preedit):
+        """Rewrite the entry tail: composition happens at the text end."""
+        text = entry.get_text()
+        if old_preedit_len:
+            text = text[:-old_preedit_len]
+        entry.set_text(text + committed + preedit)
+        entry.set_position(-1)
 
     def remove_last_annotation(self):
         if not self.annotations:
