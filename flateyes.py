@@ -235,6 +235,12 @@ class Viewer(object):
     RULER_CORE = 0xFFD819FF      # guide line core
     HINT_CASING = 0x00000090     # next-level coverage outline
     HINT_CORE = 0x33BBFFFF
+    DRAG_SLOP = 4                # px: press-release within this is a click
+    HELP_KEYS = (("+/-", "zoom"), ("0", "1:1"), ("f", "fit"),
+                 ("Enter", "full"), ("drag", "pan"), ("Ctrl+wheel", "zoom"),
+                 ("r", "ruler"), ("p", "PPU"), ("l", "legend"),
+                 ("o", "outline"), ("[/]", "level"), ("Tab", "hide"),
+                 ("q", "quit"))
 
     def __init__(self, server_sock, first_path, first_legend=None,
                  ppu=None, unit=None, stack=False, levels=None):
@@ -283,6 +289,7 @@ class Viewer(object):
         self.scroll.connect("button-release-event", self.on_button_release)
         self.scroll.connect("size-allocate", self.on_size_allocate)
         self.drag_origin = None
+        self.drag_panned = False
         self.rescale_pending = None
         self.image.connect("size-allocate", self.on_image_allocate)
 
@@ -306,13 +313,34 @@ class Viewer(object):
             widget.set_valign(Gtk.Align.START)
             widget.set_no_show_all(True)
         self.ruler_label.set_name("flateyes-ruler")
+
+        # Key help strip along the top edge; keys colored like the ruler
+        # so they stand apart from the descriptions.
+        self.help_label = Gtk.Label()
+        self.help_label.set_markup(" · ".join(
+            '<span foreground="#ffd819" weight="bold">%s</span> %s' % pair
+            for pair in self.HELP_KEYS))
+        self.help_label.set_name("flateyes-help")
+        self.help_label.set_halign(Gtk.Align.CENTER)
+        self.help_label.set_valign(Gtk.Align.START)
+        self.help_label.set_margin_top(8)
+        self.help_label.set_margin_start(8)
+        self.help_label.set_margin_end(8)
+        self.help_label.set_line_wrap(True)
+        self.help_label.set_justify(Gtk.Justification.CENTER)
+        self.help_label.set_no_show_all(True)
+
         css = Gtk.CssProvider()
         css.load_from_data(
             b"#flateyes-ruler { background-color: rgba(0,0,0,0.78);"
             b" color: #ffffff; padding: 2px 7px; border-radius: 3px;"
-            b" font-weight: bold; }")
-        self.ruler_label.get_style_context().add_provider(
-            css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            b" font-weight: bold; }"
+            b"#flateyes-help { background-color: rgba(0,0,0,0.6);"
+            b" color: #f0f0f0; padding: 2px 9px; border-radius: 4px;"
+            b" font-size: 11px; }")
+        for widget in (self.ruler_label, self.help_label):
+            widget.get_style_context().add_provider(
+                css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         for adj in (self.scroll.get_hadjustment(),
                     self.scroll.get_vadjustment()):
             adj.connect("value-changed",
@@ -336,8 +364,9 @@ class Viewer(object):
         self.overlay.add_overlay(self.hint_image)
         self.overlay.add_overlay(self.ruler_line)
         self.overlay.add_overlay(self.ruler_label)
+        self.overlay.add_overlay(self.help_label)
         for child in (self.legend_frame, self.hint_image,
-                      self.ruler_line, self.ruler_label):
+                      self.ruler_line, self.ruler_label, self.help_label):
             try:
                 # Let clicks/wheel over the overlays fall through to the image.
                 self.overlay.set_overlay_pass_through(child, True)
@@ -354,6 +383,7 @@ class Viewer(object):
 
         self.set_initial_size()
         self.window.show_all()
+        self.apply_help_visibility()
 
         GLib.io_add_watch(server_sock.fileno(), GLib.IO_IN, self.on_incoming)
         for signum in (signal.SIGINT, signal.SIGTERM):
@@ -676,6 +706,12 @@ class Viewer(object):
             self.legend_image.set_from_pixbuf(self.legend_pixbuf.scale_simple(
                 width, height, GdkPixbuf.InterpType.BILINEAR))
 
+    def apply_help_visibility(self):
+        if self.aux_visible:
+            self.help_label.show()
+        else:
+            self.help_label.hide()
+
     def apply_legend_visibility(self):
         if self.legend_pixbuf is not None and self.legend_enabled \
                 and self.aux_visible:
@@ -695,6 +731,7 @@ class Viewer(object):
         if active and not self.aux_visible:
             self.aux_visible = True  # measuring needs the overlays back
             self.apply_legend_visibility()
+            self.apply_help_visibility()
         self.ruler_active = active
         self.ruler_start = self.ruler_end = self.ruler_cursor = None
         self.set_viewport_cursor("crosshair" if active else None)
@@ -779,6 +816,9 @@ class Viewer(object):
         dist = math.hypot(end[0] - self.ruler_start[0],
                           end[1] - self.ruler_start[1])
         self.ruler_label.set_text(self.format_distance(dist))
+        # Show before measuring: hidden widgets report a zero preferred
+        # size, which would wreck the position after a Tab off/on cycle.
+        self.ruler_label.show()
         # get_preferred_size includes the widget margins, and the margins
         # hold the label's PREVIOUS position; measure the text alone or
         # the label bounces between its spot and the top of the window.
@@ -791,7 +831,6 @@ class Viewer(object):
         y = max(2, min(y, view.height - text_h - 2))
         self.ruler_label.set_margin_start(int(x))
         self.ruler_label.set_margin_top(int(y))
-        self.ruler_label.show()
 
     def draw_ruler_line(self, a, b, view):
         """Render line + end markers into a transparent pixbuf covering
@@ -962,9 +1001,9 @@ class Viewer(object):
             self.set_view_scale(self.current_view_scale() * self.ZOOM_STEP)
         elif key in ("minus", "KP_Subtract"):
             self.set_view_scale(self.current_view_scale() / self.ZOOM_STEP)
-        elif key in ("1", "KP_1"):
+        elif key in ("0", "KP_0"):
             self.set_view_scale(self.active_level()["ppu"])
-        elif key in ("f", "0", "KP_0"):
+        elif key in ("f", "F"):
             self.fit_mode = True
             if self.level_index != 0:
                 self.level_index = 0
@@ -989,8 +1028,10 @@ class Viewer(object):
         elif key == "Tab":
             self.aux_visible = not self.aux_visible
             self.apply_legend_visibility()
+            self.apply_help_visibility()
             self.update_view_overlays()
-        elif key == "F11":
+        elif key in ("F11", "Return", "KP_Enter"):
+            # Enter as well: remote/VNC clients often swallow F11.
             state = self.window.get_window().get_state() if self.window.get_window() else 0
             if state & Gdk.WindowState.FULLSCREEN:
                 self.window.unfullscreen()
@@ -1021,7 +1062,52 @@ class Viewer(object):
     def on_button_press(self, widget, event):
         if event.button != 1 or event.type != Gdk.EventType.BUTTON_PRESS:
             return False
+        # Dragging pans in BOTH modes; the ruler places its point on the
+        # release of a motionless click, so measuring and panning coexist.
+        # Root coordinates stay stable while the adjustments move underneath.
+        self.drag_origin = (event.x_root, event.y_root,
+                            self.scroll.get_hadjustment().get_value(),
+                            self.scroll.get_vadjustment().get_value())
+        self.drag_panned = False
+        if not self.ruler_active:
+            self.set_viewport_cursor("grabbing")
+        return True
+
+    def on_motion(self, widget, event):
+        if self.drag_origin is not None:
+            x0, y0, h0, v0 = self.drag_origin
+            if not self.drag_panned and \
+                    abs(event.x_root - x0) + abs(event.y_root - y0) \
+                    > self.DRAG_SLOP:
+                self.drag_panned = True  # crossed the click/drag threshold
+                if self.ruler_active:
+                    self.set_viewport_cursor("grabbing")
+            if self.drag_panned:
+                self.scroll.get_hadjustment().set_value(
+                    h0 - (event.x_root - x0))
+                self.scroll.get_vadjustment().set_value(
+                    v0 - (event.y_root - y0))
+            return True
         if self.ruler_active:
+            if self.ruler_start is not None and self.ruler_end is None:
+                point = self.event_to_world(event)
+                if point is not None:
+                    self.ruler_cursor = self.snap_point(point, event.state)
+                    self.update_ruler_overlay()
+            return True
+        return False
+
+    def on_button_release(self, widget, event):
+        if event.button != 1 or self.drag_origin is None:
+            return False
+        self.drag_origin = None
+        panned = self.drag_panned
+        self.drag_panned = False
+        if not self.ruler_active:
+            self.set_viewport_cursor(None)
+            return True
+        self.set_viewport_cursor("crosshair")
+        if not panned:  # a click, not a pan: place a point where released
             point = self.event_to_world(event)
             if point is not None:
                 if self.ruler_start is None or self.ruler_end is not None:
@@ -1030,50 +1116,6 @@ class Viewer(object):
                 else:
                     self.ruler_end = self.snap_point(point, event.state)
                 self.update_ruler_overlay()
-            return True
-        # Root coordinates stay stable while the adjustments move underneath.
-        self.drag_origin = (event.x_root, event.y_root,
-                            self.scroll.get_hadjustment().get_value(),
-                            self.scroll.get_vadjustment().get_value())
-        self.set_viewport_cursor("grabbing")
-        return True
-
-    def on_motion(self, widget, event):
-        if self.ruler_active:
-            if self.ruler_start is not None and self.ruler_end is None:
-                point = self.event_to_world(event)
-                if point is not None:
-                    self.ruler_cursor = self.snap_point(point, event.state)
-                    self.update_ruler_overlay()
-            return True
-        if self.drag_origin is None:
-            return False
-        x0, y0, h0, v0 = self.drag_origin
-        self.scroll.get_hadjustment().set_value(h0 - (event.x_root - x0))
-        self.scroll.get_vadjustment().set_value(v0 - (event.y_root - y0))
-        return True
-
-    def on_button_release(self, widget, event):
-        if event.button != 1:
-            return False
-        if self.ruler_active:
-            # press-drag-release measures in one gesture; a click in place
-            # keeps the live preview until the second click
-            if self.ruler_start is not None and self.ruler_end is None:
-                point = self.event_to_world(event)
-                screen_per_world = self.scale_shown \
-                    * self.active_level()["ppu"]
-                if point is not None and \
-                        (abs(point[0] - self.ruler_start[0]) +
-                         abs(point[1] - self.ruler_start[1])) \
-                        * screen_per_world > 5:
-                    self.ruler_end = self.snap_point(point, event.state)
-                    self.update_ruler_overlay()
-            return True
-        if self.drag_origin is None:
-            return False
-        self.drag_origin = None
-        self.set_viewport_cursor(None)
         return True
 
     def set_viewport_cursor(self, name):
@@ -1208,7 +1250,7 @@ def usage(stream):
         "  --center X,Y              center offset in units of the last\n"
         "                            --level, for misaligned captures\n"
         "\n"
-        "keys: +/- zoom, 1 actual size, f/0 fit to window, F11 fullscreen,\n"
+        "keys: +/- zoom, 0 actual size, f fit, Enter/F11 fullscreen,\n"
         "      Ctrl+wheel zoom, drag to pan, l legend, o next-level outline,\n"
         "      Tab all overlays on/off, [/] stack level, p set PPU,\n"
         "      r ruler (Shift = free angle, Esc ends), q/Esc quit\n"
