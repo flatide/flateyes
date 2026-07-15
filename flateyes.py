@@ -349,10 +349,10 @@ class Viewer(object):
     ANNO_CORE = 0xFF5040FF       # shape annotation core / text color
     HELP_KEYS = (("+/-", "zoom"), ("0", "1:1"), ("f", "fit"),
                  ("Enter", "full"), ("drag", "pan"), ("Ctrl+wheel", "zoom"),
-                 ("r", "ruler"), ("b/e", "shape"), ("t", "text"),
+                 ("r", "ruler"), ("b/e/l", "shape"), ("t", "text"),
                  ("BkSp", "undo"), ("c", "copy"), ("p", "PPU"),
-                 ("l", "legend"), ("o", "outline"), ("[/]", "level"),
-                 ("Tab", "hide"), ("q", "quit"))
+                 ("o", "outline"), ("[/]", "level"), ("q", "info"),
+                 ("Tab", "drawings"), ("Esc", "quit"))
 
     def __init__(self, server_sock, first_path, first_legend=None,
                  ppu=None, unit=None, stack=False, levels=None):
@@ -374,10 +374,11 @@ class Viewer(object):
         self.level_index = 0
         self.view_scale = 1.0
         self.pending_center = None  # world point to re-center on after render
-        # Overlay visibility: per-element switches plus a master switch
-        # (Tab) that hides everything without losing the per-element state.
-        self.aux_visible = True     # Tab
-        self.legend_enabled = True  # "l"
+        # Overlay visibility, two groups: "q" toggles the info overlays
+        # (help strip, legend, next-level outline), Tab the drawing
+        # overlays (ruler, annotations).  "o" keeps its own switch.
+        self.info_visible = True    # "q"
+        self.draw_visible = True    # Tab
         self.hint_enabled = True    # "o"
 
         self.window = Gtk.Window(title=APP)
@@ -622,7 +623,6 @@ class Viewer(object):
             self.render_legend()
         else:
             self.legend_image.clear()
-        self.legend_enabled = True  # a new request always shows its legend
         self.apply_legend_visibility()
         if self.pixbuf is not None:
             self.rescale()
@@ -885,14 +885,13 @@ class Viewer(object):
         return False
 
     def apply_help_visibility(self):
-        if self.aux_visible:
+        if self.info_visible:
             self.help_label.show()
         else:
             self.help_label.hide()
 
     def apply_legend_visibility(self):
-        if self.legend_pixbuf is not None and self.legend_enabled \
-                and self.aux_visible:
+        if self.legend_pixbuf is not None and self.info_visible:
             self.legend_image.show()
             self.legend_frame.show()
         else:
@@ -910,10 +909,8 @@ class Viewer(object):
             self.anno_tool = None   # tools are exclusive
             self.anno_start = self.anno_cursor = None
             self.update_anno_overlay()
-        if active and not self.aux_visible:
-            self.aux_visible = True  # measuring needs the overlays back
-            self.apply_legend_visibility()
-            self.apply_help_visibility()
+        if active and not self.draw_visible:
+            self.draw_visible = True  # measuring needs its overlays back
         self.ruler_active = active
         self.ruler_start = self.ruler_end = self.ruler_cursor = None
         self.set_viewport_cursor(self.tool_cursor())
@@ -974,7 +971,7 @@ class Viewer(object):
                 wy - self.scroll.get_vadjustment().get_value())
 
     def update_ruler_overlay(self):
-        if not self.ruler_active or not self.aux_visible \
+        if not self.ruler_active or not self.draw_visible \
                 or self.ruler_start is None or self.rendered_size is None:
             self.ruler_drawn = None
             self.ruler_line.hide()
@@ -1091,34 +1088,38 @@ class Viewer(object):
                 self.ruler_active = False
                 self.ruler_start = self.ruler_end = self.ruler_cursor = None
                 self.update_ruler_overlay()
-            if not self.aux_visible:
-                self.aux_visible = True  # annotating needs the overlays back
-                self.apply_legend_visibility()
-                self.apply_help_visibility()
+            if not self.draw_visible:
+                self.draw_visible = True  # drawing needs its overlays back
         self.anno_tool = tool
         self.anno_start = self.anno_cursor = None
         self.set_viewport_cursor(self.tool_cursor())
         self.update_view_overlays()
 
     def constrain_corner(self, point, state):
-        """Shift constrains the shape to a square / circle."""
+        """Shift constrains: square/circle for shapes, 0/45/90 for lines."""
         if not state & Gdk.ModifierType.SHIFT_MASK:
             return point
         ax, ay = self.anno_start
-        side = max(abs(point[0] - ax), abs(point[1] - ay))
-        return (ax + (side if point[0] >= ax else -side),
-                ay + (side if point[1] >= ay else -side))
+        dx, dy = point[0] - ax, point[1] - ay
+        if self.anno_tool == "line":
+            if abs(dx) > 2 * abs(dy):
+                return (point[0], ay)        # horizontal
+            if abs(dy) > 2 * abs(dx):
+                return (ax, point[1])        # vertical
+        side = max(abs(dx), abs(dy))         # square/circle/45-degree line
+        return (ax + (side if dx >= 0 else -side),
+                ay + (side if dy >= 0 else -side))
 
     def update_anno_overlay(self):
         texts = [x for x in self.annotations if x["kind"] == "text"]
         shapes = [x for x in self.annotations if x["kind"] != "text"]
         preview = None
-        if self.anno_tool in ("box", "ellipse") \
+        if self.anno_tool in ("box", "ellipse", "line") \
                 and self.anno_start is not None \
                 and self.anno_cursor is not None:
             preview = {"kind": self.anno_tool, "a": self.anno_start,
                        "b": self.anno_cursor}
-        if not self.aux_visible or self.rendered_size is None \
+        if not self.draw_visible or self.rendered_size is None \
                 or not (shapes or preview or texts):
             self.anno_drawn = None
             self.anno_image.hide()
@@ -1164,6 +1165,31 @@ class Viewer(object):
     def stamp_annotation(self, buf, shape):
         a = self.image_px_to_view(self.px_from_world(shape["a"]))
         b = self.image_px_to_view(self.px_from_world(shape["b"]))
+        if shape["kind"] == "line":
+            ax, ay = a
+            bx, by = b
+            if ay == by:    # horizontal
+                self.fill_rect(buf, min(ax, bx), ay - 1,
+                               abs(bx - ax) + 1, 3, self.ANNO_CASING)
+                self.fill_rect(buf, min(ax, bx), ay,
+                               abs(bx - ax) + 1, 1, self.ANNO_CORE)
+            elif ax == bx:  # vertical
+                self.fill_rect(buf, ax - 1, min(ay, by),
+                               3, abs(by - ay) + 1, self.ANNO_CASING)
+                self.fill_rect(buf, ax, min(ay, by),
+                               1, abs(by - ay) + 1, self.ANNO_CORE)
+            else:           # free angle: dense square dabs
+                steps = min(int(max(abs(bx - ax), abs(by - ay)) / 2) + 1,
+                            4000)
+                points = [(ax + (bx - ax) * i / steps,
+                           ay + (by - ay) * i / steps)
+                          for i in range(steps + 1)]
+                for x, y in points:
+                    self.fill_rect(buf, x - 1, y - 1, 3, 3,
+                                   self.ANNO_CASING)
+                for x, y in points:
+                    self.fill_rect(buf, x, y, 1, 1, self.ANNO_CORE)
+            return
         x0, x1 = sorted((a[0], b[0]))
         y0, y1 = sorted((a[1], b[1]))
         if shape["kind"] == "box":
@@ -1304,7 +1330,7 @@ class Viewer(object):
     def update_hint_overlay(self):
         """Outline the area the next magnification level covers."""
         if not self.stack_mode or not self.hint_enabled \
-                or not self.aux_visible or self.rendered_size is None \
+                or not self.info_visible or self.rendered_size is None \
                 or self.level_index >= len(self.levels) - 1:
             self.hint_drawn = None
             self.hint_image.hide()
@@ -1388,8 +1414,11 @@ class Viewer(object):
 
     def on_key(self, widget, event):
         key = Gdk.keyval_name(event.keyval)
-        if key in ("q", "Q"):
-            Gtk.main_quit()
+        if key in ("q", "Q"):  # info overlays: help, legend, level outline
+            self.info_visible = not self.info_visible
+            self.apply_help_visibility()
+            self.apply_legend_visibility()
+            self.update_hint_overlay()
         elif key == "Escape":
             if self.ruler_active:
                 self.set_ruler_active(False)
@@ -1406,6 +1435,8 @@ class Viewer(object):
                                else "ellipse")
         elif key in ("t", "T"):
             self.set_anno_tool(None if self.anno_tool == "text" else "text")
+        elif key in ("l", "L"):
+            self.set_anno_tool(None if self.anno_tool == "line" else "line")
         elif key in ("BackSpace", "Delete"):
             self.remove_last_annotation()
         elif key in ("c", "C"):  # plain c and Ctrl+C both land here
@@ -1433,18 +1464,12 @@ class Viewer(object):
                 target = min(max(self.level_index + step, 0),
                              len(self.levels) - 1)
                 self.set_view_scale(self.levels[target]["ppu"])
-        elif key in ("l", "L"):
-            if self.legend_pixbuf is not None:
-                self.legend_enabled = not self.legend_enabled
-                self.apply_legend_visibility()
         elif key in ("o", "O"):
             if self.stack_mode:
                 self.hint_enabled = not self.hint_enabled
                 self.update_hint_overlay()
-        elif key == "Tab":
-            self.aux_visible = not self.aux_visible
-            self.apply_legend_visibility()
-            self.apply_help_visibility()
+        elif key == "Tab":  # drawing overlays: ruler, annotations, outline
+            self.draw_visible = not self.draw_visible
             self.update_view_overlays()
         elif key in ("F11", "Return", "KP_Enter"):
             # Enter as well: remote/VNC clients often swallow F11.
@@ -1560,7 +1585,7 @@ class Viewer(object):
         """Cursor for the active tool, or None for the default pointer."""
         if self.ruler_active:
             return "crosshair"
-        return {"box": "cell", "ellipse": "cell",
+        return {"box": "cell", "ellipse": "cell", "line": "cell",
                 "text": "text"}.get(self.anno_tool)
 
     def set_viewport_cursor(self, name):
@@ -1698,12 +1723,15 @@ def usage(stream):
         "                            --level, for misaligned captures\n"
         "\n"
         "keys: +/- zoom, 0 actual size, f fit, Enter/F11 fullscreen,\n"
-        "      Ctrl+wheel zoom, drag to pan, l legend, o next-level outline,\n"
-        "      Tab all overlays on/off, [/] stack level, p set PPU,\n"
+        "      Ctrl+wheel zoom, drag to pan, o next-level outline,\n"
+        "      q info overlays (help/legend/outline) on/off,\n"
+        "      Tab drawing overlays (ruler/annotations) on/off,\n"
+        "      [/] stack level, p set PPU,\n"
         "      r ruler (Shift = free angle, Esc ends),\n"
-        "      b/e box/ellipse (Shift = square/circle), t text,\n"
+        "      b/e box/ellipse (Shift = square/circle),\n"
+        "      l line (Shift = horizontal/vertical/45), t text,\n"
         "      BackSpace remove last annotation,\n"
-        "      c copy the visible view to the clipboard, q/Esc quit\n"
+        "      c copy the visible view to the clipboard, Esc quit\n"
         % (APP, APP, APP))
 
 
