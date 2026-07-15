@@ -1229,7 +1229,8 @@ class Viewer(object):
         spin.set_value(self.anno_font_size)
         # Built-in hangul input for hosts without an input method.
         hangul = Gtk.CheckButton(label="한글 (Shift+Space)")
-        state = {"composer": HangulComposer(), "check": hangul}
+        state = {"composer": HangulComposer(), "check": hangul,
+                 "anchor": None}
         hangul.connect("toggled",
                        lambda *a: state["composer"].reset())
         entry.connect("key-press-event", self.on_text_entry_key, state)
@@ -1277,15 +1278,27 @@ class Viewer(object):
             return True
         if not state["check"].get_active():
             return False
+        composer = state["composer"]
         if event.state & (Gdk.ModifierType.CONTROL_MASK |
                           Gdk.ModifierType.MOD1_MASK):
-            return False  # keep shortcuts like Ctrl+A/C/V working
-        composer = state["composer"]
+            composer.reset()  # keep shortcuts like Ctrl+A/C/V working
+            state["anchor"] = None
+            return False
+        # A cursor that left the end of the preedit span (click, arrow
+        # keys, ...) finishes that syllable; composition then restarts
+        # wherever the cursor now is.
+        if composer.pending() and entry.get_position() != \
+                state["anchor"] + len(composer.preedit()):
+            composer.reset()
+            state["anchor"] = None
         if name == "BackSpace":
             if not composer.pending():
                 return False
             old_len = len(composer.preedit())
-            self.entry_apply(entry, old_len, "", composer.backspace())
+            self.entry_replace(entry, state["anchor"], old_len,
+                               composer.backspace())
+            if not composer.pending():
+                state["anchor"] = None
             return True
         code = Gdk.keyval_to_unicode(event.keyval)
         char = chr(code) if code else ""
@@ -1293,20 +1306,26 @@ class Viewer(object):
             or HangulComposer.KEYMAP.get(char.lower())
         if jamo is None:
             composer.reset()  # syllable done; the entry handles the key
+            state["anchor"] = None
             return False
-        old_len = len(composer.preedit())
+        if not composer.pending():
+            entry.delete_selection()  # type over a selection, like an IME
+            state["anchor"] = entry.get_position()
+            old_len = 0
+        else:
+            old_len = len(composer.preedit())
         committed, preedit = composer.feed(jamo)
-        self.entry_apply(entry, old_len, committed, preedit)
+        self.entry_replace(entry, state["anchor"], old_len,
+                           committed + preedit)
+        state["anchor"] += len(committed)
         return True
 
     @staticmethod
-    def entry_apply(entry, old_preedit_len, committed, preedit):
-        """Rewrite the entry tail: composition happens at the text end."""
+    def entry_replace(entry, anchor, old_len, new):
+        """Replace the preedit span at anchor, cursor after it."""
         text = entry.get_text()
-        if old_preedit_len:
-            text = text[:-old_preedit_len]
-        entry.set_text(text + committed + preedit)
-        entry.set_position(-1)
+        entry.set_text(text[:anchor] + new + text[anchor + old_len:])
+        entry.set_position(anchor + len(new))
 
     def remove_last_annotation(self):
         if not self.annotations:
