@@ -351,8 +351,8 @@ class Viewer(object):
                  ("Enter", "full"), ("drag", "pan"), ("Ctrl+wheel", "zoom"),
                  ("r", "ruler"), ("b/e/l", "shape"), ("t", "text"),
                  ("BkSp", "undo"), ("c", "copy"), ("p", "PPU"),
-                 ("o", "outline"), ("[/]", "level"), ("q", "info"),
-                 ("Tab", "drawings"), ("Esc", "quit"))
+                 ("o", "outline"), ("[/]", "level"), ("i", "info"),
+                 ("Tab", "drawings"), ("q", "quit"))
 
     def __init__(self, server_sock, first_path, first_legend=None,
                  ppu=None, unit=None, stack=False, levels=None):
@@ -374,10 +374,10 @@ class Viewer(object):
         self.level_index = 0
         self.view_scale = 1.0
         self.pending_center = None  # world point to re-center on after render
-        # Overlay visibility, two groups: "q" toggles the info overlays
+        # Overlay visibility, two groups: "i" toggles the info overlays
         # (help strip, legend, next-level outline), Tab the drawing
         # overlays (ruler, annotations).  "o" keeps its own switch.
-        self.info_visible = True    # "q"
+        self.info_visible = True    # "i"
         self.draw_visible = True    # Tab
         self.hint_enabled = True    # "o"
 
@@ -443,6 +443,16 @@ class Viewer(object):
         self.help_label.set_justify(Gtk.Justification.CENTER)
         self.help_label.set_no_show_all(True)
 
+        # Scale/size/ppu status readout at the bottom-left corner, so the
+        # window title only needs to fit the (possibly long) file name.
+        self.status_label = Gtk.Label()
+        self.status_label.set_name("flateyes-status")
+        self.status_label.set_halign(Gtk.Align.START)
+        self.status_label.set_valign(Gtk.Align.END)
+        self.status_label.set_margin_start(8)
+        self.status_label.set_margin_bottom(8)
+        self.status_label.set_no_show_all(True)
+
         # Transient feedback message (e.g. after copying to the clipboard).
         self.toast_timeout = None
         self.toast_label = Gtk.Label()
@@ -461,8 +471,12 @@ class Viewer(object):
             b" color: #f0f0f0; padding: 2px 9px; border-radius: 4px;"
             b" font-size: 11px; }"
             b"#flateyes-toast { background-color: rgba(0,0,0,0.78);"
-            b" color: #ffffff; padding: 4px 12px; border-radius: 4px; }")
-        for widget in (self.ruler_label, self.help_label, self.toast_label):
+            b" color: #ffffff; padding: 4px 12px; border-radius: 4px; }"
+            b"#flateyes-status { background-color: rgba(0,0,0,0.6);"
+            b" color: #f0f0f0; padding: 2px 9px; border-radius: 4px;"
+            b" font-size: 11px; }")
+        for widget in (self.ruler_label, self.help_label, self.toast_label,
+                       self.status_label):
             widget.get_style_context().add_provider(
                 css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         # Annotations: boxes/ellipses stamped into one viewport-sized
@@ -509,10 +523,11 @@ class Viewer(object):
         self.overlay.add_overlay(self.ruler_line)
         self.overlay.add_overlay(self.ruler_label)
         self.overlay.add_overlay(self.help_label)
+        self.overlay.add_overlay(self.status_label)
         self.overlay.add_overlay(self.toast_label)
         for child in (self.legend_frame, self.hint_image, self.anno_image,
                       self.ruler_line, self.ruler_label, self.help_label,
-                      self.toast_label):
+                      self.status_label, self.toast_label):
             try:
                 # Let clicks/wheel over the overlays fall through to the image.
                 self.overlay.set_overlay_pass_through(child, True)
@@ -816,18 +831,31 @@ class Viewer(object):
 
     def update_title(self):
         name = os.path.basename(self.path or "")
+        self.window.set_title("%s - %s" % (name, APP))
+        self.update_status()
+
+    def update_status(self):
+        """Scale/size/ppu readout at the bottom-left, styled like the
+        help strip; the title only carries the file name."""
+        value = '<span foreground="#ffd819" weight="bold">%s</span>'
         img_w, img_h = self.image_size()
-        if self.animation is not None:
-            detail = "%dx%d animation" % (img_w, img_h)
-        elif self.stack_mode:
+        parts = []
+        if self.stack_mode:
             level = self.active_level()
-            detail = "%d/%d %s  %dx%d  %d%%  %.4g px/%s" % (
-                self.level_index + 1, len(self.levels),
-                os.path.basename(level["path"]), img_w, img_h,
-                round(self.scale_shown * 100), level["ppu"], self.unit)
+            parts.append(value % ("%d/%d" % (self.level_index + 1,
+                                             len(self.levels)))
+                         + " " + GLib.markup_escape_text(
+                             os.path.basename(level["path"])))
+        parts.append(value % ("%dx%d" % (img_w, img_h)))
+        if self.animation is not None:
+            parts.append("animation")
         else:
-            detail = "%dx%d  %d%%" % (img_w, img_h, round(self.scale_shown * 100))
-        self.window.set_title("%s  (%s) - %s" % (name, detail, APP))
+            parts.append(value % ("%d%%" % round(self.scale_shown * 100)))
+            ppu = self.active_level()["ppu"] if self.stack_mode else self.ppu
+            if ppu:
+                parts.append(value % ("%.4g" % ppu) + " px/"
+                             + GLib.markup_escape_text(self.unit))
+        self.status_label.set_markup(" · ".join(parts))
 
     # -- legend overlay ------------------------------------------------------
 
@@ -887,8 +915,10 @@ class Viewer(object):
     def apply_help_visibility(self):
         if self.info_visible:
             self.help_label.show()
+            self.status_label.show()
         else:
             self.help_label.hide()
+            self.status_label.hide()
 
     def apply_legend_visibility(self):
         if self.legend_pixbuf is not None and self.info_visible:
@@ -1219,6 +1249,7 @@ class Viewer(object):
     def ask_annotation_text(self, point):
         dialog = Gtk.Dialog(title="Text", transient_for=self.window,
                             modal=True)
+        dialog.set_keep_above(True)  # stay over a fullscreen parent
         dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
         dialog.add_button("OK", Gtk.ResponseType.OK)
         dialog.set_default_response(Gtk.ResponseType.OK)
@@ -1396,6 +1427,7 @@ class Viewer(object):
     def ask_ppu(self):
         dialog = Gtk.Dialog(title="PPU", transient_for=self.window,
                             modal=True)
+        dialog.set_keep_above(True)  # stay over a fullscreen parent
         dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
         dialog.add_button("OK", Gtk.ResponseType.OK)
         dialog.set_default_response(Gtk.ResponseType.OK)
@@ -1423,6 +1455,7 @@ class Viewer(object):
                     self.ppu = value
         dialog.destroy()
         self.update_ruler_overlay()
+        self.update_status()
 
     # -- events ------------------------------------------------------------
 
@@ -1433,7 +1466,9 @@ class Viewer(object):
 
     def on_key(self, widget, event):
         key = Gdk.keyval_name(event.keyval)
-        if key in ("q", "Q"):  # info overlays: help, legend, level outline
+        if key in ("q", "Q"):
+            Gtk.main_quit()
+        elif key in ("i", "I"):  # info overlays: help, legend, level outline
             self.info_visible = not self.info_visible
             self.apply_help_visibility()
             self.apply_legend_visibility()
@@ -1461,7 +1496,10 @@ class Viewer(object):
         elif key in ("c", "C"):  # plain c and Ctrl+C both land here
             self.copy_view_to_clipboard()
         elif key in ("p", "P"):
-            if not self.stack_mode:  # stack ppu comes from the manifest
+            if self.stack_mode:  # the manifest is authoritative for stacks
+                self.show_toast("PPU from stack manifest: %.4g px/%s"
+                                % (self.active_level()["ppu"], self.unit))
+            else:
                 self.ask_ppu()
         elif key in ("plus", "equal", "KP_Add"):
             self.set_view_scale(self.current_view_scale() * self.ZOOM_STEP)
@@ -1743,14 +1781,14 @@ def usage(stream):
         "\n"
         "keys: +/- zoom, 0 actual size, f fit, Enter/F11 fullscreen,\n"
         "      Ctrl+wheel zoom, drag to pan, o next-level outline,\n"
-        "      q info overlays (help/legend/outline) on/off,\n"
+        "      i info overlays (help/legend/outline) on/off,\n"
         "      Tab drawing overlays (ruler/annotations) on/off,\n"
         "      [/] stack level, p set PPU,\n"
         "      r ruler (Shift = free angle, Esc ends),\n"
         "      b/e box/ellipse (Shift = square/circle),\n"
         "      l line (Shift = horizontal/vertical/45), t text,\n"
         "      BackSpace remove last annotation,\n"
-        "      c copy the visible view to the clipboard, Esc quit\n"
+        "      c copy the visible view to the clipboard, q/Esc quit\n"
         % (APP, APP, APP))
 
 
