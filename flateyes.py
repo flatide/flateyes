@@ -17,6 +17,7 @@ Usage:
 """
 
 import errno
+import hashlib
 import math
 import os
 import signal
@@ -346,11 +347,14 @@ class Viewer(object):
     HINT_CORE = 0x33BBFFFF
     DRAG_SLOP = 4                # px: press-release within this is a click
     ANNO_CASING = 0x000000A0     # shape annotation outline
-    ANNO_CORE = 0xFF5040FF       # shape annotation core / text color
+    ANNO_COLORS = ("#FF5040", "#FF9F1A", "#3DDC55", "#35C5FF",
+                   "#FF4FD8", "#FFFFFF")  # ","/"." cycle these
+    ANNO_COLOR_NAMES = ("red", "orange", "green", "sky", "pink", "white")
     HELP_KEYS = (("+/-", "zoom"), ("0", "1:1"), ("f", "fit"),
                  ("Enter", "full"), ("drag", "pan"), ("Ctrl+wheel", "zoom"),
                  ("r", "ruler"), ("b/e/l", "shape"), ("t", "text"),
-                 ("BkSp", "undo"), ("c", "copy"), ("p", "PPU"),
+                 ("c", "color"), ("u", "undo"), ("BkSp", "delete"),
+                 ("Ctrl+C", "copy"), ("p", "PPU"),
                  ("o", "outline"), ("[/]", "level"), ("i", "info"),
                  ("Tab", "drawings"), ("q", "quit"))
 
@@ -486,9 +490,11 @@ class Viewer(object):
         self.anno_start = None      # first corner (world)
         self.anno_cursor = None     # preview corner (world)
         self.annotations = []       # committed shapes and texts
+        self.anno_undo = []         # ("add"|"remove", annotation, index)
         self.anno_rev = 0           # bumped on add/remove for the key cache
         self.anno_drawn = None
         self.anno_font_size = 16    # last used text size (pt), sticky
+        self.anno_color_index = 0   # ","/"." cycle ANNO_COLORS
         self.anno_image = Gtk.Image()
         self.anno_image.set_halign(Gtk.Align.START)
         self.anno_image.set_valign(Gtk.Align.START)
@@ -632,6 +638,7 @@ class Viewer(object):
             self.unit = unit
         self.set_ruler_active(False)
         self.clear_annotations()
+        self.load_annotations()
         self.legend_pixbuf = legend_pixbuf
         self.legend_rendered = None
         if legend_pixbuf is not None:
@@ -900,8 +907,11 @@ class Viewer(object):
         self.show_toast("copied  %dx%d" % (pixbuf.get_width(),
                                            pixbuf.get_height()))
 
-    def show_toast(self, text):
-        self.toast_label.set_text(text)
+    def show_toast(self, text, markup=False):
+        if markup:
+            self.toast_label.set_markup(text)
+        else:
+            self.toast_label.set_text(text)
         self.toast_label.show()
         if self.toast_timeout is not None:
             GLib.source_remove(self.toast_timeout)
@@ -1068,17 +1078,22 @@ class Viewer(object):
                                3, abs(by - ay) + 1, self.RULER_CASING)
                 self.fill_rect(buf, ax, min(ay, by),
                                1, abs(by - ay) + 1, self.RULER_CORE)
-            else:           # free angle: dense square dabs along the segment
-                steps = min(int(max(abs(bx - ax), abs(by - ay)) / 2) + 1,
-                            2000)
-                points = [(ax + (bx - ax) * i / steps,
-                           ay + (by - ay) * i / steps)
-                          for i in range(steps + 1)]
-                for x, y in points:
-                    self.fill_rect(buf, x - 1, y - 1, 3, 3,
-                                   self.RULER_CASING)
-                for x, y in points:
-                    self.fill_rect(buf, x, y, 1, 1, self.RULER_CORE)
+            else:           # free angle: 1px-spaced dabs, 2x2 solid core
+                seg = self.clip_segment((ax, ay), (bx, by),
+                                        buf.get_width(), buf.get_height())
+                if seg is not None:
+                    (ax, ay), (bx, by) = seg
+                    steps = min(int(max(abs(bx - ax), abs(by - ay))) + 1,
+                                8000)
+                    points = [(ax + (bx - ax) * i / steps,
+                               ay + (by - ay) * i / steps)
+                              for i in range(steps + 1)]
+                    for x, y in points:
+                        self.fill_rect(buf, x - 1, y - 1, 3, 3,
+                                       self.RULER_CASING)
+                    for x, y in points:
+                        self.fill_rect(buf, x - 1, y - 1, 2, 2,
+                                       self.RULER_CORE)
         for x, y in ((ax, ay), (bx, by)):
             self.fill_rect(buf, x - 3, y - 3, 7, 7, self.RULER_CASING)
             self.fill_rect(buf, x - 2, y - 2, 5, 5, self.RULER_CORE)
@@ -1086,6 +1101,35 @@ class Viewer(object):
         self.ruler_line.set_margin_start(x0)
         self.ruler_line.set_margin_top(y0)
         self.ruler_line.show()
+
+    @staticmethod
+    def clip_segment(a, b, width, height, pad=4):
+        """Clip a segment to the buffer (Liang-Barsky); None if outside.
+
+        Sampling density is derived from the segment length, so stamping
+        an unclipped segment that extends far outside the buffer would
+        spread the dabs thin inside it."""
+        t0, t1 = 0.0, 1.0
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        for p, q in ((-dx, a[0] + pad), (dx, width + pad - a[0]),
+                     (-dy, a[1] + pad), (dy, height + pad - a[1])):
+            if p == 0:
+                if q < 0:
+                    return None
+                continue
+            r = q / float(p)
+            if p < 0:
+                if r > t1:
+                    return None
+                t0 = max(t0, r)
+            else:
+                if r < t0:
+                    return None
+                t1 = min(t1, r)
+        if t0 > t1:
+            return None
+        return ((a[0] + t0 * dx, a[1] + t0 * dy),
+                (a[0] + t1 * dx, a[1] + t1 * dy))
 
     @staticmethod
     def fill_rect(buf, x, y, w, h, rgba):
@@ -1125,6 +1169,14 @@ class Viewer(object):
         self.set_viewport_cursor(self.tool_cursor())
         self.update_view_overlays()
 
+    def anno_color(self):
+        return self.ANNO_COLORS[self.anno_color_index]
+
+    @staticmethod
+    def color_rgba(hex_color):
+        """"#RRGGBB" -> the 0xRRGGBBAA pixbuf fill value."""
+        return (int(hex_color[1:], 16) << 8) | 0xFF
+
     def constrain_corner(self, point, state):
         """Shift constrains: square/circle for shapes, 0/45/90 for lines."""
         if not state & Gdk.ModifierType.SHIFT_MASK:
@@ -1148,7 +1200,7 @@ class Viewer(object):
                 and self.anno_start is not None \
                 and self.anno_cursor is not None:
             preview = {"kind": self.anno_tool, "a": self.anno_start,
-                       "b": self.anno_cursor}
+                       "b": self.anno_cursor, "color": self.anno_color()}
         if not self.draw_visible or self.rendered_size is None \
                 or not (shapes or preview or texts):
             self.anno_drawn = None
@@ -1162,7 +1214,7 @@ class Viewer(object):
         # and without it the corrected layout pass would hit the cache and
         # leave annotations displaced.
         img_alloc = self.image.get_allocation()
-        key = (self.anno_rev,
+        key = (self.anno_rev, self.anno_color_index,
                preview and (preview["a"], preview["b"]),
                self.scroll.get_hadjustment().get_value(),
                self.scroll.get_vadjustment().get_value(),
@@ -1195,6 +1247,7 @@ class Viewer(object):
     def stamp_annotation(self, buf, shape):
         a = self.image_px_to_view(self.px_from_world(shape["a"]))
         b = self.image_px_to_view(self.px_from_world(shape["b"]))
+        core = self.color_rgba(shape["color"])
         if shape["kind"] == "line":
             ax, ay = a
             bx, by = b
@@ -1202,15 +1255,19 @@ class Viewer(object):
                 self.fill_rect(buf, min(ax, bx), ay - 1,
                                abs(bx - ax) + 1, 3, self.ANNO_CASING)
                 self.fill_rect(buf, min(ax, bx), ay,
-                               abs(bx - ax) + 1, 1, self.ANNO_CORE)
+                               abs(bx - ax) + 1, 1, core)
             elif ax == bx:  # vertical
                 self.fill_rect(buf, ax - 1, min(ay, by),
                                3, abs(by - ay) + 1, self.ANNO_CASING)
                 self.fill_rect(buf, ax, min(ay, by),
-                               1, abs(by - ay) + 1, self.ANNO_CORE)
-            else:           # free angle: dense square dabs
-                steps = min(int(max(abs(bx - ax), abs(by - ay)) / 2) + 1,
-                            4000)
+                               1, abs(by - ay) + 1, core)
+            else:           # free angle: 1px-spaced dabs, 2x2 solid core
+                seg = self.clip_segment(a, b, buf.get_width(),
+                                        buf.get_height())
+                if seg is None:
+                    return
+                (ax, ay), (bx, by) = seg
+                steps = min(int(max(abs(bx - ax), abs(by - ay))) + 1, 8000)
                 points = [(ax + (bx - ax) * i / steps,
                            ay + (by - ay) * i / steps)
                           for i in range(steps + 1)]
@@ -1218,12 +1275,12 @@ class Viewer(object):
                     self.fill_rect(buf, x - 1, y - 1, 3, 3,
                                    self.ANNO_CASING)
                 for x, y in points:
-                    self.fill_rect(buf, x, y, 1, 1, self.ANNO_CORE)
+                    self.fill_rect(buf, x - 1, y - 1, 2, 2, core)
             return
         x0, x1 = sorted((a[0], b[0]))
         y0, y1 = sorted((a[1], b[1]))
         if shape["kind"] == "box":
-            for width, rgba in ((3, self.ANNO_CASING), (1, self.ANNO_CORE)):
+            for width, rgba in ((3, self.ANNO_CASING), (1, core)):
                 off = width // 2
                 self.fill_rect(buf, x0 - off, y0 - off,
                                x1 - x0 + width, width, rgba)   # top
@@ -1234,17 +1291,20 @@ class Viewer(object):
                 self.fill_rect(buf, x1 - off, y0 - off,
                                width, y1 - y0 + width, rgba)   # right
             return
-        # ellipse: dense square dabs along the perimeter
+        # ellipse: 1px-spaced dabs along the perimeter, 2x2 solid core
         cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
         rx, ry = (x1 - x0) / 2.0, (y1 - y0) / 2.0
-        steps = min(max(int(3.2 * max(rx, ry)), 16), 4000)
-        points = [(cx + rx * math.cos(2 * math.pi * i / steps),
-                   cy + ry * math.sin(2 * math.pi * i / steps))
-                  for i in range(steps)]
+        buf_w, buf_h = buf.get_width(), buf.get_height()
+        steps = min(max(int(6.4 * max(rx, ry)), 16), 8000)
+        points = [(x, y) for x, y in
+                  ((cx + rx * math.cos(2 * math.pi * i / steps),
+                    cy + ry * math.sin(2 * math.pi * i / steps))
+                   for i in range(steps))
+                  if -3 <= x <= buf_w + 3 and -3 <= y <= buf_h + 3]
         for x, y in points:
             self.fill_rect(buf, x - 1, y - 1, 3, 3, self.ANNO_CASING)
         for x, y in points:
-            self.fill_rect(buf, x, y, 1, 1, self.ANNO_CORE)
+            self.fill_rect(buf, x - 1, y - 1, 2, 2, core)
 
     def ask_annotation_text(self, point):
         dialog = Gtk.Dialog(title="Text", transient_for=self.window,
@@ -1282,12 +1342,18 @@ class Viewer(object):
         if not confirmed or not text:
             return
         self.anno_font_size = size
+        self.add_text_annotation(point, text, size, self.anno_color())
+        self.anno_undo.append(("add", self.annotations[-1], None))
+        self.update_anno_overlay()
+        self.save_annotations()
+
+    def add_text_annotation(self, point, text, size, color):
         label = Gtk.Label()
         label.set_halign(Gtk.Align.START)
         label.set_valign(Gtk.Align.START)
         label.set_no_show_all(True)
-        label.set_markup('<span font="%d" foreground="#FF5040">%s</span>'
-                         % (size, GLib.markup_escape_text(text)))
+        label.set_markup('<span font="%d" foreground="%s">%s</span>'
+                         % (size, color, GLib.markup_escape_text(text)))
         label.get_style_context().add_provider(
             self.anno_css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.overlay.add_overlay(label)
@@ -1296,9 +1362,9 @@ class Viewer(object):
         except AttributeError:  # GTK < 3.18
             pass
         self.annotations.append({"kind": "text", "at": point,
-                                 "text": text, "size": size, "label": label})
+                                 "text": text, "size": size,
+                                 "color": color, "label": label})
         self.anno_rev += 1
-        self.update_anno_overlay()
 
     def on_text_entry_key(self, entry, event, state):
         """Hangul composition for the annotation text entry."""
@@ -1362,20 +1428,143 @@ class Viewer(object):
         if not self.annotations:
             return
         anno = self.annotations.pop()
+        self.anno_undo.append(("remove", anno, len(self.annotations)))
         if anno["kind"] == "text":
             self.overlay.remove(anno["label"])
         self.anno_rev += 1
         self.update_anno_overlay()
+        self.save_annotations()
+
+    def undo_annotation(self):
+        """Reverts the last add or remove ("u")."""
+        if not self.anno_undo:
+            self.show_toast("nothing to undo")
+            return
+        op, anno, index = self.anno_undo.pop()
+        if op == "add":
+            if anno not in self.annotations:
+                return  # should not happen; the stack resets per image
+            self.annotations.remove(anno)
+            if anno["kind"] == "text":
+                self.overlay.remove(anno["label"])
+        else:  # "remove": put it back where it was
+            self.annotations.insert(min(index, len(self.annotations)), anno)
+            if anno["kind"] == "text":
+                self.overlay.add_overlay(anno["label"])
+                try:
+                    self.overlay.set_overlay_pass_through(anno["label"],
+                                                          True)
+                except AttributeError:  # GTK < 3.18
+                    pass
+        self.anno_rev += 1
+        self.update_anno_overlay()
+        self.save_annotations()
 
     def clear_annotations(self):
+        # runtime state only; the metadata on disk is left untouched
         for anno in self.annotations:
             if anno["kind"] == "text":
                 self.overlay.remove(anno["label"])
         self.annotations = []
+        self.anno_undo = []
         self.anno_rev += 1
         self.anno_tool = None
         self.anno_start = self.anno_cursor = None
         self.update_anno_overlay()
+
+    # -- annotation metadata (persistence) ---------------------------------
+
+    def annotation_paths(self):
+        """Sidecar and cache candidates for the current path's metadata."""
+        digest = hashlib.sha1(self.path.encode("utf-8")).hexdigest()
+        return (self.path + ".fe",
+                os.path.join(GLib.get_user_cache_dir(), "flateyes",
+                             digest + ".fe"))
+
+    def save_annotations(self):
+        """Autosaved on every change: sidecar first, cache as fallback."""
+        lines = []
+        for anno in self.annotations:
+            color = anno.get("color", self.ANNO_COLORS[0])
+            if anno["kind"] == "text":
+                lines.append("text=%.10g,%.10g,%d,%s,%s"
+                             % (anno["at"][0], anno["at"][1],
+                                anno["size"], color, anno["text"]))
+            else:
+                lines.append("%s=%.10g,%.10g,%.10g,%.10g,%s"
+                             % (anno["kind"], anno["a"][0], anno["a"][1],
+                                anno["b"][0], anno["b"][1], color))
+        candidates = self.annotation_paths()
+        if not lines:
+            for path in candidates:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            return
+        data = "# flateyes annotations\n" + "\n".join(lines) + "\n"
+        for path in candidates:
+            try:
+                if path != candidates[0]:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(data)
+                return
+            except OSError:
+                continue
+        self.show_toast("annotations not saved (read-only?)")
+
+    def load_annotations(self):
+        if self.pixbuf is None:
+            return  # animations cannot be annotated
+        for meta_path in self.annotation_paths():
+            try:
+                with open(meta_path, "r", encoding="utf-8") as handle:
+                    lines = handle.read().splitlines()
+            except OSError:
+                continue
+            for raw in lines:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                key, sep, value = line.partition("=")
+                if not sep:
+                    continue
+                try:
+                    if key == "text":
+                        x, y, size, color, text = value.split(",", 4)
+                        if text:
+                            self.add_text_annotation(
+                                (float(x), float(y)), text,
+                                max(6, min(int(size), 96)),
+                                self.parse_color(color))
+                    elif key in ("box", "ellipse", "line"):
+                        ax, ay, bx, by, color = value.split(",", 4)
+                        self.annotations.append({
+                            "kind": key,
+                            "a": (float(ax), float(ay)),
+                            "b": (float(bx), float(by)),
+                            "color": self.parse_color(color)})
+                except ValueError:
+                    continue  # skip malformed lines
+            break  # first readable source wins
+        if self.annotations:
+            self.anno_rev += 1
+            self.update_anno_overlay()
+            self.show_toast("%d annotation%s restored"
+                            % (len(self.annotations),
+                               "" if len(self.annotations) == 1 else "s"))
+
+    @staticmethod
+    def parse_color(text):
+        text = text.strip()
+        if len(text) == 7 and text.startswith("#"):
+            try:
+                int(text[1:], 16)
+                return text
+            except ValueError:
+                pass
+        return Viewer.ANNO_COLORS[0]
 
     def update_hint_overlay(self):
         """Outline the area the next magnification level covers."""
@@ -1491,8 +1680,20 @@ class Viewer(object):
             self.set_anno_tool(None if self.anno_tool == "line" else "line")
         elif key in ("BackSpace", "Delete"):
             self.remove_last_annotation()
-        elif key in ("c", "C"):  # plain c and Ctrl+C both land here
-            self.copy_view_to_clipboard()
+        elif key in ("u", "U"):
+            self.undo_annotation()
+        elif key in ("c", "C"):
+            if event.state & Gdk.ModifierType.CONTROL_MASK:
+                self.copy_view_to_clipboard()  # Ctrl+C
+            else:                              # plain c: cycle the color
+                self.anno_color_index = (self.anno_color_index + 1) \
+                    % len(self.ANNO_COLORS)
+                self.show_toast(
+                    '<span foreground="%s">■■</span> %s'
+                    % (self.anno_color(),
+                       self.ANNO_COLOR_NAMES[self.anno_color_index]),
+                    markup=True)
+                self.update_anno_overlay()
         elif key in ("p", "P"):
             if self.stack_mode:  # the manifest is authoritative for stacks
                 self.show_toast("PPU from stack manifest: %.4g px/%s"
@@ -1628,12 +1829,15 @@ class Viewer(object):
             self.anno_start = point                # first corner
             self.anno_cursor = None
         else:
-            self.annotations.append({
-                "kind": self.anno_tool, "a": self.anno_start,
-                "b": self.constrain_corner(point, event.state)})
+            anno = {"kind": self.anno_tool, "a": self.anno_start,
+                    "b": self.constrain_corner(point, event.state),
+                    "color": self.anno_color()}
+            self.annotations.append(anno)
+            self.anno_undo.append(("add", anno, None))
             self.anno_rev += 1
             self.anno_start = self.anno_cursor = None
             self.update_anno_overlay()
+            self.save_annotations()
         return True
 
     def tool_cursor(self):
@@ -1785,8 +1989,9 @@ def usage(stream):
         "      r ruler (Shift = free angle, Esc ends),\n"
         "      b/e box/ellipse (Shift = square/circle),\n"
         "      l line (Shift = horizontal/vertical/45), t text,\n"
-        "      BackSpace remove last annotation,\n"
-        "      c copy the visible view to the clipboard, q quit\n"
+        "      c cycle the annotation color,\n"
+        "      BackSpace remove last annotation, u undo add/remove,\n"
+        "      Ctrl+C copy the visible view to the clipboard, q quit\n"
         % (APP, APP, APP))
 
 
