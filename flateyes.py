@@ -399,7 +399,7 @@ class Viewer(object):
                    "#FF4FD8", "#FFFFFF")  # "c" cycles these
     ANNO_COLOR_NAMES = ("red", "orange", "green", "sky", "pink", "white")
     HELP_KEYS = (("+/-", "zoom"), ("0", "1:1"), ("f", "fit"),
-                 ("Enter", "full"), (",/.", "browse"),
+                 ("Enter", "full"), (",/.", "file"), ("Shift+,/.", "folder"),
                  ("drag", "pan"), ("Ctrl+wheel", "zoom"),
                  ("r", "ruler"), ("b/e/l", "shape"), ("t", "text"),
                  ("c", "color"), ("u/y", "undo/redo"), ("BkSp", "delete"),
@@ -411,6 +411,7 @@ class Viewer(object):
                  ppu=None, unit=None, stack=False, levels=None):
         self.server_sock = server_sock
         self.path = None
+        self.browse_root = None     # tree browsing root: first open's folder
         self.pixbuf = None          # active level (already orientation-fixed)
         self.animation = None       # animated image (shown unscaled)
         self.fit_mode = True
@@ -679,6 +680,9 @@ class Viewer(object):
                        "pixbuf": pixbuf}]
 
         self.path = path
+        # An explicit open starts a new browsing tree here; the ,/. and
+        # Shift+,/. navigation restores the original root after loading.
+        self.browse_root = os.path.dirname(os.path.abspath(path))
         self.stack_mode = stack
         self.levels = levels
         self.level_index = 0
@@ -717,9 +721,10 @@ class Viewer(object):
 
     # -- folder browsing ----------------------------------------------------
 
-    def folder_images(self):
-        """Decodable images in the current file's folder, naturally sorted."""
-        folder = os.path.dirname(os.path.abspath(self.path or ""))
+    def folder_images(self, folder=None):
+        """Decodable images in a folder (default: the current file's)."""
+        if folder is None:
+            folder = os.path.dirname(os.path.abspath(self.path or ""))
         try:
             names = os.listdir(folder)
         except OSError as exc:
@@ -735,6 +740,7 @@ class Viewer(object):
         if self.stack_mode:  # the folder holds the stack's own level images
             self.show_toast("folder browsing is off in stack mode")
             return
+        root = self.browse_root
         files = self.folder_images()
         current = os.path.abspath(self.path or "")
         if current in files:
@@ -754,12 +760,77 @@ class Viewer(object):
         for target in candidates:  # skip over files that fail to decode
             result = self.load(target)
             if result == "OK":
+                self.browse_root = root  # navigation keeps the first root
                 self.show_toast("(%d/%d) %s"
                                 % (files.index(target) + 1, len(files),
                                    os.path.basename(target)))
                 return
             error = result
         self.show_toast(error)
+
+    def image_folders(self, root):
+        """Folders under root (itself included) holding at least one image,
+        in depth-first pre-order with naturally sorted siblings."""
+        exts = image_extensions()
+        found = []
+        for folder, dirs, names in os.walk(root):
+            dirs[:] = sorted((d for d in dirs if not d.startswith(".")),
+                             key=natural_key)
+            if any(not name.startswith(".") and
+                   os.path.splitext(name)[1].lstrip(".").lower() in exts
+                   for name in names):
+                found.append(folder)
+        return found
+
+    @staticmethod
+    def tree_key(root, folder):
+        """Pre-order sort key of a folder inside root's tree."""
+        rel = os.path.relpath(folder, root)
+        if rel == ".":
+            return ()
+        return tuple(natural_key(part) for part in rel.split(os.sep))
+
+    def browse_tree(self, step):
+        """Shift+,/.: jump to the neighbouring image folder (first image)
+        among the first opened file's folder and all of its subfolders."""
+        if self.stack_mode:
+            self.show_toast("folder browsing is off in stack mode")
+            return
+        root = self.browse_root \
+            or os.path.dirname(os.path.abspath(self.path or ""))
+        folders = self.image_folders(root)
+        current = os.path.dirname(os.path.abspath(self.path or ""))
+        if current in folders:
+            start = folders.index(current)
+        else:  # current folder emptied/outside: enter at its tree position
+            key = self.tree_key(root, current)
+            below = sum(1 for folder in folders
+                        if self.tree_key(root, folder) < key)
+            start = below - 1 if step > 0 else below
+        order = [folders[(start + step * n) % len(folders)]
+                 for n in range(1, len(folders) + 1)] if folders else []
+        order = [folder for folder in order if folder != current]
+        if not order:
+            self.show_toast("no other image folders under %s"
+                            % (os.path.basename(root) or root))
+            return
+        error = None
+        for folder in order:  # skip folders whose images all fail to load
+            images = self.folder_images(folder)
+            for target in images:
+                result = self.load(target)
+                if result == "OK":
+                    self.browse_root = root
+                    rel = os.path.relpath(folder, root)
+                    name = os.path.basename(root) or root if rel == "." \
+                        else rel
+                    self.show_toast("(%d/%d) %s  (%d image%s)"
+                                    % (folders.index(folder) + 1,
+                                       len(folders), name, len(images),
+                                       "" if len(images) == 1 else "s"))
+                    return
+                error = result
+        self.show_toast(error or "no loadable images")
 
     def image_size(self):
         if self.pixbuf is not None:
@@ -1979,9 +2050,15 @@ class Viewer(object):
                 self.rendered_size = None
             self.rescale()
         elif key in ("comma", "less"):
-            self.browse_folder(-1)
+            if key == "less" or event.state & Gdk.ModifierType.SHIFT_MASK:
+                self.browse_tree(-1)   # Shift: previous image folder
+            else:
+                self.browse_folder(-1)
         elif key in ("period", "greater"):
-            self.browse_folder(1)
+            if key == "greater" or event.state & Gdk.ModifierType.SHIFT_MASK:
+                self.browse_tree(1)    # Shift: next image folder
+            else:
+                self.browse_folder(1)
         elif key in ("bracketright", "bracketleft"):
             # jump to 100% of the neighbouring magnification level
             if self.stack_mode:
