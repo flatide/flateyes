@@ -503,6 +503,7 @@ class Viewer(object):
         # up to clear it), the scale/size/ppu readout at the bottom-left,
         # so the window title only needs to fit the file name.
         self.path_label = Gtk.Label()
+        self.path_tooltip = None    # full path when the readout is shortened
         self.path_label.set_name("flateyes-status")
         self.path_label.set_halign(Gtk.Align.END)
         self.path_label.set_valign(Gtk.Align.END)
@@ -603,6 +604,10 @@ class Viewer(object):
                 self.overlay.set_overlay_pass_through(child, True)
             except AttributeError:  # GTK < 3.18
                 break
+        # Pass-through children never see pointer events, so a tooltip set
+        # on the path label itself would never trigger; answer for it here.
+        self.overlay.set_has_tooltip(True)
+        self.overlay.connect("query-tooltip", self.on_overlay_query_tooltip)
         self.overlay.connect("size-allocate", self.on_overlay_allocate)
         self.window.add(self.overlay)
 
@@ -1032,10 +1037,11 @@ class Viewer(object):
         name = os.path.basename(self.path or "")
         self.window.set_title("%s - %s" % (name, APP_TITLE))
         full = self.path or ""
-        self.path_label.set_tooltip_text(full)
+        shown = full
         if len(full) > 72:  # keep very long paths on one short line
-            full = full[:24] + "…" + full[-47:]
-        self.path_label.set_text(full)
+            shown = full[:24] + "…" + full[-47:]
+        self.path_tooltip = full if shown != full else None
+        self.path_label.set_text(shown)
         self.update_status()
 
     def update_status(self):
@@ -1214,6 +1220,19 @@ class Viewer(object):
 
     def on_overlay_allocate(self, widget, allocation):
         self.render_legend(allocation)
+
+    def on_overlay_query_tooltip(self, widget, x, y, keyboard_mode, tooltip):
+        if self.path_tooltip is None or not self.path_label.get_visible():
+            return False
+        coords = widget.translate_coordinates(self.path_label, int(x), int(y))
+        if not coords:
+            return False
+        lx, ly = coords[-2], coords[-1]
+        alloc = self.path_label.get_allocation()
+        if 0 <= lx < alloc.width and 0 <= ly < alloc.height:
+            tooltip.set_text(self.path_tooltip)
+            return True
+        return False
 
     # -- ruler ---------------------------------------------------------------
 
