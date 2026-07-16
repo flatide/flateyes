@@ -1451,7 +1451,14 @@ class Viewer(object):
                 state["anchor"] = None
             return True
         code = Gdk.keyval_to_unicode(event.keyval)
-        char = chr(code) if code else ""
+        if not code:
+            # Keys that carry no character (Shift/Ctrl themselves, arrows,
+            # F-keys, ...) must not end the syllable: pressing Shift for a
+            # double jamo broke composition, and event.is_modifier is not
+            # readable through introspection.  Cursor movement is caught
+            # by the position check on the next jamo instead.
+            return False
+        char = chr(code)
         jamo = HangulComposer.KEYMAP.get(char) \
             or HangulComposer.KEYMAP.get(char.lower())
         if jamo is None:
