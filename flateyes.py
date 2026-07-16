@@ -402,10 +402,10 @@ class Viewer(object):
                  ("Enter", "full"), (",/.", "file"), ("Shift+,/.", "folder"),
                  ("drag", "pan"), ("Ctrl+wheel", "zoom"),
                  ("r", "ruler"), ("b/e/l", "shape"), ("t", "text"),
-                 ("c", "color"), ("u/y", "undo/redo"), ("BkSp", "delete"),
-                 ("Ctrl+C", "copy"), ("s", "save"), ("p", "PPU"),
+                 ("c", "color"), ("u/y", "undo/redo"),
+                 ("Ctrl+C", "copy"), ("Ctrl+S", "save"), ("p", "PPU"),
                  ("o", "outline"), ("[/]", "level"), ("i", "info"),
-                 ("Tab", "drawings"), ("q", "quit"))
+                 ("Tab", "overlays"), ("q", "quit"))
 
     def __init__(self, server_sock, first_path, first_legend=None,
                  ppu=None, unit=None, stack=False, levels=None):
@@ -1149,8 +1149,8 @@ class Viewer(object):
         return os.path.join(folder, base), fmt
 
     def save_view(self):
-        """s: save the visible viewport (info overlays excluded) to the
-        same flateyes_<name> file on every save."""
+        """Ctrl+S: save the visible viewport (info overlays excluded) to
+        the same flateyes_<name> file on every save."""
         self.capture_view(self.finish_save)
 
     def finish_save(self, pixbuf):
@@ -1773,18 +1773,6 @@ class Viewer(object):
                                  "label": label})
         self.anno_rev += 1
 
-    def remove_last_annotation(self):
-        if not self.annotations:
-            return
-        anno = self.annotations.pop()
-        self.anno_undo.append(("remove", anno, len(self.annotations)))
-        del self.anno_redo[:]
-        if "label" in anno:
-            self.overlay.remove(anno["label"])
-        self.anno_rev += 1
-        self.update_anno_overlay()
-        self.save_annotations()
-
     def undo_annotation(self):
         """Reverts the last add or remove ("u")."""
         if not self.anno_undo:
@@ -1942,6 +1930,11 @@ class Viewer(object):
                 except ValueError:
                     continue  # skip malformed lines
             break  # first readable source wins
+        # Restored annotations enter the undo stack as adds, so "u"
+        # deletes newest-first across restored and freshly drawn ones
+        # alike (delete-last is folded into undo/redo).
+        self.anno_undo.extend(("add", anno, None)
+                              for anno in self.annotations)
         if self.annotations or ppu_restored:
             parts = []
             if self.annotations:
@@ -2101,8 +2094,6 @@ class Viewer(object):
             self.set_anno_tool(None if self.anno_tool == "text" else "text")
         elif key in ("l", "L"):
             self.set_anno_tool(None if self.anno_tool == "line" else "line")
-        elif key in ("BackSpace", "Delete"):
-            self.remove_last_annotation()
         elif key in ("u", "U"):
             self.undo_annotation()
         elif key in ("y", "Y"):
@@ -2119,8 +2110,9 @@ class Viewer(object):
                        self.ANNO_COLOR_NAMES[self.anno_color_index]),
                     markup=True)
                 self.update_anno_overlay()
-        elif key in ("s", "S"):
-            self.save_view()
+        elif key in ("s", "S") \
+                and event.state & Gdk.ModifierType.CONTROL_MASK:
+            self.save_view()  # Ctrl+S
         elif key in ("p", "P"):
             if self.stack_mode:  # the manifest is authoritative for stacks
                 self.show_toast("PPU from stack manifest: %.4g px/%s"
@@ -2161,8 +2153,11 @@ class Viewer(object):
             if self.stack_mode:
                 self.hint_enabled = not self.hint_enabled
                 self.update_hint_overlay()
-        elif key == "Tab":  # drawing overlays: ruler, annotations, outline
-            self.draw_visible = not self.draw_visible
+        elif key == "Tab":  # every overlay: drawings and info together
+            visible = self.draw_visible or self.info_visible
+            self.draw_visible = self.info_visible = not visible
+            self.apply_help_visibility()
+            self.apply_legend_visibility()
             self.update_view_overlays()
         elif key in ("F11", "Return", "KP_Enter"):
             # Enter as well: remote/VNC clients often swallow F11.
@@ -2434,15 +2429,16 @@ def usage(stream):
         "      ,/. next/prev image, Shift+,/. next/prev folder,\n"
         "      Ctrl+wheel zoom, drag to pan, o next-level outline,\n"
         "      i info overlays (help/legend/outline) on/off,\n"
-        "      Tab drawing overlays (ruler/annotations) on/off,\n"
+        "      Tab all overlays (drawings and info) on/off,\n"
         "      [/] stack level, p set PPU,\n"
         "      r ruler (Shift = free angle, Esc ends),\n"
         "      b/e box/ellipse (Shift = square/circle),\n"
         "      l line (Shift = horizontal/vertical/45), t text,\n"
         "      c cycle the annotation color,\n"
-        "      BackSpace remove last annotation, u/y undo/redo,\n"
+        "      u/y undo/redo annotations (u also deletes, newest first),\n"
         "      Ctrl+C copy the visible view (info hidden) to the clipboard,\n"
-        "      s save the view (info hidden) as flateyes_<name>, q quit\n"
+        "      Ctrl+S save the view (info hidden) as flateyes_<name>,\n"
+        "      q quit\n"
         % (APP, APP, APP))
 
 
