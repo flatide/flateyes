@@ -20,6 +20,7 @@ import errno
 import hashlib
 import math
 import os
+import re
 import signal
 import socket
 import sys
@@ -363,6 +364,26 @@ def workarea_size():
         return screen.get_width(), screen.get_height()
 
 
+_image_extensions = None
+
+
+def image_extensions():
+    """Lowercase filename extensions GdkPixbuf can decode."""
+    global _image_extensions
+    if _image_extensions is None:
+        _image_extensions = set()
+        for fmt in GdkPixbuf.Pixbuf.get_formats():
+            _image_extensions.update(fmt.get_extensions())
+    return _image_extensions
+
+
+def natural_key(name):
+    # "img2" sorts before "img10": with a capture group re.split alternates
+    # text and digit parts, so items at the same position share a type.
+    return [int(part) if part.isdigit() else part
+            for part in re.split(r"(\d+)", name.lower())]
+
+
 class Viewer(object):
     ZOOM_STEP = 1.25
     ZOOM_MIN = 0.05
@@ -375,12 +396,13 @@ class Viewer(object):
     DRAG_SLOP = 4                # px: press-release within this is a click
     ANNO_CASING = 0x000000A0     # shape annotation outline
     ANNO_COLORS = ("#FF5040", "#FF9F1A", "#3DDC55", "#35C5FF",
-                   "#FF4FD8", "#FFFFFF")  # ","/"." cycle these
+                   "#FF4FD8", "#FFFFFF")  # "c" cycles these
     ANNO_COLOR_NAMES = ("red", "orange", "green", "sky", "pink", "white")
     HELP_KEYS = (("+/-", "zoom"), ("0", "1:1"), ("f", "fit"),
-                 ("Enter", "full"), ("drag", "pan"), ("Ctrl+wheel", "zoom"),
+                 ("Enter", "full"), (",/.", "browse"),
+                 ("drag", "pan"), ("Ctrl+wheel", "zoom"),
                  ("r", "ruler"), ("b/e/l", "shape"), ("t", "text"),
-                 ("c", "color"), ("u", "undo"), ("BkSp", "delete"),
+                 ("c", "color"), ("u/y", "undo/redo"), ("BkSp", "delete"),
                  ("Ctrl+C", "copy"), ("p", "PPU"),
                  ("o", "outline"), ("[/]", "level"), ("i", "info"),
                  ("Tab", "drawings"), ("q", "quit"))
@@ -474,8 +496,16 @@ class Viewer(object):
         self.help_label.set_justify(Gtk.Justification.CENTER)
         self.help_label.set_no_show_all(True)
 
-        # Scale/size/ppu status readout at the bottom-left corner, so the
-        # window title only needs to fit the (possibly long) file name.
+        # The file's full path sits at the bottom-right (the legend moves
+        # up to clear it), the scale/size/ppu readout at the bottom-left,
+        # so the window title only needs to fit the file name.
+        self.path_label = Gtk.Label()
+        self.path_label.set_name("flateyes-status")
+        self.path_label.set_halign(Gtk.Align.END)
+        self.path_label.set_valign(Gtk.Align.END)
+        self.path_label.set_margin_end(8)
+        self.path_label.set_margin_bottom(8)
+        self.path_label.set_no_show_all(True)
         self.status_label = Gtk.Label()
         self.status_label.set_name("flateyes-status")
         self.status_label.set_halign(Gtk.Align.START)
@@ -507,9 +537,10 @@ class Viewer(object):
             b" color: #f0f0f0; padding: 2px 9px; border-radius: 4px;"
             b" font-size: 11px; }")
         for widget in (self.ruler_label, self.help_label, self.toast_label,
-                       self.status_label):
+                       self.status_label, self.path_label):
             widget.get_style_context().add_provider(
                 css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self.chip_css = css  # for dynamically created readout labels
         # Annotations: boxes/ellipses stamped into one viewport-sized
         # overlay pixbuf, texts as Pango labels; all anchored in world
         # coordinates like the ruler.
@@ -518,6 +549,7 @@ class Viewer(object):
         self.anno_cursor = None     # preview corner (world)
         self.annotations = []       # committed shapes and texts
         self.anno_undo = []         # ("add"|"remove", annotation, index)
+        self.anno_redo = []         # undone ops; cleared by a new action
         self.anno_rev = 0           # bumped on add/remove for the key cache
         self.anno_drawn = None
         self.anno_font_size = 16    # last used text size (pt), sticky
@@ -546,7 +578,7 @@ class Viewer(object):
         self.legend_frame.set_halign(Gtk.Align.END)
         self.legend_frame.set_valign(Gtk.Align.END)
         self.legend_frame.set_margin_end(12)
-        self.legend_frame.set_margin_bottom(12)
+        self.legend_frame.set_margin_bottom(40)  # clear the path readout
         self.legend_frame.set_no_show_all(True)
 
         self.overlay = Gtk.Overlay()
@@ -558,10 +590,11 @@ class Viewer(object):
         self.overlay.add_overlay(self.ruler_label)
         self.overlay.add_overlay(self.help_label)
         self.overlay.add_overlay(self.status_label)
+        self.overlay.add_overlay(self.path_label)
         self.overlay.add_overlay(self.toast_label)
         for child in (self.legend_frame, self.hint_image, self.anno_image,
                       self.ruler_line, self.ruler_label, self.help_label,
-                      self.status_label, self.toast_label):
+                      self.status_label, self.path_label, self.toast_label):
             try:
                 # Let clicks/wheel over the overlays fall through to the image.
                 self.overlay.set_overlay_pass_through(child, True)
@@ -655,18 +688,18 @@ class Viewer(object):
         self.view_scale = levels[0]["ppu"]
         self.pending_center = None
         self.rendered_size = None
-        # PPU/unit are sticky: only overwritten when the request carries
-        # them.  A stack manifest wins over stickiness, an explicit request
-        # field wins over the manifest.
+        self.set_ruler_active(False)
+        self.clear_annotations()
+        self.load_annotations()  # may restore this file's saved ppu/unit
+        # PPU/unit precedence: an explicit request field beats the file's
+        # saved value beats the stack manifest beats stickiness (the value
+        # kept from the previous image).
         if stack_unit:
             self.unit = stack_unit
         if ppu is not None:
             self.ppu = ppu
         if unit is not None:
             self.unit = unit
-        self.set_ruler_active(False)
-        self.clear_annotations()
-        self.load_annotations()
         self.legend_pixbuf = legend_pixbuf
         self.legend_rendered = None
         if legend_pixbuf is not None:
@@ -681,6 +714,52 @@ class Viewer(object):
             self.scale_shown = 1.0
             self.update_title()
         return "OK"
+
+    # -- folder browsing ----------------------------------------------------
+
+    def folder_images(self):
+        """Decodable images in the current file's folder, naturally sorted."""
+        folder = os.path.dirname(os.path.abspath(self.path or ""))
+        try:
+            names = os.listdir(folder)
+        except OSError as exc:
+            self.show_toast(str(exc))
+            return []
+        exts = image_extensions()
+        names = [name for name in names if not name.startswith(".")
+                 and os.path.splitext(name)[1].lstrip(".").lower() in exts]
+        names.sort(key=natural_key)
+        return [os.path.join(folder, name) for name in names]
+
+    def browse_folder(self, step):
+        if self.stack_mode:  # the folder holds the stack's own level images
+            self.show_toast("folder browsing is off in stack mode")
+            return
+        files = self.folder_images()
+        current = os.path.abspath(self.path or "")
+        if current in files:
+            start = files.index(current)
+        else:  # hidden/renamed current file: enter the list at its sort slot
+            key = natural_key(os.path.basename(current))
+            below = sum(1 for path in files
+                        if natural_key(os.path.basename(path)) < key)
+            start = below - 1 if step > 0 else below
+        candidates = [files[(start + step * n) % len(files)]
+                      for n in range(1, len(files) + 1)] if files else []
+        candidates = [path for path in candidates if path != current]
+        if not candidates:
+            self.show_toast("no other images in this folder")
+            return
+        error = None
+        for target in candidates:  # skip over files that fail to decode
+            result = self.load(target)
+            if result == "OK":
+                self.show_toast("(%d/%d) %s"
+                                % (files.index(target) + 1, len(files),
+                                   os.path.basename(target)))
+                return
+            error = result
+        self.show_toast(error)
 
     def image_size(self):
         if self.pixbuf is not None:
@@ -867,6 +946,11 @@ class Viewer(object):
     def update_title(self):
         name = os.path.basename(self.path or "")
         self.window.set_title("%s - %s" % (name, APP))
+        full = self.path or ""
+        self.path_label.set_tooltip_text(full)
+        if len(full) > 72:  # keep very long paths on one short line
+            full = full[:24] + "…" + full[-47:]
+        self.path_label.set_text(full)
         self.update_status()
 
     def update_status(self):
@@ -954,9 +1038,11 @@ class Viewer(object):
         if self.info_visible:
             self.help_label.show()
             self.status_label.show()
+            self.path_label.show()
         else:
             self.help_label.hide()
             self.status_label.hide()
+            self.path_label.hide()
 
     def apply_legend_visibility(self):
         if self.legend_pixbuf is not None and self.info_visible:
@@ -1130,6 +1216,34 @@ class Viewer(object):
         self.ruler_line.set_margin_top(y0)
         self.ruler_line.show()
 
+    def stamp_segment(self, buf, a, b, casing, core):
+        ax, ay = a
+        bx, by = b
+        if ay == by:    # horizontal
+            self.fill_rect(buf, min(ax, bx), ay - 1,
+                           abs(bx - ax) + 1, 3, casing)
+            self.fill_rect(buf, min(ax, bx), ay,
+                           abs(bx - ax) + 1, 1, core)
+        elif ax == bx:  # vertical
+            self.fill_rect(buf, ax - 1, min(ay, by),
+                           3, abs(by - ay) + 1, casing)
+            self.fill_rect(buf, ax, min(ay, by),
+                           1, abs(by - ay) + 1, core)
+        else:           # free angle: 1px-spaced dabs, 2x2 solid core
+            seg = self.clip_segment(a, b, buf.get_width(),
+                                    buf.get_height())
+            if seg is None:
+                return
+            (ax, ay), (bx, by) = seg
+            steps = min(int(max(abs(bx - ax), abs(by - ay))) + 1, 8000)
+            points = [(ax + (bx - ax) * i / steps,
+                       ay + (by - ay) * i / steps)
+                      for i in range(steps + 1)]
+            for x, y in points:
+                self.fill_rect(buf, x - 1, y - 1, 3, 3, casing)
+            for x, y in points:
+                self.fill_rect(buf, x - 1, y - 1, 2, 2, core)
+
     @staticmethod
     def clip_segment(a, b, width, height, pad=4):
         """Clip a segment to the buffer (Liang-Barsky); None if outside.
@@ -1222,6 +1336,7 @@ class Viewer(object):
 
     def update_anno_overlay(self):
         texts = [x for x in self.annotations if x["kind"] == "text"]
+        rulers = [x for x in self.annotations if x["kind"] == "ruler"]
         shapes = [x for x in self.annotations if x["kind"] != "text"]
         preview = None
         if self.anno_tool in ("box", "ellipse", "line") \
@@ -1233,8 +1348,9 @@ class Viewer(object):
                 or not (shapes or preview or texts):
             self.anno_drawn = None
             self.anno_image.hide()
-            for anno in texts:
-                anno["label"].hide()
+            for anno in self.annotations:
+                if "label" in anno:
+                    anno["label"].hide()
             return
         view = self.scroll.get_allocation()
         # The image allocation belongs in the key: right after a zoom/fit
@@ -1247,6 +1363,7 @@ class Viewer(object):
                self.scroll.get_hadjustment().get_value(),
                self.scroll.get_vadjustment().get_value(),
                self.scale_shown, self.level_index, self.rendered_size,
+               self.ppu, self.unit,  # the ruler readouts convert with them
                img_alloc.width, img_alloc.height,
                view.width, view.height)
         if key == self.anno_drawn:
@@ -1267,6 +1384,19 @@ class Viewer(object):
                 anno["label"].show()
             else:
                 anno["label"].hide()
+        for anno in rulers:
+            a = self.image_px_to_view(self.px_from_world(anno["a"]))
+            b = self.image_px_to_view(self.px_from_world(anno["b"]))
+            mid_x, mid_y = (a[0] + b[0]) / 2, (a[1] + b[1]) / 2
+            if -40 <= mid_x <= view.width and -20 <= mid_y <= view.height:
+                dist = math.hypot(anno["b"][0] - anno["a"][0],
+                                  anno["b"][1] - anno["a"][1])
+                anno["label"].set_text(self.format_distance(dist))
+                anno["label"].set_margin_start(int(max(0, mid_x + 10)))
+                anno["label"].set_margin_top(int(max(0, mid_y - 30)))
+                anno["label"].show()
+            else:
+                anno["label"].hide()
         self.anno_image.set_from_pixbuf(buf)
         self.anno_image.set_margin_start(0)
         self.anno_image.set_margin_top(0)
@@ -1275,35 +1405,16 @@ class Viewer(object):
     def stamp_annotation(self, buf, shape):
         a = self.image_px_to_view(self.px_from_world(shape["a"]))
         b = self.image_px_to_view(self.px_from_world(shape["b"]))
+        if shape["kind"] == "ruler":
+            self.stamp_segment(buf, a, b, self.RULER_CASING,
+                               self.RULER_CORE)
+            for x, y in (a, b):  # endpoint markers
+                self.fill_rect(buf, x - 3, y - 3, 7, 7, self.RULER_CASING)
+                self.fill_rect(buf, x - 2, y - 2, 5, 5, self.RULER_CORE)
+            return
         core = self.color_rgba(shape["color"])
         if shape["kind"] == "line":
-            ax, ay = a
-            bx, by = b
-            if ay == by:    # horizontal
-                self.fill_rect(buf, min(ax, bx), ay - 1,
-                               abs(bx - ax) + 1, 3, self.ANNO_CASING)
-                self.fill_rect(buf, min(ax, bx), ay,
-                               abs(bx - ax) + 1, 1, core)
-            elif ax == bx:  # vertical
-                self.fill_rect(buf, ax - 1, min(ay, by),
-                               3, abs(by - ay) + 1, self.ANNO_CASING)
-                self.fill_rect(buf, ax, min(ay, by),
-                               1, abs(by - ay) + 1, core)
-            else:           # free angle: 1px-spaced dabs, 2x2 solid core
-                seg = self.clip_segment(a, b, buf.get_width(),
-                                        buf.get_height())
-                if seg is None:
-                    return
-                (ax, ay), (bx, by) = seg
-                steps = min(int(max(abs(bx - ax), abs(by - ay))) + 1, 8000)
-                points = [(ax + (bx - ax) * i / steps,
-                           ay + (by - ay) * i / steps)
-                          for i in range(steps + 1)]
-                for x, y in points:
-                    self.fill_rect(buf, x - 1, y - 1, 3, 3,
-                                   self.ANNO_CASING)
-                for x, y in points:
-                    self.fill_rect(buf, x - 1, y - 1, 2, 2, core)
+            self.stamp_segment(buf, a, b, self.ANNO_CASING, core)
             return
         x0, x1 = sorted((a[0], b[0]))
         y0, y1 = sorted((a[1], b[1]))
@@ -1396,6 +1507,7 @@ class Viewer(object):
         self.anno_text_bg = bg
         self.add_text_annotation(point, text, size, self.anno_color(), bg)
         self.anno_undo.append(("add", self.annotations[-1], None))
+        del self.anno_redo[:]
         self.update_anno_overlay()
         self.save_annotations()
 
@@ -1484,12 +1596,30 @@ class Viewer(object):
         entry.set_text(text[:anchor] + new + text[anchor + old_len:])
         entry.set_position(anchor + len(new))
 
+    def add_ruler_annotation(self, a, b):
+        label = Gtk.Label()
+        label.set_name("flateyes-ruler")  # same chip as the live readout
+        label.set_halign(Gtk.Align.START)
+        label.set_valign(Gtk.Align.START)
+        label.set_no_show_all(True)
+        label.get_style_context().add_provider(
+            self.chip_css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self.overlay.add_overlay(label)
+        try:
+            self.overlay.set_overlay_pass_through(label, True)
+        except AttributeError:  # GTK < 3.18
+            pass
+        self.annotations.append({"kind": "ruler", "a": a, "b": b,
+                                 "label": label})
+        self.anno_rev += 1
+
     def remove_last_annotation(self):
         if not self.annotations:
             return
         anno = self.annotations.pop()
         self.anno_undo.append(("remove", anno, len(self.annotations)))
-        if anno["kind"] == "text":
+        del self.anno_redo[:]
+        if "label" in anno:
             self.overlay.remove(anno["label"])
         self.anno_rev += 1
         self.update_anno_overlay()
@@ -1500,16 +1630,32 @@ class Viewer(object):
         if not self.anno_undo:
             self.show_toast("nothing to undo")
             return
-        op, anno, index = self.anno_undo.pop()
-        if op == "add":
-            if anno not in self.annotations:
-                return  # should not happen; the stack resets per image
-            self.annotations.remove(anno)
-            if anno["kind"] == "text":
-                self.overlay.remove(anno["label"])
-        else:  # "remove": put it back where it was
-            self.annotations.insert(min(index, len(self.annotations)), anno)
-            if anno["kind"] == "text":
+        op = self.anno_undo.pop()
+        self.apply_annotation_op(op, invert=True)
+        self.anno_redo.append(op)
+
+    def redo_annotation(self):
+        """Re-applies the last undone operation ("y")."""
+        if not self.anno_redo:
+            self.show_toast("nothing to redo")
+            return
+        op = self.anno_redo.pop()
+        self.apply_annotation_op(op, invert=False)
+        self.anno_undo.append(op)
+
+    def apply_annotation_op(self, op, invert):
+        """Plays an op forward (redo) or backward (undo)."""
+        action, anno, index = op
+        if (action == "add") == invert:     # take the annotation out
+            if anno in self.annotations:
+                self.annotations.remove(anno)
+                if "label" in anno:
+                    self.overlay.remove(anno["label"])
+        else:                               # put it (back) in
+            where = len(self.annotations) if index is None \
+                else min(index, len(self.annotations))
+            self.annotations.insert(where, anno)
+            if "label" in anno:
                 self.overlay.add_overlay(anno["label"])
                 try:
                     self.overlay.set_overlay_pass_through(anno["label"],
@@ -1523,10 +1669,11 @@ class Viewer(object):
     def clear_annotations(self):
         # runtime state only; the metadata on disk is left untouched
         for anno in self.annotations:
-            if anno["kind"] == "text":
+            if "label" in anno:
                 self.overlay.remove(anno["label"])
         self.annotations = []
         self.anno_undo = []
+        self.anno_redo = []
         self.anno_rev += 1
         self.anno_tool = None
         self.anno_start = self.anno_cursor = None
@@ -1544,7 +1691,17 @@ class Viewer(object):
     def save_annotations(self):
         """Autosaved on every change: sidecar first, cache as fallback."""
         lines = []
+        # The PPU used for this file is part of its metadata, so measurements
+        # read the same on the next open.  Stacks take ppu from the manifest.
+        if self.ppu and not self.stack_mode:
+            lines.append("ppu=%.10g" % self.ppu)
+            lines.append("unit=%s" % self.unit)
         for anno in self.annotations:
+            if anno["kind"] == "ruler":
+                lines.append("ruler=%.10g,%.10g,%.10g,%.10g"
+                             % (anno["a"][0], anno["a"][1],
+                                anno["b"][0], anno["b"][1]))
+                continue
             color = anno.get("color", self.ANNO_COLORS[0])
             if anno["kind"] == "text":
                 lines.append("text=%.10g,%.10g,%d,%s,%d,%s"
@@ -1579,6 +1736,7 @@ class Viewer(object):
     def load_annotations(self):
         if self.pixbuf is None:
             return  # animations cannot be annotated
+        ppu_restored = False
         for meta_path in self.annotation_paths():
             try:
                 with open(meta_path, "r", encoding="utf-8") as handle:
@@ -1593,7 +1751,14 @@ class Viewer(object):
                 if not sep:
                     continue
                 try:
-                    if key == "text":
+                    if key == "ppu":
+                        if not self.stack_mode and float(value) > 0:
+                            self.ppu = float(value)
+                            ppu_restored = True
+                    elif key == "unit":
+                        if not self.stack_mode and value.strip():
+                            self.unit = value.strip()
+                    elif key == "text":
                         x, y, size, color, bg, text = value.split(",", 5)
                         text = self.unescape_meta(text)
                         if text:
@@ -1602,6 +1767,11 @@ class Viewer(object):
                                 max(6, min(int(size), 96)),
                                 self.parse_color(color),
                                 bg=(bg.strip() != "0"))
+                    elif key == "ruler":
+                        ax, ay, bx, by = value.split(",")[:4]
+                        self.add_ruler_annotation(
+                            (float(ax), float(ay)),
+                            (float(bx), float(by)))
                     elif key in ("box", "ellipse", "line"):
                         ax, ay, bx, by, color = value.split(",", 4)
                         self.annotations.append({
@@ -1612,12 +1782,17 @@ class Viewer(object):
                 except ValueError:
                     continue  # skip malformed lines
             break  # first readable source wins
-        if self.annotations:
+        if self.annotations or ppu_restored:
+            parts = []
+            if self.annotations:
+                parts.append("%d annotation%s"
+                             % (len(self.annotations),
+                                "" if len(self.annotations) == 1 else "s"))
+            if ppu_restored:
+                parts.append("PPU %.4g px/%s" % (self.ppu, self.unit))
             self.anno_rev += 1
             self.update_anno_overlay()
-            self.show_toast("%d annotation%s restored"
-                            % (len(self.annotations),
-                               "" if len(self.annotations) == 1 else "s"))
+            self.show_toast(", ".join(parts) + " restored")
 
     @staticmethod
     def escape_meta(text):
@@ -1728,8 +1903,10 @@ class Viewer(object):
                     value = 0
                 if value > 0:
                     self.ppu = value
+            self.save_annotations()  # PPU is kept per file
         dialog.destroy()
         self.update_ruler_overlay()
+        self.update_anno_overlay()  # ruler annotation labels show distances
         self.update_status()
 
     # -- events ------------------------------------------------------------
@@ -1768,6 +1945,8 @@ class Viewer(object):
             self.remove_last_annotation()
         elif key in ("u", "U"):
             self.undo_annotation()
+        elif key in ("y", "Y"):
+            self.redo_annotation()
         elif key in ("c", "C"):
             if event.state & Gdk.ModifierType.CONTROL_MASK:
                 self.copy_view_to_clipboard()  # Ctrl+C
@@ -1799,6 +1978,10 @@ class Viewer(object):
                 self.pixbuf = self.levels[0]["pixbuf"]
                 self.rendered_size = None
             self.rescale()
+        elif key in ("comma", "less"):
+            self.browse_folder(-1)
+        elif key in ("period", "greater"):
+            self.browse_folder(1)
         elif key in ("bracketright", "bracketleft"):
             # jump to 100% of the neighbouring magnification level
             if self.stack_mode:
@@ -1903,12 +2086,21 @@ class Viewer(object):
         if point is None:
             return True
         if self.ruler_active:
-            if self.ruler_start is None or self.ruler_end is not None:
+            if self.ruler_start is None:
                 self.ruler_start = point           # start a new measurement
                 self.ruler_end = self.ruler_cursor = None
+                self.update_ruler_overlay()
             else:
-                self.ruler_end = self.snap_point(point, event.state)
-            self.update_ruler_overlay()
+                # second click commits the measurement as an annotation:
+                # it persists, undoes and saves like any drawn shape
+                self.add_ruler_annotation(
+                    self.ruler_start, self.snap_point(point, event.state))
+                self.anno_undo.append(("add", self.annotations[-1], None))
+                del self.anno_redo[:]
+                self.ruler_start = self.ruler_end = self.ruler_cursor = None
+                self.update_ruler_overlay()        # clear the live preview
+                self.update_anno_overlay()
+                self.save_annotations()
         elif self.anno_tool == "text":
             self.ask_annotation_text(point)
         elif self.anno_start is None:
@@ -1920,6 +2112,7 @@ class Viewer(object):
                     "color": self.anno_color()}
             self.annotations.append(anno)
             self.anno_undo.append(("add", anno, None))
+            del self.anno_redo[:]
             self.anno_rev += 1
             self.anno_start = self.anno_cursor = None
             self.update_anno_overlay()
@@ -2076,7 +2269,7 @@ def usage(stream):
         "      b/e box/ellipse (Shift = square/circle),\n"
         "      l line (Shift = horizontal/vertical/45), t text,\n"
         "      c cycle the annotation color,\n"
-        "      BackSpace remove last annotation, u undo add/remove,\n"
+        "      BackSpace remove last annotation, u/y undo/redo,\n"
         "      Ctrl+C copy the visible view to the clipboard, q quit\n"
         % (APP, APP, APP))
 
