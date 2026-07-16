@@ -1125,7 +1125,11 @@ class Viewer(object):
             return
         clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
         clipboard.set_image(pixbuf)
-        clipboard.store()
+        # No clipboard.store(): handing the data to a clipboard manager
+        # (e.g. the Exceed TurboX sync agent) can drop the image targets,
+        # leaving "no image in clipboard" on paste.  Serving the selection
+        # ourselves works everywhere while the viewer is running; the
+        # clipboard just empties when it quits.
         self.show_toast("copied  %dx%d" % (pixbuf.get_width(),
                                            pixbuf.get_height()))
 
