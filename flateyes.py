@@ -27,7 +27,8 @@ import sys
 import tempfile
 import time
 
-APP = "flateyes"
+APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
+APP_TITLE = "FlatEyes"  # display name
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -1029,7 +1030,7 @@ class Viewer(object):
 
     def update_title(self):
         name = os.path.basename(self.path or "")
-        self.window.set_title("%s - %s" % (name, APP))
+        self.window.set_title("%s - %s" % (name, APP_TITLE))
         full = self.path or ""
         self.path_label.set_tooltip_text(full)
         if len(full) > 72:  # keep very long paths on one short line
@@ -2027,6 +2028,30 @@ class Viewer(object):
         self.hint_image.set_margin_top(y0)
         self.hint_image.show()
 
+    def show_about(self, *args):
+        """About dialog: F1 or the right-click menu."""
+        dialog = Gtk.AboutDialog(transient_for=self.window, modal=True)
+        dialog.set_keep_above(True)  # stay over a fullscreen parent
+        dialog.set_program_name(APP_TITLE)
+        # Plain text on purpose: a website link cannot open anything on
+        # the closed network, so the URL is only shown, not clickable.
+        dialog.set_copyright("2026 FLATIDE LC.\nhttp://flatide.com")
+        dialog.run()
+        dialog.destroy()
+
+    def show_context_menu(self, event):
+        menu = Gtk.Menu()
+        item = Gtk.MenuItem(label="About %s" % APP_TITLE)
+        item.connect("activate", self.show_about)
+        menu.append(item)
+        menu.show_all()
+        self.context_menu = menu  # keep it referenced while it is up
+        try:
+            menu.popup_at_pointer(event)
+        except AttributeError:  # GTK < 3.22
+            menu.popup(None, None, None, None, event.button, event.time)
+        return True
+
     def ask_ppu(self):
         dialog = Gtk.Dialog(title="PPU", transient_for=self.window,
                             modal=True)
@@ -2159,6 +2184,8 @@ class Viewer(object):
             self.apply_help_visibility()
             self.apply_legend_visibility()
             self.update_view_overlays()
+        elif key == "F1":
+            self.show_about()
         elif key in ("F11", "Return", "KP_Enter"):
             # Enter as well: remote/VNC clients often swallow F11.
             state = self.window.get_window().get_state() if self.window.get_window() else 0
@@ -2189,7 +2216,11 @@ class Viewer(object):
         return True
 
     def on_button_press(self, widget, event):
-        if event.button != 1 or event.type != Gdk.EventType.BUTTON_PRESS:
+        if event.type != Gdk.EventType.BUTTON_PRESS:
+            return False
+        if event.button == 3:
+            return self.show_context_menu(event)
+        if event.button != 1:
             return False
         # Dragging pans in BOTH modes; the ruler places its point on the
         # release of a motionless click, so measuring and panning coexist.
@@ -2438,7 +2469,7 @@ def usage(stream):
         "      u/y undo/redo annotations (u also deletes, newest first),\n"
         "      Ctrl+C copy the visible view (info hidden) to the clipboard,\n"
         "      Ctrl+S save the view (info hidden) as flateyes_<name>,\n"
-        "      q quit\n"
+        "      F1/right-click About, q quit\n"
         % (APP, APP, APP))
 
 

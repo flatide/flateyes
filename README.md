@@ -192,6 +192,7 @@ sudo -u tduser DISPLAY=:1 XAUTHORITY=/home/tduser/.Xauthority \
 | `Ctrl+S` | 보이는 화면을 파일로 저장 — 캡처 범위는 `Ctrl+C`와 동일. 원본과 같은 폴더에 `flateyes_<원본파일명>`으로 저장하며 다시 저장하면 같은 파일을 덮어쓴다 (폴더가 읽기 전용이면 `~/.cache/flateyes/`에 저장) |
 | `p` | PPU(pixels per unit) 입력 — 파일별로 `.fe`에 저장·복원 (스택 모드에서는 manifest 값 사용) |
 | `[` / `]` | 스택 이전/다음 배율 레벨로 이동 |
+| `F1` / 우클릭 메뉴 | About (프로그램 정보) |
 | `q` | 종료 (`Esc`는 종료하지 않고 도구 모드만 빠져나온다) |
 
 ## 지원 포맷
