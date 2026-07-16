@@ -23,12 +23,15 @@ import os
 import re
 import signal
 import socket
+import struct
 import sys
 import tempfile
 import time
+import zlib
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
+VERSION = "1.0.0"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -352,6 +355,18 @@ def import_gtk():
             % (APP, exc))
         sys.exit(3)
     Gtk, Gdk, GdkPixbuf, GLib = _Gtk, _Gdk, _GdkPixbuf, _GLib
+    # PyGObject already ran gtk_init_check() while importing; when it
+    # failed (DISPLAY set but the X server unreachable: dead or restarted
+    # session, xauth mismatch, ...) the first widget would raise a
+    # RuntimeError traceback, so report it cleanly here instead.
+    ok = Gtk.init_check(sys.argv)  # GTK3 returns (bool, argv)
+    if isinstance(ok, tuple):
+        ok = ok[0]
+    if not ok:
+        sys.stderr.write(
+            "%s: cannot open display %s (X session not reachable)\n"
+            % (APP, os.environ.get("DISPLAY", "")))
+        sys.exit(3)
 
 
 def workarea_size():
@@ -385,6 +400,128 @@ def natural_key(name):
             for part in re.split(r"(\d+)", name.lower())]
 
 
+# ---------------------------------------------------------------------------
+# png metadata embedding (Ctrl+S)
+#
+# For PNGs the .fe metadata lives inside the image itself, as an iTXt chunk
+# (UTF-8, keyword "flateyes") before IEND, written only on an explicit
+# Ctrl+S — no sidecar.  Decoders must skip unknown ancillary chunks, so the
+# file stays a plain PNG everywhere else, but a copy carries its annotations
+# along.  Other formats have no such slot; Ctrl+S writes their .fe sidecar
+# instead (nothing autosaves either way).
+# ---------------------------------------------------------------------------
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+PNG_META_KEYWORD = b"flateyes"
+
+
+def is_png_file(path):
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(8) == PNG_SIGNATURE
+    except OSError:
+        return False
+
+
+def parse_itxt(body):
+    """Text of a flateyes iTXt chunk body; None when it is not ours."""
+    if not body.startswith(PNG_META_KEYWORD + b"\x00") \
+            or len(body) < len(PNG_META_KEYWORD) + 3:
+        return None
+    rest = body[len(PNG_META_KEYWORD) + 1:]
+    compressed = rest[0] == 1   # rest[1] is the compression method
+    rest = rest[2:]
+    for _ in range(2):          # language tag, translated keyword
+        _, sep, rest = rest.partition(b"\x00")
+        if not sep:
+            return None
+    try:
+        if compressed:
+            rest = zlib.decompress(rest)
+        return rest.decode("utf-8")
+    except (zlib.error, UnicodeDecodeError):
+        return None
+
+
+def read_png_metadata(path):
+    """Embedded flateyes metadata text from a PNG, or None.  Walks chunk
+    headers with seeks, so large images only cost a few reads."""
+    try:
+        with open(path, "rb") as handle:
+            if handle.read(8) != PNG_SIGNATURE:
+                return None
+            while True:
+                head = handle.read(8)
+                if len(head) < 8:
+                    return None
+                length, ctype = struct.unpack(">I4s", head)
+                if ctype == b"IEND":
+                    return None
+                if ctype == b"iTXt":
+                    body = handle.read(length)
+                    if len(body) < length:
+                        return None
+                    text = parse_itxt(body)
+                    if text is not None:
+                        return text
+                    handle.seek(4, 1)           # CRC
+                else:
+                    handle.seek(length + 4, 1)  # data + CRC
+    except OSError:
+        return None
+
+
+def write_png_metadata(path, text):
+    """Rewrite the PNG at path with our iTXt chunk inserted before IEND
+    (a previous flateyes chunk is dropped; text=None just removes it).
+    Pixel chunks are copied verbatim; the swap is atomic via os.replace,
+    so an interrupted save never corrupts the original."""
+    with open(path, "rb") as handle:
+        blob = handle.read()
+    if not blob.startswith(PNG_SIGNATURE):
+        raise ValueError("not a PNG")
+    out = [PNG_SIGNATURE]
+    pos = len(PNG_SIGNATURE)
+    done = False
+    while pos + 8 <= len(blob):
+        length, ctype = struct.unpack(">I4s", blob[pos:pos + 8])
+        end = pos + 8 + length + 4
+        if end > len(blob):
+            raise ValueError("truncated PNG")
+        if ctype == b"iTXt" \
+                and parse_itxt(blob[pos + 8:end - 4]) is not None:
+            pos = end   # drop the previous flateyes chunk
+            continue
+        if ctype == b"IEND":
+            if text is not None:
+                # keyword NUL, flag+method 0 (uncompressed), empty
+                # language tag and translated keyword, then the text
+                body = (PNG_META_KEYWORD + b"\x00\x00\x00\x00\x00"
+                        + text.encode("utf-8"))
+                out.append(struct.pack(">I", len(body)) + b"iTXt" + body
+                           + struct.pack(">I", zlib.crc32(b"iTXt" + body)))
+            out.append(blob[pos:])  # IEND and any trailing bytes verbatim
+            done = True
+            break
+        out.append(blob[pos:end])
+        pos = end
+    if not done:
+        raise ValueError("no IEND chunk")
+    folder = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix=".flateyes-", dir=folder)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(b"".join(out))
+        os.chmod(tmp, os.stat(path).st_mode & 0o7777)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 class Viewer(object):
     ZOOM_STEP = 1.25
     ZOOM_MIN = 0.05
@@ -396,9 +533,15 @@ class Viewer(object):
     HINT_CORE = 0x33BBFFFF
     DRAG_SLOP = 4                # px: press-release within this is a click
     ANNO_CASING = 0x000000A0     # shape annotation outline
-    ANNO_COLORS = ("#FF5040", "#FF9F1A", "#3DDC55", "#35C5FF",
-                   "#FF4FD8", "#FFFFFF")  # "c" cycles these
-    ANNO_COLOR_NAMES = ("red", "orange", "green", "sky", "pink", "white")
+    # One palette for the line and background pickers ("c" dialog).
+    # English labels only: X servers without Hangul fonts (e.g. XQuartz)
+    # render Korean UI text as boxes.
+    PALETTE = (("black", "#000000"), ("white", "#FFFFFF"),
+               ("red", "#FF5040"), ("orange", "#FF9F1A"),
+               ("green", "#3DDC55"), ("sky", "#35C5FF"),
+               ("pink", "#FF4FD8"))
+    DEFAULT_LINE = "#FF5040"     # red: visible on most captures
+    DEFAULT_BG = "#000000"
     HELP_KEYS = (("+/-", "zoom"), ("0", "1:1"), ("f", "fit"),
                  ("Enter", "full"), (",/.", "file"), ("Shift+,/.", "folder"),
                  ("drag", "pan"), ("Ctrl+wheel", "zoom"),
@@ -413,7 +556,7 @@ class Viewer(object):
         self.server_sock = server_sock
         self.path = None
         self.browse_root = None     # tree browsing root: first open's folder
-        self.capture_pending = False  # a Ctrl+C/s grab is waiting to run
+        self.capture_pending = False  # a Ctrl+C grab is waiting to run
         self.pixbuf = None          # active level (already orientation-fixed)
         self.animation = None       # animated image (shown unscaled)
         self.fit_mode = True
@@ -552,21 +695,28 @@ class Viewer(object):
         self.anno_start = None      # first corner (world)
         self.anno_cursor = None     # preview corner (world)
         self.annotations = []       # committed shapes and texts
+        self.is_png = False         # PNG: annotations embed on Ctrl+S,
+        self.embedded_meta = False  # ... and this file carries a chunk
         self.anno_undo = []         # ("add"|"remove", annotation, index)
         self.anno_redo = []         # undone ops; cleared by a new action
         self.anno_rev = 0           # bumped on add/remove for the key cache
         self.anno_drawn = None
         self.anno_font_size = 16    # last used text size (pt), sticky
-        self.anno_text_bg = True    # translucent backdrop, sticky
-        self.anno_color_index = 0   # "c" cycles ANNO_COLORS
+        # Shape style ("c" dialog): outline color and interior fill.
+        self.anno_line_color = self.DEFAULT_LINE
+        self.anno_outline = True                # draw the box/ellipse border
+        self.anno_fill = True                   # fill the box/ellipse
+        self.anno_fill_color = self.DEFAULT_BG
+        self.anno_fill_opaque = False           # off = translucent 0.35
+        # Text style (text dialog), sticky but separate from the shapes.
+        self.anno_text_color = self.DEFAULT_LINE
+        self.anno_text_bg = True                # backdrop on/off
+        self.anno_text_bg_color = self.DEFAULT_BG
+        self.anno_text_bg_opaque = False
         self.anno_image = Gtk.Image()
         self.anno_image.set_halign(Gtk.Align.START)
         self.anno_image.set_valign(Gtk.Align.START)
         self.anno_image.set_no_show_all(True)
-        self.anno_css = Gtk.CssProvider()
-        self.anno_css.load_from_data(
-            b"label { background-color: rgba(0,0,0,0.35);"
-            b" padding: 0px 3px; border-radius: 2px; }")
 
         for adj in (self.scroll.get_hadjustment(),
                     self.scroll.get_vadjustment()):
@@ -1140,51 +1290,32 @@ class Viewer(object):
         self.show_toast("copied  %dx%d" % (pixbuf.get_width(),
                                            pixbuf.get_height()))
 
-    def save_view_target(self):
-        """Save path (flateyes_<name> next to the file) and pixbuf type."""
-        base = "flateyes_" + os.path.basename(self.path or "image")
-        folder = os.path.dirname(os.path.abspath(self.path or ""))
-        ext = os.path.splitext(base)[1].lstrip(".").lower()
-        fmt = None
-        for candidate in GdkPixbuf.Pixbuf.get_formats():
-            if candidate.is_writable() and ext in candidate.get_extensions():
-                fmt = candidate.get_name()
-                break
-        if fmt is None:  # no writer for this extension: save a PNG copy
-            fmt = "png"
-            base += ".png"
-        return os.path.join(folder, base), fmt
-
-    def save_view(self):
-        """Ctrl+S: save the visible viewport (info overlays excluded) to
-        the same flateyes_<name> file on every save."""
-        self.capture_view(self.finish_save)
-
-    def finish_save(self, pixbuf):
-        if pixbuf is None:
-            self.show_toast("capture failed")
+    def embed_annotations(self):
+        """PNG branch of save_annotations: embed the metadata into the
+        viewed PNG itself, so a copied file carries its annotations along.
+        With nothing to embed, an existing chunk is removed."""
+        lines = self.serialize_annotations()
+        text = ("# flateyes annotations\n" + "\n".join(lines) + "\n") \
+            if lines else None
+        if text is None and not self.embedded_meta:
+            self.show_toast("no annotations to embed")
             return
-        target, fmt = self.save_view_target()
-        keys, values = (["quality"], ["92"]) if fmt == "jpeg" else ([], [])
         try:
-            pixbuf.savev(target, fmt, keys, values)
-        except GLib.Error:
-            # read-only image folder: keep the capture in the cache dir
-            fallback = os.path.join(GLib.get_user_cache_dir(), APP,
-                                    os.path.basename(target))
+            write_png_metadata(self.path, text)
+        except (OSError, ValueError):
+            self.show_toast("embed failed (read-only?)")
+            return
+        self.embedded_meta = text is not None
+        for stale in self.annotation_paths():
             try:
-                os.makedirs(os.path.dirname(fallback), exist_ok=True)
-                pixbuf.savev(fallback, fmt, keys, values)
-            except (GLib.Error, OSError):
-                self.show_toast("save failed (read-only?)")
-                return
-            target = fallback
-        name = os.path.basename(target)
-        if os.path.dirname(target) != \
-                os.path.dirname(os.path.abspath(self.path or "")):
-            name = target  # saved elsewhere: show where
-        self.show_toast("saved  %s  (%dx%d)"
-                        % (name, pixbuf.get_width(), pixbuf.get_height()))
+                os.unlink(stale)  # sidecar left behind by an older build
+            except OSError:
+                pass
+        if text is None:
+            self.show_toast("embedded annotations removed")
+        else:
+            self.show_toast("annotations embedded in %s"
+                            % os.path.basename(self.path))
 
     def show_toast(self, text, markup=False):
         if markup:
@@ -1492,12 +1623,12 @@ class Viewer(object):
         self.update_view_overlays()
 
     def anno_color(self):
-        return self.ANNO_COLORS[self.anno_color_index]
+        return self.anno_line_color
 
     @staticmethod
-    def color_rgba(hex_color):
+    def color_rgba(hex_color, alpha=0xFF):
         """"#RRGGBB" -> the 0xRRGGBBAA pixbuf fill value."""
-        return (int(hex_color[1:], 16) << 8) | 0xFF
+        return (int(hex_color[1:], 16) << 8) | alpha
 
     def constrain_corner(self, point, state):
         """Shift constrains: square/circle for shapes, 0/45/90 for lines."""
@@ -1524,6 +1655,12 @@ class Viewer(object):
                 and self.anno_cursor is not None:
             preview = {"kind": self.anno_tool, "a": self.anno_start,
                        "b": self.anno_cursor, "color": self.anno_color()}
+            if self.anno_tool in ("box", "ellipse"):
+                if self.anno_fill:
+                    preview["fill"] = self.anno_fill_color
+                    preview["fill_opaque"] = self.anno_fill_opaque
+                if not self.anno_outline:
+                    preview["outline"] = False
         if not self.draw_visible or self.rendered_size is None \
                 or not (shapes or preview or texts):
             self.anno_drawn = None
@@ -1538,7 +1675,8 @@ class Viewer(object):
         # and without it the corrected layout pass would hit the cache and
         # leave annotations displaced.
         img_alloc = self.image.get_allocation()
-        key = (self.anno_rev, self.anno_color_index,
+        key = (self.anno_rev, self.anno_line_color, self.anno_outline,
+               self.anno_fill, self.anno_fill_color, self.anno_fill_opaque,
                preview and (preview["a"], preview["b"]),
                self.scroll.get_hadjustment().get_value(),
                self.scroll.get_vadjustment().get_value(),
@@ -1598,7 +1736,19 @@ class Viewer(object):
             return
         x0, x1 = sorted((a[0], b[0]))
         y0, y1 = sorted((a[1], b[1]))
+        # The interior paints first so the outline stays on top; fill()
+        # replaces pixels (no blending), so the translucent alpha shows
+        # the image through the overlay rather than stacking.
+        fill_rgba = None
+        if shape.get("fill"):
+            fill_rgba = self.color_rgba(
+                shape["fill"], 0xFF if shape.get("fill_opaque") else 0x59)
+        outline = shape.get("outline", True)
         if shape["kind"] == "box":
+            if fill_rgba is not None:
+                self.fill_rect(buf, x0, y0, x1 - x0, y1 - y0, fill_rgba)
+            if not outline:
+                return
             for width, rgba in ((3, self.ANNO_CASING), (1, core)):
                 off = width // 2
                 self.fill_rect(buf, x0 - off, y0 - off,
@@ -1614,6 +1764,15 @@ class Viewer(object):
         cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
         rx, ry = (x1 - x0) / 2.0, (y1 - y0) / 2.0
         buf_w, buf_h = buf.get_width(), buf.get_height()
+        if fill_rgba is not None and rx >= 1 and ry >= 1:
+            # interior as one span per visible row
+            for row in range(max(int(cy - ry) + 1, 0),
+                             min(int(cy + ry) + 1, buf_h)):
+                offset = (row - cy) / ry
+                half = rx * math.sqrt(max(0.0, 1.0 - offset * offset))
+                self.fill_rect(buf, cx - half, row, 2 * half, 1, fill_rgba)
+        if not outline:
+            return
         steps = min(max(int(6.4 * max(rx, ry)), 16), 8000)
         points = [(x, y) for x, y in
                   ((cx + rx * math.cos(2 * math.pi * i / steps),
@@ -1644,7 +1803,7 @@ class Viewer(object):
         spin = Gtk.SpinButton.new_with_range(6, 96, 1)
         spin.set_value(self.anno_font_size)
         # Built-in hangul input for hosts without an input method.
-        hangul = Gtk.CheckButton(label="한글 (Shift+Space)")
+        hangul = Gtk.CheckButton(label="Hangul (Shift+Space)")
         state = {"composer": HangulComposer(), "check": hangul,
                  "anchor": None}
         hangul.connect("toggled",
@@ -1659,13 +1818,61 @@ class Viewer(object):
             return self.on_text_entry_key(editable, event, state)
 
         view.connect("key-press-event", on_view_key)
-        bgcheck = Gtk.CheckButton(label="배경")
+        text_combo = self.color_combo(self.anno_text_color)
+        bgcheck = Gtk.CheckButton(label="background")
         bgcheck.set_active(self.anno_text_bg)
+        bg_combo = self.color_combo(self.anno_text_bg_color)
+        opaque = Gtk.CheckButton(label="opaque")
+        opaque.set_active(self.anno_text_bg_opaque)
+
+        def sync_bg_widgets(*args):
+            for widget in (bg_combo, opaque):
+                widget.set_sensitive(bgcheck.get_active())
+
+        bgcheck.connect("toggled", sync_bg_widgets)
+        sync_bg_widgets()
+        hexes = [hex_ for _, hex_ in self.PALETTE]
+        # Live preview: the entered text tracks the chosen size, text
+        # color and backdrop settings.  A buffer tag re-applied on every
+        # change works on any GTK3, unlike the 3.20+ "textview" CSS node
+        # or the deprecated override_font.
+        preview_tag = view.get_buffer().create_tag(
+            None, size_points=float(self.anno_font_size),
+            foreground=self.anno_text_color)
+
+        def apply_preview(*args):
+            buf = view.get_buffer()
+            preview_tag.props.size_points = spin.get_value()
+            preview_tag.props.foreground = \
+                hexes[max(text_combo.get_active(), 0)]
+            if bgcheck.get_active():
+                rgba = Gdk.RGBA()
+                rgba.parse(hexes[max(bg_combo.get_active(), 0)])
+                rgba.alpha = 1.0 if opaque.get_active() else 0.35
+                preview_tag.props.background_rgba = rgba
+                preview_tag.props.background_set = True
+            else:
+                preview_tag.props.background_set = False
+            buf.apply_tag(preview_tag, buf.get_start_iter(),
+                          buf.get_end_iter())
+
+        spin.connect("value-changed", apply_preview)
+        text_combo.connect("changed", apply_preview)
+        bg_combo.connect("changed", apply_preview)
+        bgcheck.connect("toggled", apply_preview)
+        opaque.connect("toggled", apply_preview)
+        view.get_buffer().connect("changed", apply_preview)
+        apply_preview()
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         row.pack_start(Gtk.Label(label="size (pt)"), False, False, 0)
         row.pack_start(spin, False, False, 0)
-        row.pack_start(bgcheck, False, False, 6)
         row.pack_start(hangul, False, False, 12)
+        bgrow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        bgrow.pack_start(Gtk.Label(label="text"), False, False, 0)
+        bgrow.pack_start(text_combo, False, False, 0)
+        bgrow.pack_start(bgcheck, False, False, 6)
+        bgrow.pack_start(bg_combo, False, False, 0)
+        bgrow.pack_start(opaque, False, False, 6)
         hint = Gtk.Label()
         hint.set_markup("<small>Enter: new line · Ctrl+Enter: OK</small>")
         hint.set_halign(Gtk.Align.START)
@@ -1674,24 +1881,32 @@ class Viewer(object):
         box.set_spacing(6)
         box.pack_start(scroll, True, True, 0)
         box.pack_start(row, False, False, 0)
+        box.pack_start(bgrow, False, False, 0)
         box.pack_start(hint, False, False, 0)
         dialog.show_all()
         confirmed = dialog.run() == Gtk.ResponseType.OK
         text = editable.get_text().strip()
         size = int(spin.get_value())
+        text_color = hexes[max(text_combo.get_active(), 0)]
         bg = bgcheck.get_active()
+        bg_color = hexes[max(bg_combo.get_active(), 0)]
+        bg_opaque = opaque.get_active()
         dialog.destroy()
         if not confirmed or not text:
             return
         self.anno_font_size = size
+        self.anno_text_color = text_color
         self.anno_text_bg = bg
-        self.add_text_annotation(point, text, size, self.anno_color(), bg)
+        self.anno_text_bg_color = bg_color
+        self.anno_text_bg_opaque = bg_opaque
+        self.add_text_annotation(point, text, size, text_color, bg,
+                                 bg_color, bg_opaque)
         self.anno_undo.append(("add", self.annotations[-1], None))
         del self.anno_redo[:]
         self.update_anno_overlay()
-        self.save_annotations()
 
-    def add_text_annotation(self, point, text, size, color, bg=True):
+    def add_text_annotation(self, point, text, size, color, bg=True,
+                            bg_color="#000000", bg_opaque=False):
         label = Gtk.Label()
         label.set_halign(Gtk.Align.START)
         label.set_valign(Gtk.Align.START)
@@ -1699,8 +1914,14 @@ class Viewer(object):
         label.set_markup('<span font="%d" foreground="%s">%s</span>'
                          % (size, color, GLib.markup_escape_text(text)))
         if bg:
+            provider = Gtk.CssProvider()
+            provider.load_from_data(
+                ("label { background-color: %s; padding: 0px 3px;"
+                 " border-radius: 2px; }"
+                 % self.css_rgba(bg_color, 1.0 if bg_opaque else 0.35))
+                .encode("utf-8"))
             label.get_style_context().add_provider(
-                self.anno_css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+                provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.overlay.add_overlay(label)
         try:
             self.overlay.set_overlay_pass_through(label, True)
@@ -1708,8 +1929,121 @@ class Viewer(object):
             pass
         self.annotations.append({"kind": "text", "at": point,
                                  "text": text, "size": size,
-                                 "color": color, "bg": bg, "label": label})
+                                 "color": color, "bg": bg,
+                                 "bg_color": bg_color,
+                                 "bg_opaque": bg_opaque, "label": label})
         self.anno_rev += 1
+
+    @staticmethod
+    def css_rgba(color, alpha):
+        """'#RRGGBB' + alpha as a CSS rgba() literal."""
+        return "rgba(%d,%d,%d,%.2f)" % (int(color[1:3], 16),
+                                        int(color[3:5], 16),
+                                        int(color[5:7], 16), alpha)
+
+    @staticmethod
+    def color_swatch(color, width=24, height=14):
+        """Solid '#RRGGBB' sample pixbuf with a 1px gray frame (so white
+        stays visible); fill/subpixbuf only — no cairo on the targets."""
+        swatch = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8,
+                                      width, height)
+        swatch.fill(0x808080FF)
+        swatch.new_subpixbuf(1, 1, width - 2, height - 2).fill(
+            Viewer.color_rgba(color))
+        return swatch
+
+    def color_combo(self, active):
+        """Palette dropdown: a swatch pixbuf next to each color name."""
+        store = Gtk.ListStore(GdkPixbuf.Pixbuf, str)
+        for name, hex_ in self.PALETTE:
+            store.append([self.color_swatch(hex_), name])
+        combo = Gtk.ComboBox(model=store)
+        swatch_cell = Gtk.CellRendererPixbuf()
+        combo.pack_start(swatch_cell, False)
+        combo.add_attribute(swatch_cell, "pixbuf", 0)
+        name_cell = Gtk.CellRendererText()
+        combo.pack_start(name_cell, True)
+        combo.add_attribute(name_cell, "text", 1)
+        hexes = [hex_ for _, hex_ in self.PALETTE]
+        combo.set_active(hexes.index(active) if active in hexes else 0)
+        return combo
+
+    def ask_annotation_colors(self):
+        """"c": shape style — the outline color and the box/ellipse
+        interior fill.  Texts pick their own colors in the "t" dialog;
+        the ruler keeps its fixed color."""
+        dialog = Gtk.Dialog(title="Colors", transient_for=self.window,
+                            modal=True)
+        dialog.set_keep_above(True)  # stay over a fullscreen parent
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("OK", Gtk.ResponseType.OK)
+        dialog.set_default_response(Gtk.ResponseType.OK)
+        line_combo = self.color_combo(self.anno_line_color)
+        fill_combo = self.color_combo(self.anno_fill_color)
+        use_outline = Gtk.CheckButton(label="use")
+        use_outline.set_active(self.anno_outline)
+        use_fill = Gtk.CheckButton(label="use")
+        use_fill.set_active(self.anno_fill)
+        fill_opaque = Gtk.CheckButton(label="opaque")
+        fill_opaque.set_active(self.anno_fill_opaque)
+
+        def sync_style_widgets(*args):
+            line_combo.set_sensitive(use_outline.get_active())
+            for widget in (fill_combo, fill_opaque):
+                widget.set_sensitive(use_fill.get_active())
+            # an invisible shape helps nobody: whichever of outline/fill
+            # is the last one on cannot be unchecked
+            use_outline.set_sensitive(use_fill.get_active())
+            use_fill.set_sensitive(use_outline.get_active())
+
+        use_outline.connect("toggled", sync_style_widgets)
+        use_fill.connect("toggled", sync_style_widgets)
+        sync_style_widgets()
+        grid = Gtk.Grid()
+        grid.set_column_spacing(8)
+        grid.set_row_spacing(6)
+        for index, (title, combo) in enumerate(
+                (("line", line_combo), ("fill", fill_combo))):
+            label = Gtk.Label(label=title)
+            label.set_halign(Gtk.Align.START)
+            grid.attach(label, 0, index, 1, 1)
+            grid.attach(combo, 1, index, 1, 1)
+        grid.attach(use_outline, 2, 0, 1, 1)
+        grid.attach(use_fill, 2, 1, 1, 1)
+        grid.attach(fill_opaque, 3, 1, 1, 1)
+        box = dialog.get_content_area()
+        box.set_border_width(10)
+        box.set_spacing(6)
+        box.pack_start(grid, False, False, 0)
+        dialog.show_all()
+        confirmed = dialog.run() == Gtk.ResponseType.OK
+        hexes = [hex_ for _, hex_ in self.PALETTE]
+        line_color = hexes[max(line_combo.get_active(), 0)]
+        fill_color = hexes[max(fill_combo.get_active(), 0)]
+        outline_on = use_outline.get_active()
+        fill_on = use_fill.get_active()
+        fill_op = fill_opaque.get_active()
+        dialog.destroy()
+        if not confirmed:
+            return
+        self.anno_line_color = line_color
+        self.anno_outline = outline_on
+        self.anno_fill_color = fill_color
+        self.anno_fill = fill_on
+        self.anno_fill_opaque = fill_op
+        if outline_on:
+            line_desc = ('<span foreground="%s">■■</span> line'
+                         % line_color)
+        else:
+            line_desc = "line off"
+        if fill_on:
+            fill_desc = ('<span foreground="%s">■■</span> fill %s'
+                         % (fill_color,
+                            "opaque" if fill_op else "translucent"))
+        else:
+            fill_desc = "fill off"
+        self.show_toast("%s   %s" % (line_desc, fill_desc), markup=True)
+        self.update_anno_overlay()  # a live shape preview restyles too
 
     def on_text_entry_key(self, entry, event, state):
         """Hangul composition for the annotation text entry."""
@@ -1832,7 +2166,6 @@ class Viewer(object):
                     pass
         self.anno_rev += 1
         self.update_anno_overlay()
-        self.save_annotations()
 
     def clear_annotations(self):
         # runtime state only; the metadata on disk is left untouched
@@ -1856,8 +2189,8 @@ class Viewer(object):
                 os.path.join(GLib.get_user_cache_dir(), "flateyes",
                              digest + ".fe"))
 
-    def save_annotations(self):
-        """Autosaved on every change: sidecar first, cache as fallback."""
+    def serialize_annotations(self):
+        """Metadata lines shared by the sidecar file and the PNG chunk."""
         lines = []
         # The PPU used for this file is part of its metadata, so measurements
         # read the same on the next open.  Stacks take ppu from the manifest.
@@ -1870,86 +2203,161 @@ class Viewer(object):
                              % (anno["a"][0], anno["a"][1],
                                 anno["b"][0], anno["b"][1]))
                 continue
-            color = anno.get("color", self.ANNO_COLORS[0])
+            color = anno.get("color", self.DEFAULT_LINE)
             if anno["kind"] == "text":
-                lines.append("text=%.10g,%.10g,%d,%s,%d,%s"
+                if anno.get("bg", True):
+                    # backdrop as #RRGGBBAA (0x59 = the translucent 0.35);
+                    # older builds read any non-"0" value as their default
+                    backdrop = "%s%02X" % (
+                        anno.get("bg_color", "#000000"),
+                        255 if anno.get("bg_opaque") else 89)
+                else:
+                    backdrop = "0"
+                lines.append("text=%.10g,%.10g,%d,%s,%s,%s"
                              % (anno["at"][0], anno["at"][1],
-                                anno["size"], color,
-                                1 if anno.get("bg", True) else 0,
+                                anno["size"], color, backdrop,
                                 self.escape_meta(anno["text"])))
             else:
-                lines.append("%s=%.10g,%.10g,%.10g,%.10g,%s"
+                if anno.get("fill"):
+                    # same #RRGGBBAA form as the text backdrop field
+                    fill = "%s%02X" % (anno["fill"],
+                                       255 if anno.get("fill_opaque")
+                                       else 89)
+                else:
+                    fill = "0"
+                if not anno.get("outline", True):
+                    color = "0"  # no border ("0" like an absent fill)
+                lines.append("%s=%.10g,%.10g,%.10g,%.10g,%s,%s"
                              % (anno["kind"], anno["a"][0], anno["a"][1],
-                                anno["b"][0], anno["b"][1], color))
+                                anno["b"][0], anno["b"][1], color, fill))
+        return lines
+
+    def save_annotations(self):
+        """Ctrl+S: persist the annotation metadata.  Nothing autosaves —
+        drawings and PPU changes live in memory until this explicit save,
+        and are lost when another image is opened without saving."""
+        if self.path and self.is_png:
+            self.embed_annotations()  # into the PNG itself; no sidecar
+        else:
+            self.save_sidecar()       # other formats: .fe next to the file
+
+    def save_sidecar(self):
+        """Sidecar first, cache as fallback; saving with no annotations
+        and no PPU removes the metadata files instead."""
+        lines = self.serialize_annotations()
         candidates = self.annotation_paths()
         if not lines:
+            removed = False
             for path in candidates:
                 try:
                     os.unlink(path)
+                    removed = True
                 except OSError:
                     pass
+            self.show_toast("saved annotations removed" if removed
+                            else "no annotations to save")
             return
-        data = "# flateyes annotations\n" + "\n".join(lines) + "\n"
+        data = "# flateyes annotations\n" \
+            + "".join(line + "\n" for line in lines)
         for path in candidates:
             try:
                 if path != candidates[0]:
                     os.makedirs(os.path.dirname(path), exist_ok=True)
                 with open(path, "w", encoding="utf-8") as handle:
                     handle.write(data)
+                # the cache fallback lives elsewhere: show the full path
+                self.show_toast("annotations saved  %s"
+                                % (os.path.basename(path)
+                                   if path == candidates[0] else path))
                 return
             except OSError:
                 continue
         self.show_toast("annotations not saved (read-only?)")
 
     def load_annotations(self):
+        self.is_png = bool(self.path) and is_png_file(self.path)
+        self.embedded_meta = False
         if self.pixbuf is None:
             return  # animations cannot be annotated
-        ppu_restored = False
-        for meta_path in self.annotation_paths():
-            try:
-                with open(meta_path, "r", encoding="utf-8") as handle:
-                    lines = handle.read().splitlines()
-            except OSError:
-                continue
-            for raw in lines:
-                line = raw.strip()
-                if not line or line.startswith("#"):
-                    continue
-                key, sep, value = line.partition("=")
-                if not sep:
-                    continue
+        lines = None
+        if self.is_png:
+            embedded = read_png_metadata(self.path)
+            self.embedded_meta = embedded is not None
+            if embedded is not None:
+                lines = embedded.splitlines()
+        # For PNGs the embedded chunk is authoritative; the sidecar below
+        # only catches files annotated by older builds (Ctrl+S migrates
+        # them into the PNG).  Every other format saves there on Ctrl+S.
+        if lines is None:
+            for meta_path in self.annotation_paths():
                 try:
-                    if key == "ppu":
-                        if not self.stack_mode and float(value) > 0:
-                            self.ppu = float(value)
-                            ppu_restored = True
-                    elif key == "unit":
-                        if not self.stack_mode and value.strip():
-                            self.unit = value.strip()
-                    elif key == "text":
-                        x, y, size, color, bg, text = value.split(",", 5)
-                        text = self.unescape_meta(text)
-                        if text:
-                            self.add_text_annotation(
-                                (float(x), float(y)), text,
-                                max(6, min(int(size), 96)),
-                                self.parse_color(color),
-                                bg=(bg.strip() != "0"))
-                    elif key == "ruler":
-                        ax, ay, bx, by = value.split(",")[:4]
-                        self.add_ruler_annotation(
-                            (float(ax), float(ay)),
-                            (float(bx), float(by)))
-                    elif key in ("box", "ellipse", "line"):
-                        ax, ay, bx, by, color = value.split(",", 4)
-                        self.annotations.append({
-                            "kind": key,
+                    with open(meta_path, "r", encoding="utf-8") as handle:
+                        lines = handle.read().splitlines()
+                    break  # first readable source wins
+                except OSError:
+                    continue
+        ppu_restored = False
+        for raw in lines or []:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, sep, value = line.partition("=")
+            if not sep:
+                continue
+            try:
+                if key == "ppu":
+                    if not self.stack_mode and float(value) > 0:
+                        self.ppu = float(value)
+                        ppu_restored = True
+                elif key == "unit":
+                    if not self.stack_mode and value.strip():
+                        self.unit = value.strip()
+                elif key == "text":
+                    x, y, size, color, bg, text = value.split(",", 5)
+                    text = self.unescape_meta(text)
+                    bg = bg.strip()
+                    bg_color, bg_opaque = "#000000", False
+                    if bg.startswith("#") and len(bg) == 9:
+                        try:  # "#RRGGBBAA"; "0"/"1" come from older builds
+                            int(bg[1:9], 16)
+                            bg_color = bg[:7]
+                            bg_opaque = int(bg[7:9], 16) >= 0x80
+                        except ValueError:
+                            pass
+                    if text:
+                        self.add_text_annotation(
+                            (float(x), float(y)), text,
+                            max(6, min(int(size), 96)),
+                            self.parse_color(color),
+                            bg=(bg != "0"), bg_color=bg_color,
+                            bg_opaque=bg_opaque)
+                elif key == "ruler":
+                    ax, ay, bx, by = value.split(",")[:4]
+                    self.add_ruler_annotation(
+                        (float(ax), float(ay)),
+                        (float(bx), float(by)))
+                elif key in ("box", "ellipse", "line"):
+                    parts = value.split(",")
+                    ax, ay, bx, by, color = parts[:5]
+                    anno = {"kind": key,
                             "a": (float(ax), float(ay)),
                             "b": (float(bx), float(by)),
-                            "color": self.parse_color(color)})
-                except ValueError:
-                    continue  # skip malformed lines
-            break  # first readable source wins
+                            "color": self.parse_color(color)}
+                    if color.strip() == "0" and key != "line":
+                        anno["outline"] = False  # border switched off
+                    # 6th field since the fill feature: #RRGGBBAA or "0"
+                    fill = parts[5].strip() if len(parts) > 5 else "0"
+                    if fill.startswith("#") and len(fill) == 9:
+                        try:
+                            int(fill[1:9], 16)
+                            anno["fill"] = fill[:7]
+                            anno["fill_opaque"] = int(fill[7:9],
+                                                      16) >= 0x80
+                        except ValueError:
+                            pass
+                    self.annotations.append(anno)
+            except ValueError:
+                continue  # skip malformed lines
         # Restored annotations enter the undo stack as adds, so "u"
         # deletes newest-first across restored and freshly drawn ones
         # alike (delete-last is folded into undo/redo).
@@ -1998,7 +2406,7 @@ class Viewer(object):
                 return text
             except ValueError:
                 pass
-        return Viewer.ANNO_COLORS[0]
+        return Viewer.DEFAULT_LINE
 
     def update_hint_overlay(self):
         """Outline the area the next magnification level covers."""
@@ -2052,6 +2460,7 @@ class Viewer(object):
         dialog = Gtk.AboutDialog(transient_for=self.window, modal=True)
         dialog.set_keep_above(True)  # stay over a fullscreen parent
         dialog.set_program_name(APP_TITLE)
+        dialog.set_version(VERSION)
         # Plain text on purpose: a website link cannot open anything on
         # the closed network, so the URL is only shown, not clickable.
         dialog.set_copyright("2026 FLATIDE LC.\nhttp://flatide.com")
@@ -2100,7 +2509,6 @@ class Viewer(object):
                     value = 0
                 if value > 0:
                     self.ppu = value
-            self.save_annotations()  # PPU is kept per file
         dialog.destroy()
         self.update_ruler_overlay()
         self.update_anno_overlay()  # ruler annotation labels show distances
@@ -2145,18 +2553,11 @@ class Viewer(object):
         elif key in ("c", "C"):
             if event.state & Gdk.ModifierType.CONTROL_MASK:
                 self.copy_view_to_clipboard()  # Ctrl+C
-            else:                              # plain c: cycle the color
-                self.anno_color_index = (self.anno_color_index + 1) \
-                    % len(self.ANNO_COLORS)
-                self.show_toast(
-                    '<span foreground="%s">■■</span> %s'
-                    % (self.anno_color(),
-                       self.ANNO_COLOR_NAMES[self.anno_color_index]),
-                    markup=True)
-                self.update_anno_overlay()
+            else:
+                self.ask_annotation_colors()   # plain c: color dialog
         elif key in ("s", "S") \
                 and event.state & Gdk.ModifierType.CONTROL_MASK:
-            self.save_view()  # Ctrl+S
+            self.save_annotations()  # Ctrl+S
         elif key in ("p", "P"):
             if self.stack_mode:  # the manifest is authoritative for stacks
                 self.show_toast("PPU from stack manifest: %.4g px/%s"
@@ -2313,7 +2714,6 @@ class Viewer(object):
                 self.ruler_start = self.ruler_end = self.ruler_cursor = None
                 self.update_ruler_overlay()        # clear the live preview
                 self.update_anno_overlay()
-                self.save_annotations()
         elif self.anno_tool == "text":
             self.ask_annotation_text(point)
         elif self.anno_start is None:
@@ -2323,13 +2723,18 @@ class Viewer(object):
             anno = {"kind": self.anno_tool, "a": self.anno_start,
                     "b": self.constrain_corner(point, event.state),
                     "color": self.anno_color()}
+            if self.anno_tool in ("box", "ellipse"):
+                if self.anno_fill:
+                    anno["fill"] = self.anno_fill_color
+                    anno["fill_opaque"] = self.anno_fill_opaque
+                if not self.anno_outline:
+                    anno["outline"] = False
             self.annotations.append(anno)
             self.anno_undo.append(("add", anno, None))
             del self.anno_redo[:]
             self.anno_rev += 1
             self.anno_start = self.anno_cursor = None
             self.update_anno_overlay()
-            self.save_annotations()
         return True
 
     def tool_cursor(self):
@@ -2484,10 +2889,14 @@ def usage(stream):
         "      r ruler (Shift = free angle, Esc ends),\n"
         "      b/e box/ellipse (Shift = square/circle),\n"
         "      l line (Shift = horizontal/vertical/45), t text,\n"
-        "      c cycle the annotation color,\n"
+        "      c shape style: outline (use on/off) and box/ellipse\n"
+        "        fill (use on/off, opaque/translucent); one of the\n"
+        "        two always stays on and texts style themselves,\n"
         "      u/y undo/redo annotations (u also deletes, newest first),\n"
         "      Ctrl+C copy the visible view (info hidden) to the clipboard,\n"
-        "      Ctrl+S save the view (info hidden) as flateyes_<name>,\n"
+        "      Ctrl+S save the annotations and PPU (no autosave):\n"
+        "             embedded into a PNG image itself, to a .fe\n"
+        "             sidecar file for other formats,\n"
         "      F1/right-click About, q quit\n"
         % (APP, APP, APP))
 
