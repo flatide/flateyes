@@ -627,6 +627,18 @@ class Viewer(object):
     def load(self, path, legend_path=None, ppu=None, unit=None, stack=False,
              levels=None):
         stack = stack or levels is not None
+        if not stack and os.path.isdir(path):
+            # A folder opens its first image (subfolders included) and
+            # Shift+,/. then cycles the whole tree under that folder.
+            root = os.path.abspath(path)
+            result = "ERR no images found under: %s" % root
+            for folder in self.image_folders(root):
+                for candidate in self.folder_images(folder):
+                    result = self.load(candidate, legend_path, ppu, unit)
+                    if result == "OK":
+                        self.browse_root = root
+                        return result
+            return result
         if not os.path.isfile(path):
             return "ERR no such file: %s" % path
         # Decode the legend first so a bad legend leaves the window untouched.
@@ -2313,14 +2325,16 @@ class Viewer(object):
 
 def usage(stream):
     stream.write(
-        "usage: %s [-l LEGEND_FILE] [-p PPU] [-u UNIT] IMAGE_FILE\n"
+        "usage: %s [-l LEGEND_FILE] [-p PPU] [-u UNIT] [IMAGE_FILE|FOLDER]\n"
         "       %s [-l LEGEND_FILE] [-u UNIT] -s STACK_FILE\n"
         "       %s [-l LEGEND_FILE] [-u UNIT] --level IMG -p PPU\n"
         "                 [--center X,Y] [--level IMG -p PPU ...]\n"
         "\n"
         "Opens IMAGE_FILE in a viewer window on $DISPLAY.  If a viewer is\n"
         "already running on that display, the image replaces the one in the\n"
-        "existing window and this process exits immediately.\n"
+        "existing window and this process exits immediately.  With a FOLDER\n"
+        "(default: the current directory) the first image in it or its\n"
+        "subfolders opens instead.\n"
         "\n"
         "  -l, --legend LEGEND_FILE  overlay LEGEND_FILE at the bottom-right\n"
         "                            corner; a request without -l removes it\n"
@@ -2338,6 +2352,7 @@ def usage(stream):
         "                            --level, for misaligned captures\n"
         "\n"
         "keys: +/- zoom, 0 actual size, f fit, Enter/F11 fullscreen,\n"
+        "      ,/. next/prev image, Shift+,/. next/prev folder,\n"
         "      Ctrl+wheel zoom, drag to pan, o next-level outline,\n"
         "      i info overlays (help/legend/outline) on/off,\n"
         "      Tab drawing overlays (ruler/annotations) on/off,\n"
@@ -2420,9 +2435,11 @@ def parse_args(args):
         i += 1
     sources = (1 if paths else 0) + (1 if stack_file else 0) \
         + (1 if levels else 0)
-    if sources != 1 or len(paths) > 1:
+    if sources > 1 or len(paths) > 1:
         usage(sys.stderr)
         return 2
+    if sources == 0:  # no input: browse the current folder's images
+        paths = ["."]
     if levels:
         if ppu is not None:
             sys.stderr.write("%s: --ppu before the first --level is "
@@ -2454,8 +2471,13 @@ def main(argv):
                 return 1
     else:
         path = os.path.abspath(path)
-        if not os.path.isfile(path):
-            sys.stderr.write("%s: no such file: %s\n" % (APP, path))
+        if stack:
+            if not os.path.isfile(path):
+                sys.stderr.write("%s: no such file: %s\n" % (APP, path))
+                return 1
+        elif not os.path.isfile(path) and not os.path.isdir(path):
+            sys.stderr.write("%s: no such file or folder: %s\n"
+                             % (APP, path))
             return 1
     if legend is not None:
         legend = os.path.abspath(legend)

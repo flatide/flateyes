@@ -44,6 +44,11 @@ chmod +x /usr/local/bin/flateyes
 ```sh
 DISPLAY=:1 flateyes /path/to/image.jpg
 
+# 폴더를 주면(생략하면 현재 폴더) 그 안(하위 폴더 포함)의 첫 이미지를 열고,
+# ,/. 와 Shift+,/. 로 폴더 트리를 브라우징한다
+DISPLAY=:1 flateyes /path/to/folder
+DISPLAY=:1 flateyes
+
 # 범례(legend) 이미지를 우하단에 오버레이로 함께 표시
 DISPLAY=:1 flateyes --legend /path/to/legend.png /path/to/image.jpg
 
