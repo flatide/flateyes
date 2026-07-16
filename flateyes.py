@@ -403,7 +403,7 @@ class Viewer(object):
                  ("drag", "pan"), ("Ctrl+wheel", "zoom"),
                  ("r", "ruler"), ("b/e/l", "shape"), ("t", "text"),
                  ("c", "color"), ("u/y", "undo/redo"), ("BkSp", "delete"),
-                 ("Ctrl+C", "copy"), ("p", "PPU"),
+                 ("Ctrl+C", "copy"), ("s", "save"), ("p", "PPU"),
                  ("o", "outline"), ("[/]", "level"), ("i", "info"),
                  ("Tab", "drawings"), ("q", "quit"))
 
@@ -412,6 +412,7 @@ class Viewer(object):
         self.server_sock = server_sock
         self.path = None
         self.browse_root = None     # tree browsing root: first open's folder
+        self.capture_pending = False  # a Ctrl+C/s grab is waiting to run
         self.pixbuf = None          # active level (already orientation-fixed)
         self.animation = None       # animated image (shown unscaled)
         self.fit_mode = True
@@ -1085,14 +1086,40 @@ class Viewer(object):
             self.legend_image.set_from_pixbuf(self.legend_pixbuf.scale_simple(
                 width, height, GdkPixbuf.InterpType.BILINEAR))
 
-    def copy_view_to_clipboard(self):
-        """Copy the visible viewport, overlays included, to the clipboard."""
+    def capture_view(self, callback):
+        """Grab the visible viewport with the info overlays hidden and hand
+        the pixbuf to callback.  Painting only happens on frame clock ticks
+        back in the main loop, so the grab runs from a timeout after the
+        hidden widgets have actually left the screen."""
         win = self.window.get_window()
-        if win is None:
+        if win is None or self.capture_pending:
             return
-        alloc = self.overlay.get_allocation()
-        pixbuf = Gdk.pixbuf_get_from_window(win, alloc.x, alloc.y,
-                                            alloc.width, alloc.height)
+        self.capture_pending = True
+        self.toast_label.hide()
+        hidden = []
+        for widget in (self.help_label, self.status_label, self.path_label,
+                       self.legend_frame, self.hint_image):
+            if widget.get_visible():
+                widget.hide()
+                hidden.append(widget)
+
+        def grab():
+            alloc = self.overlay.get_allocation()
+            pixbuf = Gdk.pixbuf_get_from_window(win, alloc.x, alloc.y,
+                                                alloc.width, alloc.height)
+            for widget in hidden:
+                widget.show()
+            self.capture_pending = False
+            callback(pixbuf)
+            return False
+
+        GLib.timeout_add(150, grab)
+
+    def copy_view_to_clipboard(self):
+        """Ctrl+C: the visible viewport, info overlays excluded."""
+        self.capture_view(self.finish_copy)
+
+    def finish_copy(self, pixbuf):
         if pixbuf is None:
             self.show_toast("copy failed")
             return
@@ -1101,6 +1128,52 @@ class Viewer(object):
         clipboard.store()
         self.show_toast("copied  %dx%d" % (pixbuf.get_width(),
                                            pixbuf.get_height()))
+
+    def save_view_target(self):
+        """Save path (flateyes_<name> next to the file) and pixbuf type."""
+        base = "flateyes_" + os.path.basename(self.path or "image")
+        folder = os.path.dirname(os.path.abspath(self.path or ""))
+        ext = os.path.splitext(base)[1].lstrip(".").lower()
+        fmt = None
+        for candidate in GdkPixbuf.Pixbuf.get_formats():
+            if candidate.is_writable() and ext in candidate.get_extensions():
+                fmt = candidate.get_name()
+                break
+        if fmt is None:  # no writer for this extension: save a PNG copy
+            fmt = "png"
+            base += ".png"
+        return os.path.join(folder, base), fmt
+
+    def save_view(self):
+        """s: save the visible viewport (info overlays excluded) to the
+        same flateyes_<name> file on every save."""
+        self.capture_view(self.finish_save)
+
+    def finish_save(self, pixbuf):
+        if pixbuf is None:
+            self.show_toast("capture failed")
+            return
+        target, fmt = self.save_view_target()
+        keys, values = (["quality"], ["92"]) if fmt == "jpeg" else ([], [])
+        try:
+            pixbuf.savev(target, fmt, keys, values)
+        except GLib.Error:
+            # read-only image folder: keep the capture in the cache dir
+            fallback = os.path.join(GLib.get_user_cache_dir(), APP,
+                                    os.path.basename(target))
+            try:
+                os.makedirs(os.path.dirname(fallback), exist_ok=True)
+                pixbuf.savev(fallback, fmt, keys, values)
+            except (GLib.Error, OSError):
+                self.show_toast("save failed (read-only?)")
+                return
+            target = fallback
+        name = os.path.basename(target)
+        if os.path.dirname(target) != \
+                os.path.dirname(os.path.abspath(self.path or "")):
+            name = target  # saved elsewhere: show where
+        self.show_toast("saved  %s  (%dx%d)"
+                        % (name, pixbuf.get_width(), pixbuf.get_height()))
 
     def show_toast(self, text, markup=False):
         if markup:
@@ -2042,6 +2115,8 @@ class Viewer(object):
                        self.ANNO_COLOR_NAMES[self.anno_color_index]),
                     markup=True)
                 self.update_anno_overlay()
+        elif key in ("s", "S"):
+            self.save_view()
         elif key in ("p", "P"):
             if self.stack_mode:  # the manifest is authoritative for stacks
                 self.show_toast("PPU from stack manifest: %.4g px/%s"
@@ -2362,7 +2437,8 @@ def usage(stream):
         "      l line (Shift = horizontal/vertical/45), t text,\n"
         "      c cycle the annotation color,\n"
         "      BackSpace remove last annotation, u/y undo/redo,\n"
-        "      Ctrl+C copy the visible view to the clipboard, q quit\n"
+        "      Ctrl+C copy the visible view (info hidden) to the clipboard,\n"
+        "      s save the view (info hidden) as flateyes_<name>, q quit\n"
         % (APP, APP, APP))
 
 
