@@ -663,7 +663,10 @@ class Viewer(object):
         self.status_label.set_no_show_all(True)
 
         # Transient feedback message (e.g. after copying to the clipboard).
+        # While a drawing mode is active, mode_toast holds a persistent
+        # text that stays up and returns after transient toasts expire.
         self.toast_timeout = None
+        self.mode_toast = None
         self.toast_label = Gtk.Label()
         self.toast_label.set_name("flateyes-toast")
         self.toast_label.set_halign(Gtk.Align.CENTER)
@@ -939,6 +942,8 @@ class Viewer(object):
         if not candidates:
             self.show_toast("no other images in this folder")
             return
+        if not self.confirm_unsaved():
+            return  # keep the image and its unsaved changes
         error = None
         for target in candidates:  # skip over files that fail to decode
             result = self.load(target)
@@ -997,6 +1002,8 @@ class Viewer(object):
             self.show_toast("no other image folders under %s"
                             % (os.path.basename(root) or root))
             return
+        if not self.confirm_unsaved():
+            return  # keep the image and its unsaved changes
         error = None
         for folder in order:  # skip folders whose images all fail to load
             images = self.folder_images(folder)
@@ -1335,7 +1342,13 @@ class Viewer(object):
             self.show_toast("annotations embedded in %s"
                             % os.path.basename(self.path))
 
+    def toasts_allowed(self):
+        """Tab hides every overlay, the toast included."""
+        return self.draw_visible or self.info_visible
+
     def show_toast(self, text, markup=False):
+        if not self.toasts_allowed():
+            return
         if markup:
             self.toast_label.set_markup(text)
         else:
@@ -1347,8 +1360,73 @@ class Viewer(object):
 
     def hide_toast(self):
         self.toast_timeout = None
-        self.toast_label.hide()
+        if self.mode_toast and self.toasts_allowed():
+            self.toast_label.set_markup(self.mode_toast)  # fall back
+        else:
+            self.toast_label.hide()
         return False
+
+    def update_mode_toast(self):
+        """Keep the active mode visible as a persistent toast — drawing
+        tools, the keyboard selection and its resize anchor alike.
+        Transient toasts overlay it and it returns when they expire."""
+        selected = self.valid_selection()
+        if selected is not None:
+            if self.anno_edit_anchor:
+                part = "endpoint" if selected["kind"] in ("line", "ruler") \
+                    else "corner"
+                text = ("resize: %s %s  (arrows drag it, e next, Esc back)"
+                        % (part, self.anno_edit_anchor.upper()))
+            else:
+                pos = next(i for i, a in enumerate(self.annotations)
+                           if a is selected)
+                text = ("selected %d/%d: %s  (arrows move, e edit,"
+                        " Delete removes, Esc done)"
+                        % (len(self.annotations) - pos,
+                           len(self.annotations), selected["kind"]))
+        elif self.ruler_active:
+            text = "ruler: click two points  (Esc ends)"
+        elif self.anno_tool == "text":
+            text = "text: click to place  (Esc ends)"
+        elif self.anno_tool in ("box", "ellipse", "line"):
+            text = self.draw_mode_desc() + "  (Esc ends)"
+        else:
+            text = None
+        self.mode_toast = text
+        if not self.toasts_allowed():
+            self.toast_label.hide()
+            return
+        if self.toast_timeout is not None:
+            return  # a transient toast is up; its expiry restores this
+        if text is None:
+            self.toast_label.hide()
+        else:
+            self.toast_label.set_markup(text)
+            self.toast_label.show()
+
+    def draw_mode_desc(self):
+        """Colored style summary of the active shape tool."""
+        stroke = "%dpx %s" % (self.anno_line_width,
+                              ("solid", "dashed",
+                               "dotted")[self.anno_line_dash])
+        if self.anno_tool == "line":
+            desc = ('draw line <span foreground="%s">■■</span> %s'
+                    % (self.anno_line_color, stroke))
+            if not self.anno_casing:
+                desc += "  no halo"
+            return desc
+        parts = ["draw %s:" % self.anno_tool]
+        if self.anno_outline:
+            parts.append('<span foreground="%s">■■</span> %s outline'
+                         % (self.anno_line_color, stroke))
+        if self.anno_fill:
+            parts.append('<span foreground="%s">■■</span> %s fill'
+                         % (self.anno_fill_color,
+                            "opaque" if self.anno_fill_opaque
+                            else "translucent"))
+        if self.anno_outline and not self.anno_casing:
+            parts.append("no halo")
+        return "  ".join(parts)
 
     def apply_help_visibility(self):
         if self.info_visible:
@@ -1400,6 +1478,7 @@ class Viewer(object):
         self.ruler_start = self.ruler_end = self.ruler_cursor = None
         self.set_viewport_cursor(self.tool_cursor())
         self.update_view_overlays()
+        self.update_mode_toast()
 
     def event_to_image_px(self, event):
         """Map a pointer event to image-pixel coordinates (clamped)."""
@@ -1666,6 +1745,7 @@ class Viewer(object):
         self.anno_start = self.anno_cursor = None
         self.set_viewport_cursor(self.tool_cursor())
         self.update_view_overlays()
+        self.update_mode_toast()
 
     def anno_color(self):
         return self.anno_line_color
@@ -2240,28 +2320,8 @@ class Viewer(object):
         self.anno_fill_color = fill_color
         self.anno_fill = fill_on
         self.anno_fill_opaque = fill_op
-        self.set_anno_tool(shape)  # restyles a live preview too
-        if shape == "line":
-            desc = ('draw line <span foreground="%s">■■</span> %dpx %s'
-                    % (line_color, line_width,
-                       ("solid", "dashed", "dotted")[line_dash]))
-            if not halo_on:
-                desc += "  no halo"
-        else:
-            parts = ["draw %s:" % shape]
-            if outline_on:
-                parts.append('<span foreground="%s">■■</span> %dpx %s'
-                             ' outline'
-                             % (line_color, line_width,
-                                ("solid", "dashed", "dotted")[line_dash]))
-            if fill_on:
-                parts.append('<span foreground="%s">■■</span> %s fill'
-                             % (fill_color,
-                                "opaque" if fill_op else "translucent"))
-            if outline_on and not halo_on:
-                parts.append("no halo")
-            desc = "  ".join(parts)
-        self.show_toast(desc, markup=True)
+        # set_anno_tool shows the mode+style as a persistent toast
+        self.set_anno_tool(shape)
 
     def on_text_entry_key(self, entry, event, state):
         """Hangul composition for the annotation text entry."""
@@ -2406,10 +2466,7 @@ class Viewer(object):
         self.anno_rev += 1
         self.scroll_to_selection(anno)
         self.update_view_overlays()
-        self.show_toast("selected %d/%d: %s  (arrows move, e edit,"
-                        " Delete removes, Esc done)"
-                        % (len(self.annotations) - pos,
-                           len(self.annotations), anno["kind"]))
+        self.update_mode_toast()  # "selected i/n" stays up while selected
 
     def scroll_to_selection(self, anno):
         """Center the viewport on a selection that is off-screen."""
@@ -2491,13 +2548,7 @@ class Viewer(object):
         self.anno_edit_anchor = which
         self.anno_rev += 1
         self.update_anno_overlay()
-        part = "endpoint" if anno["kind"] in ("line", "ruler") else "corner"
-        if which is None:
-            self.show_toast("move mode (arrows move the whole %s)"
-                            % anno["kind"])
-        else:
-            self.show_toast("resize: %s %s  (arrows drag it, e next,"
-                            " Esc back)" % (part, which.upper()))
+        self.update_mode_toast()  # "resize: ..." / back to "selected i/n"
 
     @staticmethod
     def shift_annotation(anno, dx, dy):
@@ -2521,6 +2572,7 @@ class Viewer(object):
         self.anno_rev += 1
         self.update_anno_overlay()
         self.update_dirty()
+        self.update_mode_toast()  # the fallback once the notice expires
         self.show_toast("annotation removed (u restores it)")
 
     def apply_annotation_op(self, op, invert):
@@ -2555,6 +2607,7 @@ class Viewer(object):
         self.anno_rev += 1
         self.update_anno_overlay()
         self.update_dirty()
+        self.update_mode_toast()  # undo/redo can renumber the selection
 
     def clear_annotations(self):
         # runtime state only; the metadata on disk is left untouched
@@ -2570,6 +2623,7 @@ class Viewer(object):
         self.anno_tool = None
         self.anno_start = self.anno_cursor = None
         self.update_anno_overlay()
+        self.update_mode_toast()
 
     # -- annotation metadata (persistence) ---------------------------------
 
@@ -2952,7 +3006,8 @@ class Viewer(object):
         return not self.confirm_unsaved()
 
     def confirm_unsaved(self):
-        """True when closing may proceed: clean, saved, or discarded."""
+        """True when leaving the image (quit, close, browse) may proceed:
+        clean, saved, or discarded."""
         if not self.anno_dirty:
             return True
         dialog = Gtk.Dialog(title="Unsaved annotations",
@@ -2963,7 +3018,7 @@ class Viewer(object):
         dialog.add_button("Save", Gtk.ResponseType.OK)
         dialog.set_default_response(Gtk.ResponseType.OK)
         label = Gtk.Label(label="Annotations are not saved (Ctrl+S).\n"
-                                "Save them before closing?")
+                                "Save them first?")
         label.set_justify(Gtk.Justification.LEFT)
         box = dialog.get_content_area()
         box.set_border_width(12)
@@ -2986,16 +3041,16 @@ class Viewer(object):
             self.apply_help_visibility()
             self.apply_legend_visibility()
             self.update_hint_overlay()
+            self.update_mode_toast()
         elif key == "Escape":  # leaves selection/tool modes; quitting is "q"
             if self.valid_selection() is not None:
                 if self.anno_edit_anchor is not None:
                     self.anno_edit_anchor = None   # resize -> move mode
                     self.anno_rev += 1
-                    self.show_toast("move mode (arrows move the whole"
-                                    " annotation)")
                 else:
                     self.clear_selection()
                 self.update_anno_overlay()
+                self.update_mode_toast()
             elif self.ruler_active:
                 self.set_ruler_active(False)
             elif self.anno_tool is not None:
@@ -3072,12 +3127,13 @@ class Viewer(object):
             if self.stack_mode:
                 self.hint_enabled = not self.hint_enabled
                 self.update_hint_overlay()
-        elif key == "Tab":  # every overlay: drawings and info together
+        elif key == "Tab":  # every overlay: drawings, info and the toast
             visible = self.draw_visible or self.info_visible
             self.draw_visible = self.info_visible = not visible
             self.apply_help_visibility()
             self.apply_legend_visibility()
             self.update_view_overlays()
+            self.update_mode_toast()
         elif key == "F1":
             self.show_about()
         elif key in ("F11", "Return", "KP_Enter"):
@@ -3386,7 +3442,8 @@ def usage(stream):
         "      Ctrl+C copy the visible view (info hidden) to the clipboard,\n"
         "      Ctrl+S save the annotations and PPU (no autosave):\n"
         "             embedded into a PNG image itself, to a .fe\n"
-        "             sidecar file for other formats,\n"
+        "             sidecar file for other formats; browsing to\n"
+        "             another image with unsaved changes asks first,\n"
         "      F1/right-click About,\n"
         "      q quit - with unsaved annotations (the title shows\n"
         "        *name) a dialog asks to save/discard/cancel first\n"
