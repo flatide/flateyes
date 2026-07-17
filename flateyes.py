@@ -545,8 +545,8 @@ class Viewer(object):
     HELP_KEYS = (("+/-", "zoom"), ("0", "1:1"), ("f", "fit"),
                  ("Enter", "full"), (",/.", "file"), ("Shift+,/.", "folder"),
                  ("drag", "pan"), ("Ctrl+wheel", "zoom"),
-                 ("r", "ruler"), ("b/e/l", "shape"), ("t", "text"),
-                 ("c", "color"), ("u/y", "undo/redo"),
+                 ("r", "ruler"), ("d", "draw"), ("t", "text"),
+                 ("s", "select"), ("u/y", "undo/redo"),
                  ("Ctrl+C", "copy"), ("Ctrl+S", "save"), ("p", "PPU"),
                  ("o", "outline"), ("[/]", "level"), ("i", "info"),
                  ("Tab", "overlays"), ("q", "quit"))
@@ -697,12 +697,19 @@ class Viewer(object):
         self.annotations = []       # committed shapes and texts
         self.is_png = False         # PNG: annotations embed on Ctrl+S,
         self.embedded_meta = False  # ... and this file carries a chunk
-        self.anno_undo = []         # ("add"|"remove", annotation, index)
-        self.anno_redo = []         # undone ops; cleared by a new action
-        self.anno_rev = 0           # bumped on add/remove for the key cache
+        self.anno_undo = []         # ("add"|"remove", anno, index) or
+        self.anno_redo = []         # ... ("move", anno, (dx, dy) world);
+                                    # redo is cleared by any new action
+        self.anno_rev = 0           # bumped on any change for the key cache
         self.anno_drawn = None
+        self.anno_selected = None   # annotation picked with "s" (keyboard)
+        self.anno_edit_anchor = None  # "a"/"b": arrows resize that anchor
         self.anno_font_size = 16    # last used text size (pt), sticky
-        # Shape style ("c" dialog): outline color and interior fill.
+        # Shape drawing ("d" dialog): kind, outline color, interior fill.
+        self.anno_shape = "box"     # last drawn kind, preselected
+        self.anno_line_width = 1    # stroke width px (lines and outlines)
+        self.anno_line_dash = 0     # ... and 0 solid | 1 dashed | 2 dotted
+        self.anno_casing = True     # dark halo around outlines and lines
         self.anno_line_color = self.DEFAULT_LINE
         self.anno_outline = True                # draw the box/ellipse border
         self.anno_fill = True                   # fill the box/ellipse
@@ -1376,6 +1383,8 @@ class Viewer(object):
             self.update_anno_overlay()
         if active and not self.draw_visible:
             self.draw_visible = True  # measuring needs its overlays back
+        if active:
+            self.clear_selection()
         self.ruler_active = active
         self.ruler_start = self.ruler_end = self.ruler_cursor = None
         self.set_viewport_cursor(self.tool_cursor())
@@ -1527,33 +1536,57 @@ class Viewer(object):
         self.ruler_line.set_margin_top(y0)
         self.ruler_line.show()
 
-    def stamp_segment(self, buf, a, b, casing, core):
+    def stamp_segment(self, buf, a, b, casing, core, width=1, dash=0):
+        """Stamp a segment; width in px, dash 0=solid 1=dashed 2=dotted.
+        casing/core may each be None to draw a single pass (multi-segment
+        shapes stamp all casing first, then all core, to keep corners).
+        The dash phase is anchored at a, so it holds still while panning."""
         ax, ay = a
         bx, by = b
-        if ay == by:    # horizontal
-            self.fill_rect(buf, min(ax, bx), ay - 1,
-                           abs(bx - ax) + 1, 3, casing)
-            self.fill_rect(buf, min(ax, bx), ay,
-                           abs(bx - ax) + 1, 1, core)
-        elif ax == bx:  # vertical
-            self.fill_rect(buf, ax - 1, min(ay, by),
-                           3, abs(by - ay) + 1, casing)
-            self.fill_rect(buf, ax, min(ay, by),
-                           1, abs(by - ay) + 1, core)
-        else:           # free angle: 1px-spaced dabs, 2x2 solid core
+        if dash == 0 and ay == by:    # horizontal, solid: two flat rects
+            y0 = ay - width // 2
+            if casing is not None:
+                self.fill_rect(buf, min(ax, bx), y0 - 1,
+                               abs(bx - ax) + 1, width + 2, casing)
+            if core is not None:
+                self.fill_rect(buf, min(ax, bx), y0,
+                               abs(bx - ax) + 1, width, core)
+        elif dash == 0 and ax == bx:  # vertical, solid
+            x0 = ax - width // 2
+            if casing is not None:
+                self.fill_rect(buf, x0 - 1, min(ay, by),
+                               width + 2, abs(by - ay) + 1, casing)
+            if core is not None:
+                self.fill_rect(buf, x0, min(ay, by),
+                               width, abs(by - ay) + 1, core)
+        else:           # free angle or dashed: 1px-spaced dabs
             seg = self.clip_segment(a, b, buf.get_width(),
                                     buf.get_height())
             if seg is None:
                 return
-            (ax, ay), (bx, by) = seg
-            steps = min(int(max(abs(bx - ax), abs(by - ay))) + 1, 8000)
-            points = [(ax + (bx - ax) * i / steps,
-                       ay + (by - ay) * i / steps)
-                      for i in range(steps + 1)]
-            for x, y in points:
-                self.fill_rect(buf, x - 1, y - 1, 3, 3, casing)
-            for x, y in points:
-                self.fill_rect(buf, x - 1, y - 1, 2, 2, core)
+            (sx, sy), (ex, ey) = seg
+            steps = min(int(max(abs(ex - sx), abs(ey - sy))) + 1, 8000)
+            spacing = math.hypot(ex - sx, ey - sy) / max(steps, 1)
+            base = math.hypot(sx - ax, sy - ay)  # clipped-away length
+            if dash == 1:
+                on, period = 3 * width + 3, 5 * width + 6
+            elif dash == 2:
+                on, period = 1, 3 * width + 3
+            else:
+                on = period = 1
+            points = [(sx + (ex - sx) * i / steps,
+                       sy + (ey - sy) * i / steps)
+                      for i in range(steps + 1)
+                      if not dash or (base + i * spacing) % period < on]
+            off = width // 2 + 1
+            if casing is not None:
+                for x, y in points:
+                    self.fill_rect(buf, x - off, y - off,
+                                   width + 2, width + 2, casing)
+            if core is not None:
+                for x, y in points:
+                    self.fill_rect(buf, x - off, y - off,
+                                   width + 1, width + 1, core)
 
     @staticmethod
     def clip_segment(a, b, width, height, pad=4):
@@ -1617,6 +1650,7 @@ class Viewer(object):
                 self.update_ruler_overlay()
             if not self.draw_visible:
                 self.draw_visible = True  # drawing needs its overlays back
+            self.clear_selection()
         self.anno_tool = tool
         self.anno_start = self.anno_cursor = None
         self.set_viewport_cursor(self.tool_cursor())
@@ -1646,6 +1680,7 @@ class Viewer(object):
                 ay + (side if dy >= 0 else -side))
 
     def update_anno_overlay(self):
+        selected = self.valid_selection()
         texts = [x for x in self.annotations if x["kind"] == "text"]
         rulers = [x for x in self.annotations if x["kind"] == "ruler"]
         shapes = [x for x in self.annotations if x["kind"] != "text"]
@@ -1654,13 +1689,17 @@ class Viewer(object):
                 and self.anno_start is not None \
                 and self.anno_cursor is not None:
             preview = {"kind": self.anno_tool, "a": self.anno_start,
-                       "b": self.anno_cursor, "color": self.anno_color()}
+                       "b": self.anno_cursor, "color": self.anno_color(),
+                       "width": self.anno_line_width,
+                       "dash": self.anno_line_dash}
             if self.anno_tool in ("box", "ellipse"):
                 if self.anno_fill:
                     preview["fill"] = self.anno_fill_color
                     preview["fill_opaque"] = self.anno_fill_opaque
                 if not self.anno_outline:
                     preview["outline"] = False
+            if not self.anno_casing:
+                preview["casing"] = False
         if not self.draw_visible or self.rendered_size is None \
                 or not (shapes or preview or texts):
             self.anno_drawn = None
@@ -1675,7 +1714,8 @@ class Viewer(object):
         # and without it the corrected layout pass would hit the cache and
         # leave annotations displaced.
         img_alloc = self.image.get_allocation()
-        key = (self.anno_rev, self.anno_line_color, self.anno_outline,
+        key = (self.anno_rev, self.anno_line_color, self.anno_line_width,
+               self.anno_line_dash, self.anno_casing, self.anno_outline,
                self.anno_fill, self.anno_fill_color, self.anno_fill_opaque,
                preview and (preview["a"], preview["b"]),
                self.scroll.get_hadjustment().get_value(),
@@ -1694,12 +1734,28 @@ class Viewer(object):
             self.stamp_annotation(buf, shape)
         if preview is not None:
             self.stamp_annotation(buf, preview)
+        if selected is not None and selected["kind"] != "text":
+            a = self.image_px_to_view(self.px_from_world(selected["a"]))
+            b = self.image_px_to_view(self.px_from_world(selected["b"]))
+            if selected["kind"] in ("box", "ellipse"):
+                x0, x1 = sorted((a[0], b[0]))
+                y0, y1 = sorted((a[1], b[1]))
+                corners = ((x0, y0), (x1, y0), (x0, y1), (x1, y1))
+            else:
+                corners = (a, b)   # line/ruler: the two endpoints
+            active = {"a": a, "b": b}.get(self.anno_edit_anchor)
+            self.stamp_selection(buf, corners, active)
         for anno in texts:
             x, y = self.image_px_to_view(self.px_from_world(anno["at"]))
             if -20 <= x <= view.width and -10 <= y <= view.height:
                 anno["label"].set_margin_start(int(max(0, x)))
                 anno["label"].set_margin_top(int(max(0, y)))
                 anno["label"].show()
+                if anno is selected:
+                    alloc = anno["label"].get_allocation()
+                    w, h = max(alloc.width, 10), max(alloc.height, 10)
+                    self.stamp_selection(buf, ((x, y), (x + w, y),
+                                               (x, y + h), (x + w, y + h)))
             else:
                 anno["label"].hide()
         for anno in rulers:
@@ -1731,8 +1787,10 @@ class Viewer(object):
                 self.fill_rect(buf, x - 2, y - 2, 5, 5, self.RULER_CORE)
             return
         core = self.color_rgba(shape["color"])
+        casing = self.ANNO_CASING if shape.get("casing", True) else None
         if shape["kind"] == "line":
-            self.stamp_segment(buf, a, b, self.ANNO_CASING, core)
+            self.stamp_segment(buf, a, b, casing, core,
+                               shape.get("width", 1), shape.get("dash", 0))
             return
         x0, x1 = sorted((a[0], b[0]))
         y0, y1 = sorted((a[1], b[1]))
@@ -1744,23 +1802,40 @@ class Viewer(object):
             fill_rgba = self.color_rgba(
                 shape["fill"], 0xFF if shape.get("fill_opaque") else 0x59)
         outline = shape.get("outline", True)
+        stroke_w = shape.get("width", 1)
+        stroke_dash = shape.get("dash", 0)
         if shape["kind"] == "box":
             if fill_rgba is not None:
                 self.fill_rect(buf, x0, y0, x1 - x0, y1 - y0, fill_rgba)
             if not outline:
                 return
-            for width, rgba in ((3, self.ANNO_CASING), (1, core)):
-                off = width // 2
-                self.fill_rect(buf, x0 - off, y0 - off,
-                               x1 - x0 + width, width, rgba)   # top
-                self.fill_rect(buf, x0 - off, y1 - off,
-                               x1 - x0 + width, width, rgba)   # bottom
-                self.fill_rect(buf, x0 - off, y0 - off,
-                               width, y1 - y0 + width, rgba)   # left
-                self.fill_rect(buf, x1 - off, y0 - off,
-                               width, y1 - y0 + width, rgba)   # right
+            if stroke_dash == 0:   # solid: flat rects with square corners
+                for pass_w, rgba in ((stroke_w + 2, casing),
+                                     (stroke_w, core)):
+                    if rgba is None:
+                        continue  # halo switched off
+                    off = pass_w // 2
+                    self.fill_rect(buf, x0 - off, y0 - off,
+                                   x1 - x0 + pass_w, pass_w, rgba)  # top
+                    self.fill_rect(buf, x0 - off, y1 - off,
+                                   x1 - x0 + pass_w, pass_w, rgba)  # bottom
+                    self.fill_rect(buf, x0 - off, y0 - off,
+                                   pass_w, y1 - y0 + pass_w, rgba)  # left
+                    self.fill_rect(buf, x1 - off, y0 - off,
+                                   pass_w, y1 - y0 + pass_w, rgba)  # right
+            else:  # dashed: four edge segments; all casing first so a
+                   # later edge cannot cut into a finished corner's core
+                corners = ((x0, y0), (x1, y0), (x1, y1), (x0, y1))
+                edges = tuple(zip(corners, corners[1:] + corners[:1]))
+                if casing is not None:
+                    for ea, eb in edges:
+                        self.stamp_segment(buf, ea, eb, casing, None,
+                                           stroke_w, stroke_dash)
+                for ea, eb in edges:
+                    self.stamp_segment(buf, ea, eb, None, core,
+                                       stroke_w, stroke_dash)
             return
-        # ellipse: 1px-spaced dabs along the perimeter, 2x2 solid core
+        # ellipse: 1px-spaced dabs along the perimeter
         cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
         rx, ry = (x1 - x0) / 2.0, (y1 - y0) / 2.0
         buf_w, buf_h = buf.get_width(), buf.get_height()
@@ -1774,19 +1849,52 @@ class Viewer(object):
         if not outline:
             return
         steps = min(max(int(6.4 * max(rx, ry)), 16), 8000)
-        points = [(x, y) for x, y in
-                  ((cx + rx * math.cos(2 * math.pi * i / steps),
-                    cy + ry * math.sin(2 * math.pi * i / steps))
-                   for i in range(steps))
-                  if -3 <= x <= buf_w + 3 and -3 <= y <= buf_h + 3]
+        if stroke_dash == 1:
+            on, period = 3 * stroke_w + 3, 5 * stroke_w + 6
+        elif stroke_dash == 2:
+            on, period = 1, 3 * stroke_w + 3
+        else:
+            on = period = 1
+        margin = 3 + stroke_w
+        points = []
+        prev = None
+        cum = 0.0   # dash pattern runs along the arc length
+        for i in range(steps):
+            x = cx + rx * math.cos(2 * math.pi * i / steps)
+            y = cy + ry * math.sin(2 * math.pi * i / steps)
+            if prev is not None:
+                cum += math.hypot(x - prev[0], y - prev[1])
+            prev = (x, y)
+            if stroke_dash and cum % period >= on:
+                continue
+            if -margin <= x <= buf_w + margin \
+                    and -margin <= y <= buf_h + margin:
+                points.append((x, y))
+        off = stroke_w // 2 + 1
+        if casing is not None:
+            for x, y in points:
+                self.fill_rect(buf, x - off, y - off,
+                               stroke_w + 2, stroke_w + 2, casing)
         for x, y in points:
-            self.fill_rect(buf, x - 1, y - 1, 3, 3, self.ANNO_CASING)
-        for x, y in points:
-            self.fill_rect(buf, x - 1, y - 1, 2, 2, core)
+            self.fill_rect(buf, x - off, y - off,
+                           stroke_w + 1, stroke_w + 1, core)
 
-    def ask_annotation_text(self, point):
-        dialog = Gtk.Dialog(title="Text", transient_for=self.window,
-                            modal=True)
+    def stamp_selection(self, buf, points, active=None):
+        """Corner handles marking the keyboard-selected annotation; the
+        anchor the arrows drag ("e") grows a white core."""
+        for x, y in points:
+            self.fill_rect(buf, x - 5, y - 5, 11, 11, self.RULER_CASING)
+            self.fill_rect(buf, x - 3, y - 3, 7, 7, self.RULER_CORE)
+        if active is not None:
+            x, y = active
+            self.fill_rect(buf, x - 6, y - 6, 13, 13, self.RULER_CASING)
+            self.fill_rect(buf, x - 4, y - 4, 9, 9, 0xFFFFFFFF)
+
+    def ask_annotation_text(self, point, edit=None):
+        """Text dialog: creates an annotation at point, or reworks the
+        existing one passed as edit (selection + "e")."""
+        dialog = Gtk.Dialog(title="Edit Text" if edit else "Text",
+                            transient_for=self.window, modal=True)
         dialog.set_keep_above(True)  # stay over a fullscreen parent
         dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
         dialog.add_button("OK", Gtk.ResponseType.OK)
@@ -1800,8 +1908,15 @@ class Viewer(object):
         scroll.set_shadow_type(Gtk.ShadowType.IN)
         scroll.set_size_request(340, 90)  # room for a few lines
         scroll.add(view)
+        init = edit if edit is not None else {
+            "size": self.anno_font_size, "color": self.anno_text_color,
+            "bg": self.anno_text_bg, "bg_color": self.anno_text_bg_color,
+            "bg_opaque": self.anno_text_bg_opaque}
+        if edit is not None:
+            editable.set_text(edit["text"])
+            editable.set_position(len(edit["text"]))
         spin = Gtk.SpinButton.new_with_range(6, 96, 1)
-        spin.set_value(self.anno_font_size)
+        spin.set_value(init["size"])
         # Built-in hangul input for hosts without an input method.
         hangul = Gtk.CheckButton(label="Hangul (Shift+Space)")
         state = {"composer": HangulComposer(), "check": hangul,
@@ -1818,12 +1933,12 @@ class Viewer(object):
             return self.on_text_entry_key(editable, event, state)
 
         view.connect("key-press-event", on_view_key)
-        text_combo = self.color_combo(self.anno_text_color)
+        text_combo = self.color_combo(init["color"])
         bgcheck = Gtk.CheckButton(label="background")
-        bgcheck.set_active(self.anno_text_bg)
-        bg_combo = self.color_combo(self.anno_text_bg_color)
+        bgcheck.set_active(init["bg"])
+        bg_combo = self.color_combo(init["bg_color"])
         opaque = Gtk.CheckButton(label="opaque")
-        opaque.set_active(self.anno_text_bg_opaque)
+        opaque.set_active(init["bg_opaque"])
 
         def sync_bg_widgets(*args):
             for widget in (bg_combo, opaque):
@@ -1837,8 +1952,8 @@ class Viewer(object):
         # change works on any GTK3, unlike the 3.20+ "textview" CSS node
         # or the deprecated override_font.
         preview_tag = view.get_buffer().create_tag(
-            None, size_points=float(self.anno_font_size),
-            foreground=self.anno_text_color)
+            None, size_points=float(init["size"]),
+            foreground=init["color"])
 
         def apply_preview(*args):
             buf = view.get_buffer()
@@ -1893,20 +2008,30 @@ class Viewer(object):
         bg_opaque = opaque.get_active()
         dialog.destroy()
         if not confirmed or not text:
-            return
+            return  # emptied text is a cancel; deleting is the Delete key
         self.anno_font_size = size
         self.anno_text_color = text_color
         self.anno_text_bg = bg
         self.anno_text_bg_color = bg_color
         self.anno_text_bg_opaque = bg_opaque
-        self.add_text_annotation(point, text, size, text_color, bg,
-                                 bg_color, bg_opaque)
-        self.anno_undo.append(("add", self.annotations[-1], None))
+        new = {"text": text, "size": size, "color": text_color, "bg": bg,
+               "bg_color": bg_color, "bg_opaque": bg_opaque}
+        if edit is not None:
+            old = dict((k, edit[k]) for k in new)
+            if new == old:
+                return
+            self.apply_text_fields(edit, new)
+            self.anno_undo.append(("edit", edit, (old, new)))
+        else:
+            self.add_text_annotation(point, text, size, text_color, bg,
+                                     bg_color, bg_opaque)
+            self.anno_undo.append(("add", self.annotations[-1], None))
         del self.anno_redo[:]
+        self.anno_rev += 1
         self.update_anno_overlay()
 
-    def add_text_annotation(self, point, text, size, color, bg=True,
-                            bg_color="#000000", bg_opaque=False):
+    def make_text_label(self, text, size, color, bg, bg_color, bg_opaque):
+        """A styled overlay label for one text annotation."""
         label = Gtk.Label()
         label.set_halign(Gtk.Align.START)
         label.set_valign(Gtk.Align.START)
@@ -1927,6 +2052,21 @@ class Viewer(object):
             self.overlay.set_overlay_pass_through(label, True)
         except AttributeError:  # GTK < 3.18
             pass
+        return label
+
+    def apply_text_fields(self, anno, fields):
+        """Restyle a text annotation in place (edit, and its undo/redo):
+        the label is rebuilt because the backdrop CSS cannot change."""
+        anno.update(fields)
+        self.overlay.remove(anno["label"])
+        anno["label"] = self.make_text_label(
+            anno["text"], anno["size"], anno["color"], anno["bg"],
+            anno["bg_color"], anno["bg_opaque"])
+
+    def add_text_annotation(self, point, text, size, color, bg=True,
+                            bg_color="#000000", bg_opaque=False):
+        label = self.make_text_label(text, size, color, bg, bg_color,
+                                     bg_opaque)
         self.annotations.append({"kind": "text", "at": point,
                                  "text": text, "size": size,
                                  "color": color, "bg": bg,
@@ -1968,16 +2108,32 @@ class Viewer(object):
         combo.set_active(hexes.index(active) if active in hexes else 0)
         return combo
 
-    def ask_annotation_colors(self):
-        """"c": shape style — the outline color and the box/ellipse
-        interior fill.  Texts pick their own colors in the "t" dialog;
+    def ask_draw_shape(self):
+        """"d": the one shape-drawing dialog — pick box/ellipse/line plus
+        the style (outline color, box/ellipse interior fill), OK starts
+        the drawing mode.  Texts pick their own colors in the "t" dialog;
         the ruler keeps its fixed color."""
-        dialog = Gtk.Dialog(title="Colors", transient_for=self.window,
+        if self.pixbuf is None:
+            return  # animations are shown unscaled and unannotated
+        dialog = Gtk.Dialog(title="Draw", transient_for=self.window,
                             modal=True)
         dialog.set_keep_above(True)  # stay over a fullscreen parent
         dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
         dialog.add_button("OK", Gtk.ResponseType.OK)
         dialog.set_default_response(Gtk.ResponseType.OK)
+        current = self.anno_tool \
+            if self.anno_tool in ("box", "ellipse", "line") \
+            else self.anno_shape
+        shape_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
+                            spacing=10)
+        radios = {}
+        group = None
+        for kind in ("box", "ellipse", "line"):
+            radio = Gtk.RadioButton.new_with_label_from_widget(group, kind)
+            group = group if group is not None else radio
+            radio.set_active(kind == current)
+            radios[kind] = radio
+            shape_row.pack_start(radio, False, False, 0)
         line_combo = self.color_combo(self.anno_line_color)
         fill_combo = self.color_combo(self.anno_fill_color)
         use_outline = Gtk.CheckButton(label="use")
@@ -1986,64 +2142,114 @@ class Viewer(object):
         use_fill.set_active(self.anno_fill)
         fill_opaque = Gtk.CheckButton(label="opaque")
         fill_opaque.set_active(self.anno_fill_opaque)
+        # The color row doubles up: the box/ellipse outline, or the line
+        # color itself while the line shape is chosen — retitled live.
+        outline_label = Gtk.Label(label="outline")
+        # Stroke style for lines and box/ellipse outlines.
+        width_label = Gtk.Label(label="width (px)")
+        width_spin = Gtk.SpinButton.new_with_range(1, 8, 1)
+        width_spin.set_value(self.anno_line_width)
+        type_combo = Gtk.ComboBoxText()
+        for name in ("solid", "dashed", "dotted"):
+            type_combo.append_text(name)
+        type_combo.set_active(self.anno_line_dash)
+        halo_check = Gtk.CheckButton(label="black halo")
+        halo_check.set_active(self.anno_casing)
 
         def sync_style_widgets(*args):
-            line_combo.set_sensitive(use_outline.get_active())
+            # A line always draws with the line color: its fill and the
+            # outline toggle rest while it is chosen.  The stroke style
+            # (width/type/halo) follows the outline for box/ellipse.
+            is_line = radios["line"].get_active()
+            stroked = is_line or use_outline.get_active()
+            outline_label.set_text("line" if is_line else "outline")
+            line_combo.set_sensitive(stroked)
             for widget in (fill_combo, fill_opaque):
-                widget.set_sensitive(use_fill.get_active())
+                widget.set_sensitive(not is_line and use_fill.get_active())
+            for widget in (halo_check, width_label, width_spin,
+                           type_combo):
+                widget.set_sensitive(stroked)
             # an invisible shape helps nobody: whichever of outline/fill
             # is the last one on cannot be unchecked
-            use_outline.set_sensitive(use_fill.get_active())
-            use_fill.set_sensitive(use_outline.get_active())
+            use_outline.set_sensitive(not is_line
+                                      and use_fill.get_active())
+            use_fill.set_sensitive(not is_line
+                                   and use_outline.get_active())
 
+        for radio in radios.values():
+            radio.connect("toggled", sync_style_widgets)
         use_outline.connect("toggled", sync_style_widgets)
         use_fill.connect("toggled", sync_style_widgets)
         sync_style_widgets()
         grid = Gtk.Grid()
         grid.set_column_spacing(8)
         grid.set_row_spacing(6)
-        for index, (title, combo) in enumerate(
-                (("line", line_combo), ("fill", fill_combo))):
-            label = Gtk.Label(label=title)
+        for index, (label, combo) in enumerate(
+                ((outline_label, line_combo),
+                 (Gtk.Label(label="fill"), fill_combo))):
             label.set_halign(Gtk.Align.START)
             grid.attach(label, 0, index, 1, 1)
             grid.attach(combo, 1, index, 1, 1)
         grid.attach(use_outline, 2, 0, 1, 1)
+        grid.attach(halo_check, 3, 0, 1, 1)
         grid.attach(use_fill, 2, 1, 1, 1)
         grid.attach(fill_opaque, 3, 1, 1, 1)
+        width_label.set_halign(Gtk.Align.START)
+        grid.attach(width_label, 0, 2, 1, 1)
+        grid.attach(width_spin, 1, 2, 1, 1)
+        grid.attach(type_combo, 2, 2, 2, 1)
         box = dialog.get_content_area()
         box.set_border_width(10)
-        box.set_spacing(6)
+        box.set_spacing(8)
+        box.pack_start(shape_row, False, False, 0)
         box.pack_start(grid, False, False, 0)
         dialog.show_all()
         confirmed = dialog.run() == Gtk.ResponseType.OK
         hexes = [hex_ for _, hex_ in self.PALETTE]
+        shape = next(kind for kind, radio in radios.items()
+                     if radio.get_active())
         line_color = hexes[max(line_combo.get_active(), 0)]
         fill_color = hexes[max(fill_combo.get_active(), 0)]
         outline_on = use_outline.get_active()
         fill_on = use_fill.get_active()
         fill_op = fill_opaque.get_active()
+        line_width = int(width_spin.get_value())
+        line_dash = max(type_combo.get_active(), 0)
+        halo_on = halo_check.get_active()
         dialog.destroy()
         if not confirmed:
             return
+        self.anno_shape = shape
         self.anno_line_color = line_color
+        self.anno_line_width = line_width
+        self.anno_line_dash = line_dash
+        self.anno_casing = halo_on
         self.anno_outline = outline_on
         self.anno_fill_color = fill_color
         self.anno_fill = fill_on
         self.anno_fill_opaque = fill_op
-        if outline_on:
-            line_desc = ('<span foreground="%s">■■</span> line'
-                         % line_color)
+        self.set_anno_tool(shape)  # restyles a live preview too
+        if shape == "line":
+            desc = ('draw line <span foreground="%s">■■</span> %dpx %s'
+                    % (line_color, line_width,
+                       ("solid", "dashed", "dotted")[line_dash]))
+            if not halo_on:
+                desc += "  no halo"
         else:
-            line_desc = "line off"
-        if fill_on:
-            fill_desc = ('<span foreground="%s">■■</span> fill %s'
-                         % (fill_color,
-                            "opaque" if fill_op else "translucent"))
-        else:
-            fill_desc = "fill off"
-        self.show_toast("%s   %s" % (line_desc, fill_desc), markup=True)
-        self.update_anno_overlay()  # a live shape preview restyles too
+            parts = ["draw %s:" % shape]
+            if outline_on:
+                parts.append('<span foreground="%s">■■</span> %dpx %s'
+                             ' outline'
+                             % (line_color, line_width,
+                                ("solid", "dashed", "dotted")[line_dash]))
+            if fill_on:
+                parts.append('<span foreground="%s">■■</span> %s fill'
+                             % (fill_color,
+                                "opaque" if fill_op else "translucent"))
+            if outline_on and not halo_on:
+                parts.append("no halo")
+            desc = "  ".join(parts)
+        self.show_toast(desc, markup=True)
 
     def on_text_entry_key(self, entry, event, state):
         """Hangul composition for the annotation text entry."""
@@ -2145,17 +2351,185 @@ class Viewer(object):
         self.apply_annotation_op(op, invert=False)
         self.anno_undo.append(op)
 
+    # -- keyboard selection ("s"): move or delete drawn annotations --------
+
+    def valid_selection(self):
+        """The selected annotation, or None once it left the list (undo,
+        image switch, ...).  Identity, not ==: twins must stay apart."""
+        if self.anno_selected is not None and \
+                not any(a is self.anno_selected for a in self.annotations):
+            self.anno_selected = None
+            self.anno_edit_anchor = None
+        return self.anno_selected
+
+    def clear_selection(self):
+        if self.anno_selected is None:
+            return
+        self.anno_selected = None
+        self.anno_edit_anchor = None
+        self.anno_rev += 1
+
+    @staticmethod
+    def anchor_points(anno):
+        return (anno["at"],) if anno["kind"] == "text" \
+            else (anno["a"], anno["b"])
+
+    def cycle_selection(self, step):
+        """"s": select annotations newest-first (Shift+s: the other way)."""
+        if not self.annotations:
+            self.show_toast("no annotations to select")
+            return
+        cur = self.valid_selection()
+        if cur is None:
+            pos = len(self.annotations) - 1 if step > 0 else 0
+        else:
+            pos = next(i for i, a in enumerate(self.annotations)
+                       if a is cur)
+            pos = (pos - step) % len(self.annotations)
+        anno = self.annotations[pos]
+        self.anno_selected = anno
+        self.anno_edit_anchor = None
+        if not self.draw_visible:   # the markers must be visible
+            self.draw_visible = True
+        self.anno_rev += 1
+        self.scroll_to_selection(anno)
+        self.update_view_overlays()
+        self.show_toast("selected %d/%d: %s  (arrows move, e edit,"
+                        " Delete removes, Esc done)"
+                        % (len(self.annotations) - pos,
+                           len(self.annotations), anno["kind"]))
+
+    def scroll_to_selection(self, anno):
+        """Center the viewport on a selection that is off-screen."""
+        if self.rendered_size is None:
+            return
+        pts = self.anchor_points(anno)
+        center = (sum(p[0] for p in pts) / len(pts),
+                  sum(p[1] for p in pts) / len(pts))
+        view = self.scroll.get_allocation()
+        vx, vy = self.image_px_to_view(self.px_from_world(center))
+        if 0 <= vx <= view.width and 0 <= vy <= view.height:
+            return
+        wx, wy = self.image_px_to_widget(self.px_from_world(center))
+        for adj, target in ((self.scroll.get_hadjustment(), wx),
+                            (self.scroll.get_vadjustment(), wy)):
+            page = adj.get_page_size()
+            adj.set_value(max(adj.get_lower(),
+                              min(target - page / 2.0,
+                                  adj.get_upper() - page)))
+
+    def move_selection(self, dx, dy, fast):
+        """Arrow keys: nudge the selection by one screen pixel (Shift: 10),
+        so the felt step size is the same at every zoom level.  With an
+        edit anchor ("e") only that corner/endpoint moves: a resize."""
+        anno = self.valid_selection()
+        if anno is None or self.rendered_size is None:
+            return
+        step = 10.0 if fast else 1.0
+        scale = self.current_view_scale()  # screen px per world unit
+        dx, dy = dx * step / scale, dy * step / scale
+        # Keep every anchor on the image so the shape stays reachable
+        # (the widest level bounds the world for stacks).
+        base = self.levels[0]["pixbuf"]
+        lo = self.world_from_px((0.0, 0.0), 0)
+        hi = self.world_from_px((float(base.get_width()),
+                                 float(base.get_height())), 0)
+        target = self.anno_edit_anchor
+        pts = (anno[target],) if target else self.anchor_points(anno)
+        dx = max(lo[0] - min(p[0] for p in pts),
+                 min(dx, hi[0] - max(p[0] for p in pts)))
+        dy = max(lo[1] - min(p[1] for p in pts),
+                 min(dy, hi[1] - max(p[1] for p in pts)))
+        if not dx and not dy:
+            return
+        # a run of nudges coalesces into a single undo step
+        top = self.anno_undo[-1] if self.anno_undo else None
+        if target:
+            anno[target] = (anno[target][0] + dx, anno[target][1] + dy)
+            if top is not None and top[0] == "anchor" and top[1] is anno \
+                    and top[2][0] == target:
+                self.anno_undo[-1] = ("anchor", anno,
+                                      (target, top[2][1] + dx,
+                                       top[2][2] + dy))
+            else:
+                self.anno_undo.append(("anchor", anno, (target, dx, dy)))
+        else:
+            self.shift_annotation(anno, dx, dy)
+            if top is not None and top[0] == "move" and top[1] is anno:
+                self.anno_undo[-1] = ("move", anno,
+                                      (top[2][0] + dx, top[2][1] + dy))
+            else:
+                self.anno_undo.append(("move", anno, (dx, dy)))
+        del self.anno_redo[:]
+        self.anno_rev += 1
+        self.update_anno_overlay()
+
+    def edit_selection(self):
+        """"e" with a selection: texts reopen their input dialog, shapes
+        cycle what the arrows drag: whole -> anchor b -> anchor a."""
+        anno = self.valid_selection()
+        if anno is None:
+            return
+        if anno["kind"] == "text":
+            self.ask_annotation_text(anno["at"], edit=anno)
+            return
+        order = (None, "b", "a")
+        which = order[(order.index(self.anno_edit_anchor) + 1) % len(order)]
+        self.anno_edit_anchor = which
+        self.anno_rev += 1
+        self.update_anno_overlay()
+        part = "endpoint" if anno["kind"] in ("line", "ruler") else "corner"
+        if which is None:
+            self.show_toast("move mode (arrows move the whole %s)"
+                            % anno["kind"])
+        else:
+            self.show_toast("resize: %s %s  (arrows drag it, e next,"
+                            " Esc back)" % (part, which.upper()))
+
+    @staticmethod
+    def shift_annotation(anno, dx, dy):
+        for key in ("a", "b", "at"):
+            if key in anno:
+                anno[key] = (anno[key][0] + dx, anno[key][1] + dy)
+
+    def delete_selection(self):
+        """Delete/BackSpace: remove the selection (undoable with "u")."""
+        anno = self.valid_selection()
+        if anno is None:
+            return
+        index = next(i for i, a in enumerate(self.annotations) if a is anno)
+        del self.annotations[index]
+        if "label" in anno:
+            self.overlay.remove(anno["label"])
+        self.anno_undo.append(("remove", anno, index))
+        del self.anno_redo[:]
+        self.anno_selected = None
+        self.anno_edit_anchor = None
+        self.anno_rev += 1
+        self.update_anno_overlay()
+        self.show_toast("annotation removed (u restores it)")
+
     def apply_annotation_op(self, op, invert):
         """Plays an op forward (redo) or backward (undo)."""
-        action, anno, index = op
-        if (action == "add") == invert:     # take the annotation out
+        action, anno, extra = op
+        if action == "move":
+            sign = -1 if invert else 1
+            self.shift_annotation(anno, sign * extra[0], sign * extra[1])
+        elif action == "anchor":            # one corner/endpoint dragged
+            which, dx, dy = extra
+            sign = -1 if invert else 1
+            anno[which] = (anno[which][0] + sign * dx,
+                           anno[which][1] + sign * dy)
+        elif action == "edit":              # text reworded/restyled
+            self.apply_text_fields(anno, extra[0] if invert else extra[1])
+        elif (action == "add") == invert:   # take the annotation out
             if anno in self.annotations:
                 self.annotations.remove(anno)
                 if "label" in anno:
                     self.overlay.remove(anno["label"])
         else:                               # put it (back) in
-            where = len(self.annotations) if index is None \
-                else min(index, len(self.annotations))
+            where = len(self.annotations) if extra is None \
+                else min(extra, len(self.annotations))
             self.annotations.insert(where, anno)
             if "label" in anno:
                 self.overlay.add_overlay(anno["label"])
@@ -2175,6 +2549,8 @@ class Viewer(object):
         self.annotations = []
         self.anno_undo = []
         self.anno_redo = []
+        self.anno_selected = None
+        self.anno_edit_anchor = None
         self.anno_rev += 1
         self.anno_tool = None
         self.anno_start = self.anno_cursor = None
@@ -2227,9 +2603,16 @@ class Viewer(object):
                     fill = "0"
                 if not anno.get("outline", True):
                     color = "0"  # no border ("0" like an absent fill)
-                lines.append("%s=%.10g,%.10g,%.10g,%.10g,%s,%s"
+                # 7th/8th field: stroke width and dash type (outlines and
+                # lines alike); older builds ignore trailing fields
+                extra = ",%d,%d" % (anno.get("width", 1),
+                                    anno.get("dash", 0))
+                if not anno.get("casing", True):
+                    extra += ",0"  # 9th field: halo off (default on)
+                lines.append("%s=%.10g,%.10g,%.10g,%.10g,%s,%s%s"
                              % (anno["kind"], anno["a"][0], anno["a"][1],
-                                anno["b"][0], anno["b"][1], color, fill))
+                                anno["b"][0], anno["b"][1], color, fill,
+                                extra))
         return lines
 
     def save_annotations(self):
@@ -2355,6 +2738,17 @@ class Viewer(object):
                                                       16) >= 0x80
                         except ValueError:
                             pass
+                    if len(parts) > 6:
+                        try:  # 7th/8th field: stroke width and dash type
+                            anno["width"] = max(1, min(int(
+                                float(parts[6])), 8))
+                            if len(parts) > 7:
+                                code = int(float(parts[7]))
+                                anno["dash"] = code if code in (1, 2) else 0
+                        except ValueError:
+                            pass  # keep the shape, default 1px solid
+                    if len(parts) > 8 and parts[8].strip() == "0":
+                        anno["casing"] = False  # 9th field: halo off
                     self.annotations.append(anno)
             except ValueError:
                 continue  # skip malformed lines
@@ -2530,34 +2924,52 @@ class Viewer(object):
             self.apply_help_visibility()
             self.apply_legend_visibility()
             self.update_hint_overlay()
-        elif key == "Escape":  # leaves tool modes only; quitting is "q"
-            if self.ruler_active:
+        elif key == "Escape":  # leaves selection/tool modes; quitting is "q"
+            if self.valid_selection() is not None:
+                if self.anno_edit_anchor is not None:
+                    self.anno_edit_anchor = None   # resize -> move mode
+                    self.anno_rev += 1
+                    self.show_toast("move mode (arrows move the whole"
+                                    " annotation)")
+                else:
+                    self.clear_selection()
+                self.update_anno_overlay()
+            elif self.ruler_active:
                 self.set_ruler_active(False)
             elif self.anno_tool is not None:
                 self.set_anno_tool(None)
         elif key in ("r", "R"):
             self.set_ruler_active(not self.ruler_active)
-        elif key in ("b", "B"):
-            self.set_anno_tool(None if self.anno_tool == "box" else "box")
-        elif key in ("e", "E"):
-            self.set_anno_tool(None if self.anno_tool == "ellipse"
-                               else "ellipse")
+        elif key in ("d", "D"):
+            self.ask_draw_shape()   # shape + style dialog starts the mode
+        elif key in ("e", "E") and self.valid_selection() is not None:
+            self.edit_selection()   # resize anchors / the text dialog
         elif key in ("t", "T"):
             self.set_anno_tool(None if self.anno_tool == "text" else "text")
-        elif key in ("l", "L"):
-            self.set_anno_tool(None if self.anno_tool == "line" else "line")
         elif key in ("u", "U"):
             self.undo_annotation()
         elif key in ("y", "Y"):
             self.redo_annotation()
-        elif key in ("c", "C"):
-            if event.state & Gdk.ModifierType.CONTROL_MASK:
-                self.copy_view_to_clipboard()  # Ctrl+C
-            else:
-                self.ask_annotation_colors()   # plain c: color dialog
+        elif key in ("c", "C") \
+                and event.state & Gdk.ModifierType.CONTROL_MASK:
+            self.copy_view_to_clipboard()  # Ctrl+C
         elif key in ("s", "S") \
                 and event.state & Gdk.ModifierType.CONTROL_MASK:
             self.save_annotations()  # Ctrl+S
+        elif key in ("s", "S"):      # plain s: cycle-select annotations
+            self.cycle_selection(
+                -1 if event.state & Gdk.ModifierType.SHIFT_MASK else 1)
+        elif key in ("Delete", "KP_Delete", "BackSpace") \
+                and self.valid_selection() is not None:
+            self.delete_selection()
+        elif key in ("Left", "Right", "Up", "Down",
+                     "KP_Left", "KP_Right", "KP_Up", "KP_Down") \
+                and self.valid_selection() is not None:
+            # with a selection the arrows move it instead of panning
+            self.move_selection(
+                key.endswith("Right") - key.endswith("Left"),
+                key.endswith("Down") - key.endswith("Up"),
+                bool(event.state & Gdk.ModifierType.SHIFT_MASK))
         elif key in ("p", "P"):
             if self.stack_mode:  # the manifest is authoritative for stacks
                 self.show_toast("PPU from stack manifest: %.4g px/%s"
@@ -2722,13 +3134,17 @@ class Viewer(object):
         else:
             anno = {"kind": self.anno_tool, "a": self.anno_start,
                     "b": self.constrain_corner(point, event.state),
-                    "color": self.anno_color()}
+                    "color": self.anno_color(),
+                    "width": self.anno_line_width,
+                    "dash": self.anno_line_dash}
             if self.anno_tool in ("box", "ellipse"):
                 if self.anno_fill:
                     anno["fill"] = self.anno_fill_color
                     anno["fill_opaque"] = self.anno_fill_opaque
                 if not self.anno_outline:
                     anno["outline"] = False
+            if not self.anno_casing:
+                anno["casing"] = False
             self.annotations.append(anno)
             self.anno_undo.append(("add", anno, None))
             del self.anno_redo[:]
@@ -2887,11 +3303,21 @@ def usage(stream):
         "      Tab all overlays (drawings and info) on/off,\n"
         "      [/] stack level, p set PPU,\n"
         "      r ruler (Shift = free angle, Esc ends),\n"
-        "      b/e box/ellipse (Shift = square/circle),\n"
-        "      l line (Shift = horizontal/vertical/45), t text,\n"
-        "      c shape style: outline (use on/off) and box/ellipse\n"
-        "        fill (use on/off, opaque/translucent); one of the\n"
-        "        two always stays on and texts style themselves,\n"
+        "      d draw shapes: a dialog picks box/ellipse/line and the\n"
+        "        style - outline (use, color), stroke width (1-8 px)\n"
+        "        and type (solid/dashed/dotted) for lines and outlines\n"
+        "        alike, the black halo around strokes (on/off) and the\n"
+        "        box/ellipse fill (use, color, opaque/translucent); one\n"
+        "        of outline/fill always stays on and texts style\n"
+        "        themselves; Shift while clicking = square/circle/\n"
+        "        45-degree line,\n"
+        "      t text,\n"
+        "      s select annotations, newest first (Shift+s backwards):\n"
+        "        arrows move the selection (Shift = 10 px steps),\n"
+        "        e edits it - shapes cycle a resize corner/endpoint\n"
+        "          that the arrows then drag, texts reopen their\n"
+        "          input dialog prefilled,\n"
+        "        Delete/BackSpace removes it, Esc deselects,\n"
         "      u/y undo/redo annotations (u also deletes, newest first),\n"
         "      Ctrl+C copy the visible view (info hidden) to the clipboard,\n"
         "      Ctrl+S save the annotations and PPU (no autosave):\n"
