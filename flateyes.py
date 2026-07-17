@@ -31,7 +31,7 @@ import zlib
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -582,6 +582,7 @@ class Viewer(object):
 
         self.window = Gtk.Window(title=APP)
         self.window.connect("destroy", lambda *a: Gtk.main_quit())
+        self.window.connect("delete-event", self.on_delete_event)
         self.window.connect("key-press-event", self.on_key)
         self.window.connect("focus-in-event", self.on_focus_in)
 
@@ -704,6 +705,8 @@ class Viewer(object):
         self.anno_drawn = None
         self.anno_selected = None   # annotation picked with "s" (keyboard)
         self.anno_edit_anchor = None  # "a"/"b": arrows resize that anchor
+        self.anno_dirty = False     # metadata differs from the saved state
+        self.saved_meta = []        # serialization at load/save time
         self.anno_font_size = 16    # last used text size (pt), sticky
         # Shape drawing ("d" dialog): kind, outline color, interior fill.
         self.anno_shape = "box"     # last drawn kind, preselected
@@ -880,6 +883,10 @@ class Viewer(object):
             self.ppu = ppu
         if unit is not None:
             self.unit = unit
+        # The as-loaded state (request ppu included) is the clean baseline
+        # for the title's unsaved marker.
+        self.saved_meta = self.serialize_annotations()
+        self.anno_dirty = False
         self.legend_pixbuf = legend_pixbuf
         self.legend_rendered = None
         if legend_pixbuf is not None:
@@ -1192,6 +1199,8 @@ class Viewer(object):
 
     def update_title(self):
         name = os.path.basename(self.path or "")
+        if self.anno_dirty:
+            name = "*" + name  # unsaved annotation changes
         self.window.set_title("%s - %s" % (name, APP_TITLE))
         full = self.path or ""
         shown = full
@@ -1318,6 +1327,8 @@ class Viewer(object):
                 os.unlink(stale)  # sidecar left behind by an older build
             except OSError:
                 pass
+        self.saved_meta = lines
+        self.update_dirty()
         if text is None:
             self.show_toast("embedded annotations removed")
         else:
@@ -2029,6 +2040,7 @@ class Viewer(object):
         del self.anno_redo[:]
         self.anno_rev += 1
         self.update_anno_overlay()
+        self.update_dirty()
 
     def make_text_label(self, text, size, color, bg, bg_color, bg_opaque):
         """A styled overlay label for one text annotation."""
@@ -2463,6 +2475,7 @@ class Viewer(object):
         del self.anno_redo[:]
         self.anno_rev += 1
         self.update_anno_overlay()
+        self.update_dirty()
 
     def edit_selection(self):
         """"e" with a selection: texts reopen their input dialog, shapes
@@ -2507,6 +2520,7 @@ class Viewer(object):
         self.anno_edit_anchor = None
         self.anno_rev += 1
         self.update_anno_overlay()
+        self.update_dirty()
         self.show_toast("annotation removed (u restores it)")
 
     def apply_annotation_op(self, op, invert):
@@ -2540,6 +2554,7 @@ class Viewer(object):
                     pass
         self.anno_rev += 1
         self.update_anno_overlay()
+        self.update_dirty()
 
     def clear_annotations(self):
         # runtime state only; the metadata on disk is left untouched
@@ -2615,6 +2630,14 @@ class Viewer(object):
                                 extra))
         return lines
 
+    def update_dirty(self):
+        """Retitle ("*name") when the metadata diverges from the saved
+        state; undoing back to it clears the marker again."""
+        dirty = self.serialize_annotations() != self.saved_meta
+        if dirty != self.anno_dirty:
+            self.anno_dirty = dirty
+            self.update_title()
+
     def save_annotations(self):
         """Ctrl+S: persist the annotation metadata.  Nothing autosaves —
         drawings and PPU changes live in memory until this explicit save,
@@ -2637,6 +2660,8 @@ class Viewer(object):
                     removed = True
                 except OSError:
                     pass
+            self.saved_meta = lines
+            self.update_dirty()
             self.show_toast("saved annotations removed" if removed
                             else "no annotations to save")
             return
@@ -2648,6 +2673,8 @@ class Viewer(object):
                     os.makedirs(os.path.dirname(path), exist_ok=True)
                 with open(path, "w", encoding="utf-8") as handle:
                     handle.write(data)
+                self.saved_meta = lines
+                self.update_dirty()
                 # the cache fallback lives elsewhere: show the full path
                 self.show_toast("annotations saved  %s"
                                 % (os.path.basename(path)
@@ -2907,6 +2934,7 @@ class Viewer(object):
         self.update_ruler_overlay()
         self.update_anno_overlay()  # ruler annotation labels show distances
         self.update_status()
+        self.update_dirty()  # the PPU saves with the metadata
 
     # -- events ------------------------------------------------------------
 
@@ -2915,10 +2943,44 @@ class Viewer(object):
             self.rescale(allocation)
         self.update_view_overlays()
 
+    def request_quit(self):
+        if self.confirm_unsaved():
+            Gtk.main_quit()
+
+    def on_delete_event(self, widget, event):
+        """Window close asks like "q"; True keeps the window open."""
+        return not self.confirm_unsaved()
+
+    def confirm_unsaved(self):
+        """True when closing may proceed: clean, saved, or discarded."""
+        if not self.anno_dirty:
+            return True
+        dialog = Gtk.Dialog(title="Unsaved annotations",
+                            transient_for=self.window, modal=True)
+        dialog.set_keep_above(True)  # stay over a fullscreen parent
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Discard", Gtk.ResponseType.REJECT)
+        dialog.add_button("Save", Gtk.ResponseType.OK)
+        dialog.set_default_response(Gtk.ResponseType.OK)
+        label = Gtk.Label(label="Annotations are not saved (Ctrl+S).\n"
+                                "Save them before closing?")
+        label.set_justify(Gtk.Justification.LEFT)
+        box = dialog.get_content_area()
+        box.set_border_width(12)
+        box.set_spacing(6)
+        box.pack_start(label, True, True, 0)
+        dialog.show_all()
+        response = dialog.run()
+        dialog.destroy()
+        if response == Gtk.ResponseType.OK:
+            self.save_annotations()
+            return not self.anno_dirty  # a failed save keeps the window
+        return response == Gtk.ResponseType.REJECT
+
     def on_key(self, widget, event):
         key = Gdk.keyval_name(event.keyval)
         if key in ("q", "Q"):
-            Gtk.main_quit()
+            self.request_quit()
         elif key in ("i", "I"):  # info overlays: help, legend, level outline
             self.info_visible = not self.info_visible
             self.apply_help_visibility()
@@ -3126,6 +3188,7 @@ class Viewer(object):
                 self.ruler_start = self.ruler_end = self.ruler_cursor = None
                 self.update_ruler_overlay()        # clear the live preview
                 self.update_anno_overlay()
+                self.update_dirty()
         elif self.anno_tool == "text":
             self.ask_annotation_text(point)
         elif self.anno_start is None:
@@ -3151,6 +3214,7 @@ class Viewer(object):
             self.anno_rev += 1
             self.anno_start = self.anno_cursor = None
             self.update_anno_overlay()
+            self.update_dirty()
         return True
 
     def tool_cursor(self):
@@ -3323,7 +3387,9 @@ def usage(stream):
         "      Ctrl+S save the annotations and PPU (no autosave):\n"
         "             embedded into a PNG image itself, to a .fe\n"
         "             sidecar file for other formats,\n"
-        "      F1/right-click About, q quit\n"
+        "      F1/right-click About,\n"
+        "      q quit - with unsaved annotations (the title shows\n"
+        "        *name) a dialog asks to save/discard/cancel first\n"
         % (APP, APP, APP))
 
 
