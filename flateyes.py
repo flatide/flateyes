@@ -532,6 +532,7 @@ class Viewer(object):
     HINT_CASING = 0x00000090     # next-level coverage outline
     HINT_CORE = 0x33BBFFFF
     DRAG_SLOP = 4                # px: press-release within this is a click
+    THUMB_SIZE = 120             # thumbnail browser: image cell size
     ANNO_CASING = 0x000000A0     # shape annotation outline
     # One palette for the line and background pickers ("c" dialog).
     # English labels only: X servers without Hangul fonts (e.g. XQuartz)
@@ -543,7 +544,7 @@ class Viewer(object):
     DEFAULT_LINE = "#FF5040"     # red: visible on most captures
     DEFAULT_BG = "#000000"
     HELP_KEYS = (("+/-", "zoom"), ("0", "1:1"), ("f", "fit"),
-                 ("Enter", "full"), (",/.", "file"), ("Shift+,/.", "folder"),
+                 ("Enter", "full"), (",/.", "file"), ("b", "browse"),
                  ("drag", "pan"), ("Ctrl+wheel", "zoom"),
                  ("r", "ruler"), ("d", "draw"), ("t", "text"),
                  ("s", "select"), ("u/y", "undo/redo"),
@@ -555,7 +556,6 @@ class Viewer(object):
                  ppu=None, unit=None, stack=False, levels=None):
         self.server_sock = server_sock
         self.path = None
-        self.browse_root = None     # tree browsing root: first open's folder
         self.capture_pending = False  # a Ctrl+C grab is waiting to run
         self.pixbuf = None          # active level (already orientation-fixed)
         self.animation = None       # animated image (shown unscaled)
@@ -585,6 +585,34 @@ class Viewer(object):
         self.window.connect("delete-event", self.on_delete_event)
         self.window.connect("key-press-event", self.on_key)
         self.window.connect("focus-in-event", self.on_focus_in)
+
+        # Thumbnail browser ("b"): a second screen listing one folder's
+        # subfolders and images.  Only a single level is read at a time,
+        # so deep trees stay fast (the old Shift+,/. walked them all).
+        self.browser_active = False
+        self.browser_folder = None
+        self.thumb_queue = []       # (row index, path) pending thumbnails
+        self.thumb_source = None    # idle handler feeding them
+        self.icon_cache = {}
+        self.browser_store = Gtk.ListStore(GdkPixbuf.Pixbuf, str, str, bool)
+        self.browser_view = Gtk.IconView(model=self.browser_store)
+        self.browser_view.set_pixbuf_column(0)
+        self.browser_view.set_text_column(1)
+        self.browser_view.set_item_width(self.THUMB_SIZE + 16)
+        self.browser_view.connect("item-activated", self.on_browser_activate)
+        self.browser_scroll = Gtk.ScrolledWindow()
+        self.browser_scroll.set_policy(Gtk.PolicyType.AUTOMATIC,
+                                       Gtk.PolicyType.AUTOMATIC)
+        self.browser_scroll.add(self.browser_view)
+        self.browser_status = Gtk.Label()
+        self.browser_status.set_halign(Gtk.Align.START)
+        self.browser_status.set_margin_start(8)
+        self.browser_status.set_margin_top(2)
+        self.browser_status.set_margin_bottom(2)
+        self.browser_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.browser_box.pack_start(self.browser_scroll, True, True, 0)
+        self.browser_box.pack_start(self.browser_status, False, False, 0)
+        self.browser_box.set_no_show_all(True)
 
         self.image = Gtk.Image()
         self.scroll = Gtk.ScrolledWindow()
@@ -772,17 +800,29 @@ class Viewer(object):
         self.overlay.set_has_tooltip(True)
         self.overlay.connect("query-tooltip", self.on_overlay_query_tooltip)
         self.overlay.connect("size-allocate", self.on_overlay_allocate)
-        self.window.add(self.overlay)
+        root_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        root_box.pack_start(self.overlay, True, True, 0)
+        root_box.pack_start(self.browser_box, True, True, 0)
+        self.window.add(root_box)
 
-        error = self.load(first_path, first_legend, stack=stack,
-                          levels=levels)
-        if error != "OK":
-            sys.stderr.write("%s\n" % error)
-            sys.exit(1)
-
-        self.set_initial_size()
+        start_folder = None
+        if levels is None and not stack and os.path.isdir(first_path):
+            start_folder = os.path.abspath(first_path)
+        if start_folder is None:
+            error = self.load(first_path, first_legend, stack=stack,
+                              levels=levels)
+            if error != "OK":
+                sys.stderr.write("%s\n" % error)
+                sys.exit(1)
+            self.set_initial_size()
+        else:  # folder request: start in the thumbnail browser
+            work_w, work_h = workarea_size()
+            self.window.set_default_size(int(work_w * 0.72),
+                                         int(work_h * 0.85))
         self.window.show_all()
         self.apply_help_visibility()
+        if start_folder is not None:
+            self.enter_browser(start_folder)
 
         GLib.io_add_watch(server_sock.fileno(), GLib.IO_IN, self.on_incoming)
         for signum in (signal.SIGINT, signal.SIGTERM):
@@ -794,21 +834,24 @@ class Viewer(object):
 
     # -- image loading -----------------------------------------------------
 
+    def open_request(self, path, legend=None, ppu=None, unit=None,
+                     stack=False, levels=None):
+        """An incoming open: folders switch to the thumbnail browser,
+        anything else loads as an image/stack."""
+        if levels is None and not stack and os.path.isdir(path):
+            self.enter_browser(os.path.abspath(path))
+            return "OK"
+        result = self.load(path, legend, ppu, unit, stack, levels)
+        if result == "OK" and self.browser_active:
+            self.leave_browser()
+        return result
+
     def load(self, path, legend_path=None, ppu=None, unit=None, stack=False,
              levels=None):
         stack = stack or levels is not None
         if not stack and os.path.isdir(path):
-            # A folder opens its first image (subfolders included) and
-            # Shift+,/. then cycles the whole tree under that folder.
-            root = os.path.abspath(path)
-            result = "ERR no images found under: %s" % root
-            for folder in self.image_folders(root):
-                for candidate in self.folder_images(folder):
-                    result = self.load(candidate, legend_path, ppu, unit)
-                    if result == "OK":
-                        self.browse_root = root
-                        return result
-            return result
+            # folders open in the thumbnail browser, never here
+            return "ERR is a folder: %s" % path
         if not os.path.isfile(path):
             return "ERR no such file: %s" % path
         # Decode the legend first so a bad legend leaves the window untouched.
@@ -862,9 +905,6 @@ class Viewer(object):
                        "pixbuf": pixbuf}]
 
         self.path = path
-        # An explicit open starts a new browsing tree here; the ,/. and
-        # Shift+,/. navigation restores the original root after loading.
-        self.browse_root = os.path.dirname(os.path.abspath(path))
         self.stack_mode = stack
         self.levels = levels
         self.level_index = 0
@@ -926,7 +966,6 @@ class Viewer(object):
         if self.stack_mode:  # the folder holds the stack's own level images
             self.show_toast("folder browsing is off in stack mode")
             return
-        root = self.browse_root
         files = self.folder_images()
         current = os.path.abspath(self.path or "")
         if current in files:
@@ -948,7 +987,6 @@ class Viewer(object):
         for target in candidates:  # skip over files that fail to decode
             result = self.load(target)
             if result == "OK":
-                self.browse_root = root  # navigation keeps the first root
                 self.show_toast("(%d/%d) %s"
                                 % (files.index(target) + 1, len(files),
                                    os.path.basename(target)))
@@ -956,71 +994,144 @@ class Viewer(object):
             error = result
         self.show_toast(error)
 
-    def image_folders(self, root):
-        """Folders under root (itself included) holding at least one image,
-        in depth-first pre-order with naturally sorted siblings."""
-        exts = image_extensions()
-        found = []
-        for folder, dirs, names in os.walk(root):
-            dirs[:] = sorted((d for d in dirs if not d.startswith(".")),
-                             key=natural_key)
-            if any(not name.startswith(".") and
-                   os.path.splitext(name)[1].lstrip(".").lower() in exts
-                   for name in names):
-                found.append(folder)
-        return found
+    # -- thumbnail browser ("b") -------------------------------------------
 
-    @staticmethod
-    def tree_key(root, folder):
-        """Pre-order sort key of a folder inside root's tree."""
-        rel = os.path.relpath(folder, root)
-        if rel == ".":
-            return ()
-        return tuple(natural_key(part) for part in rel.split(os.sep))
+    def browser_icon(self, kind):
+        """Fixed cells drawn with pixbuf fills (no cairo, and the icon
+        theme may be missing on bare X servers): "folder", "up",
+        "loading" and "broken"."""
+        if kind in self.icon_cache:
+            return self.icon_cache[kind]
+        size = self.THUMB_SIZE
+        icon = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8,
+                                    size, int(size * 0.75))
+        icon.fill(0x00000000)
+        w, h = icon.get_width(), icon.get_height()
+        if kind in ("folder", "up"):
+            tab_w, tab_h, top = int(w * 0.38), int(h * 0.16), int(h * 0.08)
+            body_top = top + tab_h - 2
+            edge, face = 0x8A6D1EFF, 0xE8C15AFF
+            icon.new_subpixbuf(4, top, tab_w, tab_h).fill(edge)
+            icon.new_subpixbuf(5, top + 1, tab_w - 2, tab_h - 2).fill(face)
+            icon.new_subpixbuf(4, body_top, w - 8, h - body_top - 2) \
+                .fill(edge)
+            icon.new_subpixbuf(5, body_top + 1, w - 10,
+                               h - body_top - 4).fill(face)
+            if kind == "up":  # a darker chevron block pointing up
+                icon.new_subpixbuf(w // 2 - 6, body_top + 8, 12,
+                                   h - body_top - 18).fill(edge)
+                icon.new_subpixbuf(w // 2 - 12, body_top + 14, 24,
+                                   6).fill(edge)
+        else:
+            shade = 0x555555FF if kind == "broken" else 0x777777FF
+            icon.new_subpixbuf(4, 2, w - 8, h - 4).fill(0x333333FF)
+            icon.new_subpixbuf(5, 3, w - 10, h - 6).fill(shade)
+        self.icon_cache[kind] = icon
+        return icon
 
-    def browse_tree(self, step):
-        """Shift+,/.: jump to the neighbouring image folder (first image)
-        among the first opened file's folder and all of its subfolders."""
-        if self.stack_mode:
-            self.show_toast("folder browsing is off in stack mode")
+    def enter_browser(self, folder=None, select=None):
+        """Switch to the thumbnail browser (one folder at a time)."""
+        if folder is None:
+            folder = os.path.dirname(os.path.abspath(self.path or "")) \
+                or os.getcwd()
+        self.browser_active = True
+        self.overlay.hide()
+        self.browser_box.set_no_show_all(False)
+        self.browser_box.show_all()
+        self.populate_browser(folder, select)
+        self.browser_view.grab_focus()
+
+    def leave_browser(self):
+        """Back to the image screen (only reachable with an image)."""
+        del self.thumb_queue[:]
+        self.browser_active = False
+        self.browser_box.hide()
+        self.overlay.show()
+        self.scroll.grab_focus()  # arrow keys pan again
+        self.update_title()
+
+    def populate_browser(self, folder, select=None):
+        """One os.listdir deep: subfolders first, then this folder's
+        images.  Thumbnails stream in from an idle handler."""
+        folder = os.path.abspath(folder)
+        self.browser_folder = folder
+        self.browser_store.clear()
+        del self.thumb_queue[:]
+        try:
+            names = [n for n in os.listdir(folder) if not n.startswith(".")]
+        except OSError as exc:
+            names = []
+            self.browser_status.set_text("cannot read folder: %s" % exc)
+        dirs = sorted((n for n in names
+                       if os.path.isdir(os.path.join(folder, n))),
+                      key=natural_key)
+        images = self.folder_images(folder)
+        parent = os.path.dirname(folder)
+        if parent and parent != folder:
+            self.browser_store.append(
+                [self.browser_icon("up"), "..", parent, True])
+        for name in dirs:
+            self.browser_store.append(
+                [self.browser_icon("folder"), name,
+                 os.path.join(folder, name), True])
+        cursor = None
+        for path in images:
+            row = len(self.browser_store)
+            self.browser_store.append(
+                [self.browser_icon("loading"), os.path.basename(path),
+                 path, False])
+            self.thumb_queue.append((row, path))
+            if select and os.path.abspath(select) == os.path.abspath(path):
+                cursor = row
+        if self.thumb_queue and self.thumb_source is None:
+            self.thumb_source = GLib.idle_add(self.on_thumb_idle)
+        if cursor is not None:
+            tree_path = Gtk.TreePath(cursor)
+            self.browser_view.select_path(tree_path)
+            self.browser_view.set_cursor(tree_path, None, False)
+            GLib.idle_add(self.browser_view.scroll_to_path,
+                          tree_path, True, 0.5, 0.5)
+        self.window.set_title("%s - %s" % (folder, APP_TITLE))
+        self.browser_status.set_text(
+            "%s   %d folder%s, %d image%s   "
+            "(Enter opens, BackSpace up, Esc back, q quits)"
+            % (folder, len(dirs), "" if len(dirs) == 1 else "s",
+               len(images), "" if len(images) == 1 else "s"))
+
+    def on_thumb_idle(self):
+        """Fill in one thumbnail per idle pass; the queue is replaced
+        whenever the folder changes, so stale work just drains away."""
+        if not self.thumb_queue or not self.browser_active:
+            self.thumb_source = None
+            return False
+        row, path = self.thumb_queue.pop(0)
+        try:
+            thumb = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                path, self.THUMB_SIZE, self.THUMB_SIZE, True)
+            thumb = thumb.apply_embedded_orientation() or thumb
+        except GLib.Error:
+            thumb = self.browser_icon("broken")
+        if row < len(self.browser_store):
+            self.browser_store[row][0] = thumb
+        return True
+
+    def on_browser_activate(self, view, tree_path):
+        row = self.browser_store[tree_path]
+        target, is_dir = row[2], row[3]
+        if is_dir:
+            self.populate_browser(target)
             return
-        root = self.browse_root \
-            or os.path.dirname(os.path.abspath(self.path or ""))
-        folders = self.image_folders(root)
-        current = os.path.dirname(os.path.abspath(self.path or ""))
-        if current in folders:
-            start = folders.index(current)
-        else:  # current folder emptied/outside: enter at its tree position
-            key = self.tree_key(root, current)
-            below = sum(1 for folder in folders
-                        if self.tree_key(root, folder) < key)
-            start = below - 1 if step > 0 else below
-        order = [folders[(start + step * n) % len(folders)]
-                 for n in range(1, len(folders) + 1)] if folders else []
-        order = [folder for folder in order if folder != current]
-        if not order:
-            self.show_toast("no other image folders under %s"
-                            % (os.path.basename(root) or root))
+        current = os.path.abspath(self.path) if self.path else None
+        if current == os.path.abspath(target) and self.pixbuf is not None:
+            self.leave_browser()  # the image already on screen
             return
         if not self.confirm_unsaved():
-            return  # keep the image and its unsaved changes
-        error = None
-        for folder in order:  # skip folders whose images all fail to load
-            images = self.folder_images(folder)
-            for target in images:
-                result = self.load(target)
-                if result == "OK":
-                    self.browse_root = root
-                    rel = os.path.relpath(folder, root)
-                    name = os.path.basename(root) or root if rel == "." \
-                        else rel
-                    self.show_toast("(%d/%d) %s  (%d image%s)"
-                                    % (folders.index(folder) + 1,
-                                       len(folders), name, len(images),
-                                       "" if len(images) == 1 else "s"))
-                    return
-                error = result
-        self.show_toast(error or "no loadable images")
+            return
+        result = self.load(target)
+        if result == "OK":
+            self.leave_browser()
+        else:
+            self.browser_status.set_text(result)
 
     def image_size(self):
         if self.pixbuf is not None:
@@ -3034,6 +3145,21 @@ class Viewer(object):
 
     def on_key(self, widget, event):
         key = Gdk.keyval_name(event.keyval)
+        if self.browser_active:  # the thumbnail browser has its own keys
+            if key in ("q", "Q"):
+                self.request_quit()
+            elif key in ("Escape", "b", "B"):
+                if self.pixbuf is not None or self.animation is not None:
+                    self.leave_browser()
+            elif key == "BackSpace":
+                parent = os.path.dirname(self.browser_folder or "")
+                if parent and parent != self.browser_folder:
+                    self.populate_browser(parent)
+            elif key == "F1":
+                self.show_about()
+            else:
+                return False  # arrows/Enter/typeahead: the icon view's
+            return True
         if key in ("q", "Q"):
             self.request_quit()
         elif key in ("i", "I"):  # info overlays: help, legend, level outline
@@ -3057,6 +3183,11 @@ class Viewer(object):
                 self.set_anno_tool(None)
         elif key in ("r", "R"):
             self.set_ruler_active(not self.ruler_active)
+        elif key in ("b", "B"):
+            if self.stack_mode:  # the folder holds the stack's levels
+                self.show_toast("folder browsing is off in stack mode")
+            else:
+                self.enter_browser(select=self.path)
         elif key in ("d", "D"):
             self.ask_draw_shape()   # shape + style dialog starts the mode
         elif key in ("e", "E") and self.valid_selection() is not None:
@@ -3107,15 +3238,9 @@ class Viewer(object):
                 self.rendered_size = None
             self.rescale()
         elif key in ("comma", "less"):
-            if key == "less" or event.state & Gdk.ModifierType.SHIFT_MASK:
-                self.browse_tree(-1)   # Shift: previous image folder
-            else:
-                self.browse_folder(-1)
+            self.browse_folder(-1)
         elif key in ("period", "greater"):
-            if key == "greater" or event.state & Gdk.ModifierType.SHIFT_MASK:
-                self.browse_tree(1)    # Shift: next image folder
-            else:
-                self.browse_folder(1)
+            self.browse_folder(1)
         elif key in ("bracketright", "bracketleft"):
             # jump to 100% of the neighbouring magnification level
             if self.stack_mode:
@@ -3367,10 +3492,10 @@ class Viewer(object):
             if bad:
                 reply = bad
             elif inline:
-                reply = self.load(inline[0]["path"], legend, None, unit,
-                                  True, inline)
+                reply = self.open_request(inline[0]["path"], legend, None,
+                                          unit, True, inline)
             elif path:
-                reply = self.load(path, legend, ppu, unit, stack)
+                reply = self.open_request(path, legend, ppu, unit, stack)
             else:
                 reply = "ERR empty request"
             try:
@@ -3398,8 +3523,8 @@ def usage(stream):
         "Opens IMAGE_FILE in a viewer window on $DISPLAY.  If a viewer is\n"
         "already running on that display, the image replaces the one in the\n"
         "existing window and this process exits immediately.  With a FOLDER\n"
-        "(default: the current directory) the first image in it or its\n"
-        "subfolders opens instead.\n"
+        "(default: the current directory) a thumbnail browser of its\n"
+        "images and subfolders opens instead.\n"
         "\n"
         "  -l, --legend LEGEND_FILE  overlay LEGEND_FILE at the bottom-right\n"
         "                            corner; a request without -l removes it\n"
@@ -3417,7 +3542,9 @@ def usage(stream):
         "                            --level, for misaligned captures\n"
         "\n"
         "keys: +/- zoom, 0 actual size, f fit, Enter/F11 fullscreen,\n"
-        "      ,/. next/prev image, Shift+,/. next/prev folder,\n"
+        "      ,/. next/prev image in the folder,\n"
+        "      b thumbnail browser: one folder's subfolders and images\n"
+        "        (Enter opens, BackSpace goes up, Esc returns),\n"
         "      Ctrl+wheel zoom, drag to pan, o next-level outline,\n"
         "      i info overlays (help/legend/outline) on/off,\n"
         "      Tab all overlays (drawings and info) on/off,\n"
