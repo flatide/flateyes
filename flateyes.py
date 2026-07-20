@@ -557,7 +557,8 @@ class Viewer(object):
                  ("drag", "pan"), ("Ctrl+wheel", "zoom"),
                  ("r", "ruler"), ("d", "draw"), ("t", "text"),
                  ("s", "select"), ("u/y", "undo/redo"),
-                 ("Ctrl+C", "copy"), ("Ctrl+S", "save"), ("p", "PPU"),
+                 ("Ctrl+C", "copy"), ("Ctrl+Shift+C", "path"),
+                 ("Ctrl+S", "save"), ("p", "PPU"),
                  ("o", "outline"), ("[/]", "level"), ("i", "info"),
                  ("Tab", "overlays"), ("q", "quit"))
 
@@ -1331,15 +1332,20 @@ class Viewer(object):
         # the scroll adjustments were refreshed; safe to re-center now.
         self.apply_pending_center(allocation)
 
+    @staticmethod
+    def shorten_path(path):
+        """Very long paths on one short line: keep the head and tail."""
+        if len(path) > 72:
+            return path[:24] + "…" + path[-47:]
+        return path
+
     def update_title(self):
         name = os.path.basename(self.path or "")
         if self.anno_dirty:
             name = "*" + name  # unsaved annotation changes
         self.window.set_title("%s - %s" % (name, APP_TITLE))
         full = self.path or ""
-        shown = full
-        if len(full) > 72:  # keep very long paths on one short line
-            shown = full[:24] + "…" + full[-47:]
+        shown = self.shorten_path(full)
         self.path_tooltip = full if shown != full else None
         self.path_label.set_text(shown)
         self.update_status()
@@ -1439,6 +1445,18 @@ class Viewer(object):
         # clipboard just empties when it quits.
         self.show_toast("copied  %dx%d" % (pixbuf.get_width(),
                                            pixbuf.get_height()))
+
+    def copy_path_to_clipboard(self):
+        """Ctrl+Shift+C: the viewed image's path as clipboard text
+        (stacks: the level on screen)."""
+        path = self.active_level()["path"] if self.stack_mode else self.path
+        if not path:
+            return
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clipboard.set_text(path, -1)
+        # No clipboard.store(): see finish_copy — the selection is served
+        # by the viewer itself, so the copy lives while it runs.
+        self.show_toast("path copied  %s" % self.shorten_path(path))
 
     def embed_annotations(self):
         """PNG branch of save_annotations: embed the metadata into the
@@ -3343,6 +3361,10 @@ class Viewer(object):
         elif key in ("y", "Y"):
             self.redo_annotation()
         elif key in ("c", "C") \
+                and event.state & Gdk.ModifierType.CONTROL_MASK \
+                and event.state & Gdk.ModifierType.SHIFT_MASK:
+            self.copy_path_to_clipboard()  # Ctrl+Shift+C
+        elif key in ("c", "C") \
                 and event.state & Gdk.ModifierType.CONTROL_MASK:
             self.copy_view_to_clipboard()  # Ctrl+C
         elif key in ("s", "S") \
@@ -3736,6 +3758,8 @@ def usage(stream):
         "        Delete/BackSpace removes it, Esc deselects,\n"
         "      u/y undo/redo annotations (u also deletes, newest first),\n"
         "      Ctrl+C copy the visible view (info hidden) to the clipboard,\n"
+        "      Ctrl+Shift+C copy the image file path as text (stacks:\n"
+        "             the level shown),\n"
         "      Ctrl+S save the annotations and PPU (no autosave):\n"
         "             embedded into a PNG image itself, to a .fe\n"
         "             sidecar file for other formats; browsing to\n"
