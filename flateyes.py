@@ -2165,23 +2165,64 @@ class Viewer(object):
                                                (x, y + h), (x + w, y + h)))
             else:
                 anno["label"].hide()
+        placed = []   # rects of ruler labels already positioned this pass
         for anno in rulers:
             a = self.image_px_to_view(self.px_from_world(anno["a"]))
             b = self.image_px_to_view(self.px_from_world(anno["b"]))
             mid_x, mid_y = (a[0] + b[0]) / 2, (a[1] + b[1]) / 2
-            if -40 <= mid_x <= view.width and -20 <= mid_y <= view.height:
-                dist = math.hypot(anno["b"][0] - anno["a"][0],
-                                  anno["b"][1] - anno["a"][1])
-                anno["label"].set_text(self.format_distance(dist))
-                anno["label"].set_margin_start(int(max(0, mid_x + 10)))
-                anno["label"].set_margin_top(int(max(0, mid_y - 30)))
-                anno["label"].show()
-            else:
-                anno["label"].hide()
+            label = anno["label"]
+            if not (-40 <= mid_x <= view.width
+                    and -20 <= mid_y <= view.height):
+                label.hide()
+                continue
+            dist = math.hypot(anno["b"][0] - anno["a"][0],
+                              anno["b"][1] - anno["a"][1])
+            label.set_text(self.format_distance(dist))
+            label.show()   # a hidden label measures as zero
+            # get_preferred_size folds in the margins, which still hold the
+            # previous position; subtract them for the text's own size.
+            _, nat = label.get_preferred_size()
+            text_w = nat.width - label.get_margin_start()
+            text_h = nat.height - label.get_margin_top()
+            x, y = self.avoid_label_overlap(mid_x + 10, mid_y - text_h - 6,
+                                            text_w, text_h, placed, view)
+            label.set_margin_start(int(x))
+            label.set_margin_top(int(y))
+            placed.append((x, y, x + text_w, y + text_h))
         self.anno_image.set_from_pixbuf(buf)
         self.anno_image.set_margin_start(0)
         self.anno_image.set_margin_top(0)
         self.anno_image.show()
+
+    @staticmethod
+    def rects_overlap(p, q):
+        return (p[0] < q[2] and p[2] > q[0]
+                and p[1] < q[3] and p[3] > q[1])
+
+    def avoid_label_overlap(self, x, y, w, h, placed, view):
+        """Nudge a w*h label from its desired (x, y) so it clears every
+        ruler label already placed this pass: drop it just below the
+        blocking label, wrap to a fresh column when one fills, and keep it
+        inside the viewport.  Without this, rulers whose midpoints sit close
+        together stack their readouts on the same spot and become unreadable.
+        Best-effort and bounded: a viewport packed edge-to-edge with labels
+        may still leave a residual overlap rather than loop forever."""
+        gap = 3
+        max_x = max(2, view.width - w - 2)
+        max_y = max(2, view.height - h - 2)
+        x = min(max(2, x), max_x)
+        y = min(max(2, y), max_y)
+        for _ in range(len(placed) * 2 + 2):
+            rect = (x, y, x + w, y + h)
+            hit = next((r for r in placed if self.rects_overlap(rect, r)),
+                       None)
+            if hit is None:
+                break
+            y = hit[3] + gap            # just below the blocking label
+            if y > max_y:               # column full: start the next one
+                x = min(x + w + gap, max_x)
+                y = 2
+        return x, y
 
     def stamp_annotation(self, buf, shape):
         a = self.image_px_to_view(self.px_from_world(shape["a"]))
