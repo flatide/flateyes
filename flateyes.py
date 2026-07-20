@@ -2167,16 +2167,22 @@ class Viewer(object):
                                                (x, y + h), (x + w, y + h)))
             else:
                 anno["label"].hide()
-        placed = []   # rects of ruler labels already positioned this pass
+        # Which rulers are on-screen this pass; a single one keeps its plain
+        # up-right readout, several switch to spread-out placement + leaders.
+        vis = []
         for anno in rulers:
             a = self.image_px_to_view(self.px_from_world(anno["a"]))
             b = self.image_px_to_view(self.px_from_world(anno["b"]))
             mid_x, mid_y = (a[0] + b[0]) / 2, (a[1] + b[1]) / 2
+            if -40 <= mid_x <= view.width and -20 <= mid_y <= view.height:
+                vis.append((anno, a, b, mid_x, mid_y))
+            else:
+                anno["label"].hide()
+        multi = len(vis) > 1
+        placed = []   # rects of ruler labels already positioned this pass
+        shown = []    # (segment, label rect) of visible rulers, for leaders
+        for anno, a, b, mid_x, mid_y in vis:
             label = anno["label"]
-            if not (-40 <= mid_x <= view.width
-                    and -20 <= mid_y <= view.height):
-                label.hide()
-                continue
             dist = math.hypot(anno["b"][0] - anno["a"][0],
                               anno["b"][1] - anno["a"][1])
             label.set_text(self.format_distance(dist))
@@ -2186,11 +2192,23 @@ class Viewer(object):
             _, nat = label.get_preferred_size()
             text_w = nat.width - label.get_margin_start()
             text_h = nat.height - label.get_margin_top()
-            x, y = self.avoid_label_overlap(mid_x + 10, mid_y - text_h - 6,
-                                            text_w, text_h, placed, view)
+            if multi:   # off the shared crossing, beside each own line
+                dx, dy = self.ruler_label_spot(a, b, mid_x, mid_y,
+                                                text_w, text_h)
+            else:
+                dx, dy = mid_x + 10, mid_y - text_h - 6
+            x, y = self.avoid_label_overlap(dx, dy, text_w, text_h,
+                                            placed, view)
             label.set_margin_start(int(x))
             label.set_margin_top(int(y))
             placed.append((x, y, x + text_w, y + text_h))
+            shown.append((a, b, x, y, text_w, text_h))
+        # With several rulers a bare readout no longer says which line it
+        # measures (crossing rulers especially); tie each back to its own
+        # line with a dotted leader, distinct from the solid ruler lines.
+        if multi:
+            for a, b, lx, ly, lw, lh in shown:
+                self.draw_label_leader(buf, a, b, lx, ly, lw, lh)
         self.anno_image.set_from_pixbuf(buf)
         self.anno_image.set_margin_start(0)
         self.anno_image.set_margin_top(0)
@@ -2225,6 +2243,48 @@ class Viewer(object):
                 x = min(x + w + gap, max_x)
                 y = 2
         return x, y
+
+    def ruler_label_spot(self, a, b, mid_x, mid_y, w, h):
+        """Desired top-left for a ruler's readout when several rulers share
+        the view.  Shift along the line (tangent) so crossing rulers don't
+        pile their labels and leaders on the shared crossing, then lift off
+        the line (normal) so each chip sits beside its own line.  The leader
+        then lands on a distinct stretch of that line, away from the crossing."""
+        dvx, dvy = b[0] - a[0], b[1] - a[1]
+        length = math.hypot(dvx, dvy) or 1.0
+        tx, ty = dvx / length, dvy / length         # unit tangent
+        nx, ny = -ty, tx                             # unit normal
+        if ny > 0 or (abs(ny) < 1e-9 and nx < 0):    # aim the normal upward
+            nx, ny = -nx, -ny
+        sdir = 1.0 if tx >= 0 else -1.0              # lean toward the right end
+        shift = min(0.30 * length, 64.0)
+        foot_x = mid_x + sdir * tx * shift
+        foot_y = mid_y + sdir * ty * shift
+        lift = (abs(nx) * w + abs(ny) * h) / 2.0 + 12
+        return foot_x + nx * lift - w / 2.0, foot_y + ny * lift - h / 2.0
+
+    def draw_label_leader(self, buf, a, b, lx, ly, lw, lh):
+        """Dotted line from the ruler segment a-b to the nearest edge of its
+        readout.  The far end lands on the label's closest point along that
+        specific line (not the shared crossing), so several rulers' labels
+        stay identifiable even in a symmetric cross.  No line when the
+        segment already passes under the label."""
+        ax, ay = a
+        bx, by = b
+        # project the label centre onto the segment, clamped to its ends
+        lcx, lcy = lx + lw / 2.0, ly + lh / 2.0
+        dx, dy = bx - ax, by - ay
+        denom = dx * dx + dy * dy
+        t = 0.0 if denom == 0 else \
+            ((lcx - ax) * dx + (lcy - ay) * dy) / denom
+        t = max(0.0, min(1.0, t))
+        px, py = ax + t * dx, ay + t * dy
+        ex = min(max(px, lx), lx + lw)   # stop at the label boundary
+        ey = min(max(py, ly), ly + lh)
+        if abs(ex - px) < 1 and abs(ey - py) < 1:
+            return
+        self.stamp_segment(buf, (ex, ey), (px, py),
+                           self.RULER_CASING, self.RULER_CORE, 1, 2)
 
     def stamp_annotation(self, buf, shape):
         a = self.image_px_to_view(self.px_from_world(shape["a"]))
