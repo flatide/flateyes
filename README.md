@@ -55,6 +55,11 @@ DISPLAY=:1 flateyes --legend /path/to/legend.png /path/to/image.jpg
 # ruler 환산 배율 지정: 3.2 픽셀 = 1 um
 DISPLAY=:1 flateyes --ppu 3.2 /path/to/image.jpg
 
+# 열면서 주석을 함께 그리기 (박스·타원·선·측정·텍스트, 반복 가능)
+DISPLAY=:1 flateyes --box 120,80,360,240,red \
+                    --ruler 100,300,400,300 \
+                    --text "130,250,defect A" /path/to/image.png
+
 # 다중 배율 스택(mip-map 방식) 표시
 DISPLAY=:1 flateyes --stack /path/to/site.tds
 
@@ -172,6 +177,36 @@ DISPLAY=:1 flateyes --level site_5x.png --ppu 0.8 \
 
   같은 파일을 다시 열면 저장된 주석이 복원되고, 주석 없이 저장하면 내장
   청크/사이드카를 제거한다.
+
+### 실행 옵션으로 주석 추가
+
+이미지를 열면서 명령줄 옵션으로 주석을 함께 그릴 수 있다. 외부 프로그램이
+결함 좌표 등을 표시한 채로 뷰어를 띄우는 용도이며, 각 옵션은 여러 번
+반복할 수 있다.
+
+```sh
+flateyes --box X1,Y1,X2,Y2[,COLOR[,FILL[,WIDTH[,DASH]]]] image.png
+flateyes --ellipse X1,Y1,X2,Y2[,COLOR[,FILL[,WIDTH[,DASH]]]] image.png
+flateyes --line X1,Y1,X2,Y2[,COLOR[,WIDTH[,DASH]]] image.png
+flateyes --ruler X1,Y1,X2,Y2 image.png
+flateyes --text X,Y,TEXT image.png
+```
+
+- **좌표**는 이미지 픽셀 기준 (스택은 ruler와 같은 um 세계 좌표).
+- **COLOR**: 팔레트 이름(black·white·red·orange·green·sky·pink) 또는
+  `#RRGGBB`. 생략하면 red. `0`이면 윤곽선 없음 (FILL 필수).
+- **FILL**(박스·타원 내부): 색 이름/`#RRGGBB`는 반투명(0.35),
+  `#RRGGBBAA`로 주면 AA가 `80` 이상일 때 불투명. 생략하면 채우기 없음.
+- **WIDTH**: 굵기 1~8px (기본 1). **DASH**: `solid`/`dashed`/`dotted`
+  (또는 0/1/2, 기본 solid).
+- `--ruler`는 확정된 측정으로 추가되어 현재 PPU/단위로 환산 표시된다
+  (`--ppu`와 조합 가능). `--text`는 16pt 기본 스타일로 표시되며 TEXT에
+  쉼표를 포함할 수 있고 리터럴 `\n`이 줄바꿈이 된다.
+- 이미 실행 중인 창으로 전달(포워딩)될 때도 동일하게 적용되며, 스택
+  (`--stack`/`--level`)과도 함께 쓸 수 있다. 폴더 인자와는 함께 쓸 수 없다.
+- 추가된 주석은 손으로 그린 것과 똑같이 동작한다: 파일에 저장돼 있던 주석
+  위에 얹히고, 선택(`s`)·수정(`e`)·삭제·실행 취소(`u`)가 되며, **저장되지
+  않은 상태**로 열리므로(제목에 `*`) 유지하려면 `Ctrl+S`로 저장해야 한다.
 
 ### 썸네일 브라우저
 

@@ -553,7 +553,8 @@ class Viewer(object):
                  ("Tab", "overlays"), ("q", "quit"))
 
     def __init__(self, server_sock, first_path, first_legend=None,
-                 ppu=None, unit=None, stack=False, levels=None):
+                 ppu=None, unit=None, stack=False, levels=None,
+                 annos=None):
         self.server_sock = server_sock
         self.path = None
         self.capture_pending = False  # a Ctrl+C grab is waiting to run
@@ -814,6 +815,7 @@ class Viewer(object):
             if error != "OK":
                 sys.stderr.write("%s\n" % error)
                 sys.exit(1)
+            self.apply_request_annotations(annos or [])
             self.set_initial_size()
         else:  # folder request: start in the thumbnail browser
             work_w, work_h = workarea_size()
@@ -835,15 +837,20 @@ class Viewer(object):
     # -- image loading -----------------------------------------------------
 
     def open_request(self, path, legend=None, ppu=None, unit=None,
-                     stack=False, levels=None):
+                     stack=False, levels=None, annos=None):
         """An incoming open: folders switch to the thumbnail browser,
         anything else loads as an image/stack."""
         if levels is None and not stack and os.path.isdir(path):
+            if annos:
+                return "ERR annotations need an image, not a folder: %s" \
+                    % path
             self.enter_browser(os.path.abspath(path))
             return "OK"
         result = self.load(path, legend, ppu, unit, stack, levels)
-        if result == "OK" and self.browser_active:
-            self.leave_browser()
+        if result == "OK":
+            self.apply_request_annotations(annos or [])
+            if self.browser_active:
+                self.leave_browser()
         return result
 
     def load(self, path, legend_path=None, ppu=None, unit=None, stack=False,
@@ -2745,6 +2752,46 @@ class Viewer(object):
                 os.path.join(GLib.get_user_cache_dir(), "flateyes",
                              digest + ".fe"))
 
+    @staticmethod
+    def serialize_anno(anno):
+        """One annotation dict as its key=value metadata line — the same
+        format in the sidecar file, the PNG chunk and forwarded open
+        requests (--box and friends)."""
+        if anno["kind"] == "ruler":
+            return ("ruler=%.10g,%.10g,%.10g,%.10g"
+                    % (anno["a"][0], anno["a"][1],
+                       anno["b"][0], anno["b"][1]))
+        color = anno.get("color", Viewer.DEFAULT_LINE)
+        if anno["kind"] == "text":
+            if anno.get("bg", True):
+                # backdrop as #RRGGBBAA (0x59 = the translucent 0.35);
+                # older builds read any non-"0" value as their default
+                backdrop = "%s%02X" % (
+                    anno.get("bg_color", "#000000"),
+                    255 if anno.get("bg_opaque") else 89)
+            else:
+                backdrop = "0"
+            return ("text=%.10g,%.10g,%d,%s,%s,%s"
+                    % (anno["at"][0], anno["at"][1],
+                       anno["size"], color, backdrop,
+                       Viewer.escape_meta(anno["text"])))
+        if anno.get("fill"):
+            # same #RRGGBBAA form as the text backdrop field
+            fill = "%s%02X" % (anno["fill"],
+                               255 if anno.get("fill_opaque") else 89)
+        else:
+            fill = "0"
+        if not anno.get("outline", True):
+            color = "0"  # no border ("0" like an absent fill)
+        # 7th/8th field: stroke width and dash type (outlines and
+        # lines alike); older builds ignore trailing fields
+        extra = ",%d,%d" % (anno.get("width", 1), anno.get("dash", 0))
+        if not anno.get("casing", True):
+            extra += ",0"  # 9th field: halo off (default on)
+        return ("%s=%.10g,%.10g,%.10g,%.10g,%s,%s%s"
+                % (anno["kind"], anno["a"][0], anno["a"][1],
+                   anno["b"][0], anno["b"][1], color, fill, extra))
+
     def serialize_annotations(self):
         """Metadata lines shared by the sidecar file and the PNG chunk."""
         lines = []
@@ -2753,46 +2800,7 @@ class Viewer(object):
         if self.ppu and not self.stack_mode:
             lines.append("ppu=%.10g" % self.ppu)
             lines.append("unit=%s" % self.unit)
-        for anno in self.annotations:
-            if anno["kind"] == "ruler":
-                lines.append("ruler=%.10g,%.10g,%.10g,%.10g"
-                             % (anno["a"][0], anno["a"][1],
-                                anno["b"][0], anno["b"][1]))
-                continue
-            color = anno.get("color", self.DEFAULT_LINE)
-            if anno["kind"] == "text":
-                if anno.get("bg", True):
-                    # backdrop as #RRGGBBAA (0x59 = the translucent 0.35);
-                    # older builds read any non-"0" value as their default
-                    backdrop = "%s%02X" % (
-                        anno.get("bg_color", "#000000"),
-                        255 if anno.get("bg_opaque") else 89)
-                else:
-                    backdrop = "0"
-                lines.append("text=%.10g,%.10g,%d,%s,%s,%s"
-                             % (anno["at"][0], anno["at"][1],
-                                anno["size"], color, backdrop,
-                                self.escape_meta(anno["text"])))
-            else:
-                if anno.get("fill"):
-                    # same #RRGGBBAA form as the text backdrop field
-                    fill = "%s%02X" % (anno["fill"],
-                                       255 if anno.get("fill_opaque")
-                                       else 89)
-                else:
-                    fill = "0"
-                if not anno.get("outline", True):
-                    color = "0"  # no border ("0" like an absent fill)
-                # 7th/8th field: stroke width and dash type (outlines and
-                # lines alike); older builds ignore trailing fields
-                extra = ",%d,%d" % (anno.get("width", 1),
-                                    anno.get("dash", 0))
-                if not anno.get("casing", True):
-                    extra += ",0"  # 9th field: halo off (default on)
-                lines.append("%s=%.10g,%.10g,%.10g,%.10g,%s,%s%s"
-                             % (anno["kind"], anno["a"][0], anno["a"][1],
-                                anno["b"][0], anno["b"][1], color, fill,
-                                extra))
+        lines.extend(self.serialize_anno(anno) for anno in self.annotations)
         return lines
 
     def update_dirty(self):
@@ -2887,61 +2895,8 @@ class Viewer(object):
                 elif key == "unit":
                     if not self.stack_mode and value.strip():
                         self.unit = value.strip()
-                elif key == "text":
-                    x, y, size, color, bg, text = value.split(",", 5)
-                    text = self.unescape_meta(text)
-                    bg = bg.strip()
-                    bg_color, bg_opaque = "#000000", False
-                    if bg.startswith("#") and len(bg) == 9:
-                        try:  # "#RRGGBBAA"; "0"/"1" come from older builds
-                            int(bg[1:9], 16)
-                            bg_color = bg[:7]
-                            bg_opaque = int(bg[7:9], 16) >= 0x80
-                        except ValueError:
-                            pass
-                    if text:
-                        self.add_text_annotation(
-                            (float(x), float(y)), text,
-                            max(6, min(int(size), 96)),
-                            self.parse_color(color),
-                            bg=(bg != "0"), bg_color=bg_color,
-                            bg_opaque=bg_opaque)
-                elif key == "ruler":
-                    ax, ay, bx, by = value.split(",")[:4]
-                    self.add_ruler_annotation(
-                        (float(ax), float(ay)),
-                        (float(bx), float(by)))
-                elif key in ("box", "ellipse", "line"):
-                    parts = value.split(",")
-                    ax, ay, bx, by, color = parts[:5]
-                    anno = {"kind": key,
-                            "a": (float(ax), float(ay)),
-                            "b": (float(bx), float(by)),
-                            "color": self.parse_color(color)}
-                    if color.strip() == "0" and key != "line":
-                        anno["outline"] = False  # border switched off
-                    # 6th field since the fill feature: #RRGGBBAA or "0"
-                    fill = parts[5].strip() if len(parts) > 5 else "0"
-                    if fill.startswith("#") and len(fill) == 9:
-                        try:
-                            int(fill[1:9], 16)
-                            anno["fill"] = fill[:7]
-                            anno["fill_opaque"] = int(fill[7:9],
-                                                      16) >= 0x80
-                        except ValueError:
-                            pass
-                    if len(parts) > 6:
-                        try:  # 7th/8th field: stroke width and dash type
-                            anno["width"] = max(1, min(int(
-                                float(parts[6])), 8))
-                            if len(parts) > 7:
-                                code = int(float(parts[7]))
-                                anno["dash"] = code if code in (1, 2) else 0
-                        except ValueError:
-                            pass  # keep the shape, default 1px solid
-                    if len(parts) > 8 and parts[8].strip() == "0":
-                        anno["casing"] = False  # 9th field: halo off
-                    self.annotations.append(anno)
+                elif key in ("box", "ellipse", "line", "ruler", "text"):
+                    self.attach_annotation(self.parse_anno_line(key, value))
             except ValueError:
                 continue  # skip malformed lines
         # Restored annotations enter the undo stack as adds, so "u"
@@ -2993,6 +2948,186 @@ class Viewer(object):
             except ValueError:
                 pass
         return Viewer.DEFAULT_LINE
+
+    @staticmethod
+    def parse_anno_line(key, value):
+        """One key=value annotation from saved metadata or a forwarded
+        request as a plain data dict (no GTK — usable before import_gtk).
+        Raises ValueError on malformed input."""
+        if key == "ruler":
+            ax, ay, bx, by = value.split(",")[:4]
+            return {"kind": "ruler", "a": (float(ax), float(ay)),
+                    "b": (float(bx), float(by))}
+        if key == "text":
+            x, y, size, color, bg, text = value.split(",", 5)
+            text = Viewer.unescape_meta(text)
+            if not text:
+                raise ValueError("empty text")
+            bg = bg.strip()
+            bg_color, bg_opaque = "#000000", False
+            if bg.startswith("#") and len(bg) == 9:
+                try:  # "#RRGGBBAA"; "0"/"1" come from older builds
+                    int(bg[1:9], 16)
+                    bg_color = bg[:7]
+                    bg_opaque = int(bg[7:9], 16) >= 0x80
+                except ValueError:
+                    pass
+            return {"kind": "text", "at": (float(x), float(y)),
+                    "text": text, "size": max(6, min(int(size), 96)),
+                    "color": Viewer.parse_color(color), "bg": bg != "0",
+                    "bg_color": bg_color, "bg_opaque": bg_opaque}
+        parts = value.split(",")
+        ax, ay, bx, by, color = parts[:5]
+        anno = {"kind": key,
+                "a": (float(ax), float(ay)),
+                "b": (float(bx), float(by)),
+                "color": Viewer.parse_color(color)}
+        if color.strip() == "0" and key != "line":
+            anno["outline"] = False  # border switched off
+        # 6th field since the fill feature: #RRGGBBAA or "0"
+        fill = parts[5].strip() if len(parts) > 5 else "0"
+        if fill.startswith("#") and len(fill) == 9:
+            try:
+                int(fill[1:9], 16)
+                anno["fill"] = fill[:7]
+                anno["fill_opaque"] = int(fill[7:9], 16) >= 0x80
+            except ValueError:
+                pass
+        if len(parts) > 6:
+            try:  # 7th/8th field: stroke width and dash type
+                anno["width"] = max(1, min(int(float(parts[6])), 8))
+                if len(parts) > 7:
+                    code = int(float(parts[7]))
+                    anno["dash"] = code if code in (1, 2) else 0
+            except ValueError:
+                pass  # keep the shape, default 1px solid
+        if len(parts) > 8 and parts[8].strip() == "0":
+            anno["casing"] = False  # 9th field: halo off
+        return anno
+
+    @staticmethod
+    def option_color(text):
+        """A color from a command-line option: palette name or #RRGGBB."""
+        for name, hex_ in Viewer.PALETTE:
+            if text.lower() == name:
+                return hex_
+        if text.startswith("#") and len(text) == 7:
+            try:
+                int(text[1:], 16)
+                return text
+            except ValueError:
+                pass
+        raise ValueError("bad color: %s (use %s or #RRGGBB)"
+                         % (text, "/".join(n for n, _ in Viewer.PALETTE)))
+
+    @staticmethod
+    def parse_anno_option(kind, value):
+        """One --box/--ellipse/--line/--ruler/--text command-line value as
+        a full annotation dict (same fields as parse_anno_line yields).
+        Friendlier than the metadata format: the style fields are optional
+        and colors also take palette names.  Raises ValueError."""
+        if kind == "text":
+            parts = value.split(",", 2)
+            if len(parts) < 3 or not parts[2].strip():
+                raise ValueError("expects X,Y,TEXT")
+            try:
+                at = (float(parts[0]), float(parts[1]))
+            except ValueError:
+                raise ValueError("bad position: %s,%s"
+                                 % (parts[0], parts[1]))
+            # literal \n starts a new line, like in the metadata format;
+            # tabs would break the request protocol
+            text = Viewer.unescape_meta(parts[2]).replace("\t", " ")
+            return {"kind": "text", "at": at, "text": text, "size": 16,
+                    "color": Viewer.DEFAULT_LINE, "bg": True,
+                    "bg_color": Viewer.DEFAULT_BG, "bg_opaque": False}
+        parts = [part.strip() for part in value.split(",")]
+        if len(parts) < 4:
+            raise ValueError("expects X1,Y1,X2,Y2")
+        try:
+            anno = {"kind": kind,
+                    "a": (float(parts[0]), float(parts[1])),
+                    "b": (float(parts[2]), float(parts[3]))}
+        except ValueError:
+            raise ValueError("bad coordinates: %s" % ",".join(parts[:4]))
+        rest = parts[4:]
+        if kind == "ruler":
+            if rest:
+                raise ValueError("expects exactly X1,Y1,X2,Y2")
+            return anno
+        anno["color"] = Viewer.DEFAULT_LINE
+        if rest:  # 5th field: outline color, 0 = no outline (fill only)
+            color = rest.pop(0)
+            if color == "0":
+                if kind == "line":
+                    raise ValueError("a line needs a color")
+                anno["outline"] = False
+            elif color:
+                anno["color"] = Viewer.option_color(color)
+        if rest and kind != "line":  # 6th: fill, #RRGGBBAA makes it opaque
+            fill = rest.pop(0)
+            if fill.startswith("#") and len(fill) == 9:
+                try:
+                    int(fill[1:9], 16)
+                except ValueError:
+                    raise ValueError("bad fill: %s" % fill)
+                anno["fill"] = fill[:7]
+                anno["fill_opaque"] = int(fill[7:9], 16) >= 0x80
+            elif fill not in ("", "0"):
+                anno["fill"] = Viewer.option_color(fill)
+                anno["fill_opaque"] = False
+        if not anno.get("outline", True) and "fill" not in anno:
+            raise ValueError("0 (no outline) needs a FILL")
+        if rest:  # then WIDTH 1-8 and DASH solid/dashed/dotted
+            width = rest.pop(0)
+            try:
+                anno["width"] = int(width)
+            except ValueError:
+                raise ValueError("bad width: %s" % width)
+            if not 1 <= anno["width"] <= 8:
+                raise ValueError("width must be 1-8, got: %s" % width)
+        if rest:
+            dashes = {"solid": 0, "dashed": 1, "dotted": 2,
+                      "0": 0, "1": 1, "2": 2}
+            dash = rest.pop(0)
+            if dash.lower() not in dashes:
+                raise ValueError("dash must be solid/dashed/dotted, "
+                                 "got: %s" % dash)
+            anno["dash"] = dashes[dash.lower()]
+        if rest:
+            raise ValueError("too many fields: %s" % ",".join(rest))
+        return anno
+
+    def attach_annotation(self, anno):
+        """Append one parsed annotation dict; texts and rulers get the
+        overlay label they carry at runtime."""
+        if anno["kind"] == "text":
+            self.add_text_annotation(anno["at"], anno["text"],
+                                     anno["size"], anno["color"],
+                                     anno["bg"], anno["bg_color"],
+                                     anno["bg_opaque"])
+        elif anno["kind"] == "ruler":
+            self.add_ruler_annotation(anno["a"], anno["b"])
+        else:
+            self.annotations.append(anno)
+            self.anno_rev += 1
+
+    def apply_request_annotations(self, annos):
+        """Annotations passed on the command line (--box and friends):
+        added on top of the file's saved ones, undoable like drawn
+        shapes, and unsaved until Ctrl+S."""
+        if not annos:
+            return
+        if self.pixbuf is None:
+            self.show_toast("animations cannot be annotated")
+            return
+        for anno in annos:
+            self.attach_annotation(anno)
+            self.anno_undo.append(("add", self.annotations[-1], None))
+        del self.anno_redo[:]
+        self.anno_rev += 1
+        self.update_anno_overlay()
+        self.update_dirty()
 
     def update_hint_overlay(self):
         """Outline the area the next magnification level covers."""
@@ -3455,6 +3590,7 @@ class Viewer(object):
             legend = ppu = unit = None
             stack = False
             inline = []   # ppu=/center= after a level= bind to that level
+            annos = []    # annotations to draw once the image is open
             bad = None
             for field in fields[1:]:
                 key, _, value = field.partition("=")
@@ -3488,14 +3624,20 @@ class Viewer(object):
                     unit = value or None
                 elif key == "stack":
                     stack = value not in ("", "0")
+                elif key in ("box", "ellipse", "line", "ruler", "text"):
+                    try:
+                        annos.append(self.parse_anno_line(key, value))
+                    except ValueError:
+                        bad = "ERR bad %s: %s" % (key, value)
                 # unknown keys are ignored for forward compatibility
             if bad:
                 reply = bad
             elif inline:
                 reply = self.open_request(inline[0]["path"], legend, None,
-                                          unit, True, inline)
+                                          unit, True, inline, annos)
             elif path:
-                reply = self.open_request(path, legend, ppu, unit, stack)
+                reply = self.open_request(path, legend, ppu, unit, stack,
+                                          annos=annos)
             else:
                 reply = "ERR empty request"
             try:
@@ -3515,9 +3657,10 @@ class Viewer(object):
 
 def usage(stream):
     stream.write(
-        "usage: %s [-l LEGEND_FILE] [-p PPU] [-u UNIT] [IMAGE_FILE|FOLDER]\n"
-        "       %s [-l LEGEND_FILE] [-u UNIT] -s STACK_FILE\n"
-        "       %s [-l LEGEND_FILE] [-u UNIT] --level IMG -p PPU\n"
+        "usage: %s [-l LEGEND_FILE] [-p PPU] [-u UNIT] [DRAW...]\n"
+        "                 [IMAGE_FILE|FOLDER]\n"
+        "       %s [-l LEGEND_FILE] [-u UNIT] [DRAW...] -s STACK_FILE\n"
+        "       %s [-l LEGEND_FILE] [-u UNIT] [DRAW...] --level IMG -p PPU\n"
         "                 [--center X,Y] [--level IMG -p PPU ...]\n"
         "\n"
         "Opens IMAGE_FILE in a viewer window on $DISPLAY.  If a viewer is\n"
@@ -3540,6 +3683,23 @@ def usage(stream):
         "                            command line (no stack file needed)\n"
         "  --center X,Y              center offset in units of the last\n"
         "                            --level, for misaligned captures\n"
+        "\n"
+        "DRAW options add annotations onto the opened image, on top of\n"
+        "its saved ones; they behave like hand-drawn shapes (select,\n"
+        "undo, ...) and stay unsaved until Ctrl+S.  Each may be repeated.\n"
+        "Coordinates are image pixels (stacks: world units, like the\n"
+        "ruler).  COLOR is a palette name (%s)\n"
+        "or #RRGGBB; 0 = no outline (needs FILL).  FILL is a color, or\n"
+        "#RRGGBBAA with AA >= 80 for an opaque fill (default none).\n"
+        "WIDTH is the stroke width 1-8, DASH is solid, dashed or dotted.\n"
+        "\n"
+        "  --box X1,Y1,X2,Y2[,COLOR[,FILL[,WIDTH[,DASH]]]]\n"
+        "  --ellipse X1,Y1,X2,Y2[,COLOR[,FILL[,WIDTH[,DASH]]]]\n"
+        "  --line X1,Y1,X2,Y2[,COLOR[,WIDTH[,DASH]]]\n"
+        "  --ruler X1,Y1,X2,Y2       finished ruler measurement (uses\n"
+        "                            the PPU/unit in effect)\n"
+        "  --text X,Y,TEXT           note at X,Y (16pt, default colors;\n"
+        "                            a literal \\n breaks the line)\n"
         "\n"
         "keys: +/- zoom, 0 actual size, f fit, Enter/F11 fullscreen,\n"
         "      ,/. next/prev image in the folder,\n"
@@ -3574,16 +3734,19 @@ def usage(stream):
         "      F1/right-click About,\n"
         "      q quit - with unsaved annotations (the title shows\n"
         "        *name) a dialog asks to save/discard/cancel first\n"
-        % (APP, APP, APP))
+        % (APP, APP, APP,
+           "/".join(name for name, _ in Viewer.PALETTE)))
 
 
 def parse_args(args):
-    """Returns (path, legend, ppu, unit, is_stack, levels) or an exit code.
+    """Returns (path, legend, ppu, unit, is_stack, levels, annos) or an
+    exit code.
 
     path is None when inline levels are given; is_stack marks a manifest.
     """
     legend = ppu = unit = stack_file = None
     levels = []
+    annos = []
     paths = []
     i = 0
     while i < len(args):
@@ -3593,14 +3756,17 @@ def parse_args(args):
             usage(sys.stdout)
             return 0
         elif arg in ("-l", "--legend", "-p", "--ppu", "-u", "--unit",
-                     "-s", "--stack", "--level", "--center"):
+                     "-s", "--stack", "--level", "--center",
+                     "--box", "--ellipse", "--line", "--ruler", "--text"):
             i += 1
             if i == len(args):
                 sys.stderr.write("%s: %s requires an argument\n" % (APP, arg))
                 return 2
             took_value = args[i]
         elif arg.startswith(("--legend=", "--ppu=", "--unit=", "--stack=",
-                             "--level=", "--center=")):
+                             "--level=", "--center=", "--box=",
+                             "--ellipse=", "--line=", "--ruler=",
+                             "--text=")):
             arg, took_value = arg.split("=", 1)
         elif arg.startswith("-") and arg != "-":
             sys.stderr.write("%s: unknown option: %s\n" % (APP, arg))
@@ -3641,6 +3807,14 @@ def parse_args(args):
                                      % (APP, took_value))
                     return 2
                 levels[-1]["center"] = (x, y)
+            elif arg in ("--box", "--ellipse", "--line", "--ruler",
+                         "--text"):
+                try:
+                    annos.append(Viewer.parse_anno_option(arg[2:],
+                                                          took_value))
+                except ValueError as exc:
+                    sys.stderr.write("%s: %s: %s\n" % (APP, arg, exc))
+                    return 2
             else:
                 stack_file = took_value
         i += 1
@@ -3661,17 +3835,17 @@ def parse_args(args):
                 sys.stderr.write("%s: --level %s needs a --ppu\n"
                                  % (APP, meta["path"]))
                 return 2
-        return None, legend, None, unit, False, levels
+        return None, legend, None, unit, False, levels, annos
     if stack_file is not None:
-        return stack_file, legend, ppu, unit, True, None
-    return paths[0], legend, ppu, unit, False, None
+        return stack_file, legend, ppu, unit, True, None, annos
+    return paths[0], legend, ppu, unit, False, None, annos
 
 
 def main(argv):
     parsed = parse_args(argv[1:])
     if isinstance(parsed, int):
         return parsed
-    path, legend, ppu, unit, stack, levels = parsed
+    path, legend, ppu, unit, stack, levels, annos = parsed
 
     if levels is not None:
         for meta in levels:
@@ -3690,6 +3864,10 @@ def main(argv):
             sys.stderr.write("%s: no such file or folder: %s\n"
                              % (APP, path))
             return 1
+        if annos and os.path.isdir(path):
+            sys.stderr.write("%s: annotations need an image, not a "
+                             "folder: %s\n" % (APP, path))
+            return 2
     if legend is not None:
         legend = os.path.abspath(legend)
         if not os.path.isfile(legend):
@@ -3717,6 +3895,8 @@ def main(argv):
             fields.append("ppu=%.10g" % meta["ppu"])
             if meta["center"] != (0.0, 0.0):
                 fields.append("center=%.10g,%.10g" % meta["center"])
+    # annotations travel as the same key=value lines Ctrl+S would write
+    fields.extend(Viewer.serialize_anno(anno) for anno in annos)
     request = "\t".join(fields)
     server = None
     for _ in range(5):
@@ -3737,7 +3917,7 @@ def main(argv):
 
     import_gtk()
     Viewer(server, path if levels is None else levels[0]["path"],
-           legend, ppu, unit, stack, levels)
+           legend, ppu, unit, stack, levels, annos)
     Gtk.main()
     return 0
 
