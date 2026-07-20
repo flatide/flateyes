@@ -58,7 +58,16 @@ def socket_address(display):
         # process, so stale sockets are impossible.
         return "\0" + key
     base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
-    return os.path.join(base, key.replace("/", "_") + ".sock")
+    path = os.path.join(base, key.replace("/", "_") + ".sock")
+    if len(path.encode("utf-8")) > 96:
+        # sun_path holds ~104 bytes on macOS/BSD, and launchd-style
+        # DISPLAY values ("/var/run/.../org.xquartz:0") blow past it;
+        # fall back to a digest of the key, still deterministic per
+        # (uid, DISPLAY) so forwarders find the owner.
+        digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+        path = os.path.join(base, "%s-%d-%s.sock"
+                            % (APP, os.getuid(), digest))
+    return path
 
 
 def try_forward(addr, request):
