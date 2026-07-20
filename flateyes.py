@@ -1515,7 +1515,7 @@ class Viewer(object):
             parts.append(value % ("%d%%" % round(self.scale_shown * 100)))
             ppu = self.active_level()["ppu"] if self.stack_mode else self.ppu
             if ppu:
-                parts.append(value % ("%.4g" % ppu) + " px/"
+                parts.append(value % self.trim_decimal(ppu, 4) + " px/"
                              + GLib.markup_escape_text(self.unit))
         self.status_label.set_markup(" · ".join(parts))
 
@@ -1792,14 +1792,39 @@ class Viewer(object):
         point = self.event_to_image_px(event)
         return None if point is None else self.world_from_px(point)
 
+    @staticmethod
+    def trim_decimal(value, decimals):
+        """Fixed-point text, trailing zeros (and any bare dot) trimmed and
+        always plain decimal, so large values never turn into 4.8e+04 the
+        way %g does."""
+        text = "%.*f" % (decimals, value)
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        return text
+
+    @staticmethod
+    def um_decimals(ppu):
+        """Decimal places a micron reading is worth: enough that a single
+        pixel step (1/ppu um) stays visible, clamped to 2..6.  At a high
+        ppu like 48000 that is 5 places, so 0.0065 um no longer rounds to
+        0.01."""
+        if ppu and ppu > 0:
+            return min(6, max(2, int(math.ceil(math.log10(ppu)))))
+        return 2
+
     def format_distance(self, dist_world):
         if self.stack_mode:
             # world units come straight from the manifest ppu values
-            px = dist_world * self.active_level()["ppu"]
-            return "%.2f %s  (%d px)" % (dist_world, self.unit, round(px))
+            ppu = self.active_level()["ppu"]
+            px = dist_world * ppu
+            return "%s %s  (%d px)" % (
+                self.trim_decimal(dist_world, self.um_decimals(ppu)),
+                self.unit, round(px))
         if self.ppu:
-            return "%.2f %s  (%d px)" % (dist_world / self.ppu, self.unit,
-                                         round(dist_world))
+            return "%s %s  (%d px)" % (
+                self.trim_decimal(dist_world / self.ppu,
+                                  self.um_decimals(self.ppu)),
+                self.unit, round(dist_world))
         return "%d px" % round(dist_world)
 
     def snap_point(self, point, state):
@@ -3084,7 +3109,8 @@ class Viewer(object):
                              % (len(self.annotations),
                                 "" if len(self.annotations) == 1 else "s"))
             if ppu_restored:
-                parts.append("PPU %.4g px/%s" % (self.ppu, self.unit))
+                parts.append("PPU %s px/%s"
+                             % (self.trim_decimal(self.ppu, 4), self.unit))
             self.anno_rev += 1
             self.update_anno_overlay()
             self.show_toast(", ".join(parts) + " restored")
@@ -3383,7 +3409,7 @@ class Viewer(object):
         dialog.set_default_response(Gtk.ResponseType.OK)
         entry = Gtk.Entry()
         if self.ppu:
-            entry.set_text("%g" % self.ppu)
+            entry.set_text(self.trim_decimal(self.ppu, 6))
         entry.set_activates_default(True)
         box = dialog.get_content_area()
         box.set_border_width(10)
@@ -3532,8 +3558,9 @@ class Viewer(object):
                 bool(event.state & Gdk.ModifierType.SHIFT_MASK))
         elif key in ("p", "P"):
             if self.stack_mode:  # the manifest is authoritative for stacks
-                self.show_toast("PPU from stack manifest: %.4g px/%s"
-                                % (self.active_level()["ppu"], self.unit))
+                self.show_toast("PPU from stack manifest: %s px/%s"
+                                % (self.trim_decimal(
+                                    self.active_level()["ppu"], 4), self.unit))
             else:
                 self.ask_ppu()
         elif key in ("plus", "equal", "KP_Add"):
