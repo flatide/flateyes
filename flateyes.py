@@ -606,6 +606,7 @@ class Viewer(object):
         # so deep trees stay fast (the old Shift+,/. walked them all).
         self.browser_active = False
         self.browser_folder = None
+        self.from_browser = False   # image reached via the browser: Esc back
         self.thumb_queue = []       # (row index, path) pending thumbnails
         self.thumb_source = None    # idle handler feeding them
         self.thumb_pending = 0      # decode jobs in flight
@@ -1069,6 +1070,7 @@ class Viewer(object):
         """Back to the image screen (only reachable with an image)."""
         self.reset_thumb_work()
         self.browser_active = False
+        self.from_browser = True    # so Esc on the image screen goes back
         self.browser_box.hide()
         self.overlay.show()
         self.scroll.grab_focus()  # arrow keys pan again
@@ -3556,6 +3558,9 @@ class Viewer(object):
                 self.set_ruler_active(False)
             elif self.anno_tool is not None:
                 self.set_anno_tool(None)
+            elif self.from_browser and not self.stack_mode:
+                # nothing left to cancel: go back to the browser we came from
+                self.enter_browser(select=self.path)
         elif key in ("r", "R"):
             self.set_ruler_active(not self.ruler_active)
         elif key in ("b", "B"):
