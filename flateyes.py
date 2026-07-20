@@ -1125,6 +1125,10 @@ class Viewer(object):
             self.thumb_queue.append((row, path))
             if select and os.path.abspath(select) == os.path.abspath(path):
                 cursor = row
+        # Cloud placeholders decode last (each blocks a worker on an
+        # on-demand download), so the locally-present thumbnails are not
+        # stuck queued behind them.  Stable: natural order within groups.
+        self.thumb_queue.sort(key=lambda rp: self.file_is_dataless(rp[1]))
         self.pump_thumbs()
         if cursor is not None:
             tree_path = Gtk.TreePath(cursor)
@@ -1287,6 +1291,23 @@ class Viewer(object):
         except (GLib.Error, OSError, ValueError):
             pass
 
+    @staticmethod
+    def file_is_dataless(path):
+        """Cloud-placeholder heuristic: the on-disk blocks cover far less
+        than the file size (iCloud optimized storage, and likewise thin
+        network files).  Reading one stalls on an on-demand download, so
+        background work steers around them.  Sparse or transparently
+        compressed files can match too -- being deferred or left uncached
+        is harmless there."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return False
+        blocks = getattr(st, "st_blocks", None)
+        if blocks is None or st.st_size < 65536:
+            return False
+        return blocks * 512 < st.st_size // 2
+
     def worth_caching(self, path):
         """Cache only images larger than the thumbnail itself: tiny
         files decode instantly, and an upscaled cache entry would look
@@ -1337,7 +1358,9 @@ class Viewer(object):
         as the browser's decode_thumb_job, minus the delivery."""
         try:
             thumb, mtime = self.load_thumb_cache(path)
-            if thumb is None:
+            if thumb is None and not self.file_is_dataless(path):
+                # a cloud placeholder is left alone: speculative warming
+                # must not force a bulk download of the whole folder
                 decoded = GdkPixbuf.Pixbuf.new_from_file_at_scale(
                     path, self.THUMB_CACHE, self.THUMB_CACHE, True)
                 decoded = decoded.apply_embedded_orientation() or decoded
