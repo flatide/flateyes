@@ -612,6 +612,13 @@ class Viewer(object):
         self.thumb_pending = 0      # decode jobs in flight
         self.thumb_generation = 0   # bumped whenever the queue is replaced
         self.thumb_pool = None      # worker threads, created on first browse
+        # Cache warming: while an image is on screen its folder's
+        # thumbnails are pre-generated in the background, so a later "b"
+        # opens with every cell instant.
+        self.warm_queue = []        # paths still to warm
+        self.warm_source = None     # low-priority idle dispatcher
+        self.warm_pending = 0       # warm jobs in flight
+        self.warm_folder = None     # folder already warmed (or warming)
         self.icon_cache = {}
         self.browser_store = Gtk.ListStore(GdkPixbuf.Pixbuf, str, str, bool)
         self.browser_view = Gtk.IconView(model=self.browser_store)
@@ -970,6 +977,7 @@ class Viewer(object):
             self.image.set_from_animation(self.animation)
             self.scale_shown = 1.0
             self.update_title()
+        self.start_thumb_warm()   # pre-cache this folder for a later "b"
         return "OK"
 
     # -- folder browsing ----------------------------------------------------
@@ -1077,6 +1085,7 @@ class Viewer(object):
         self.overlay.show()
         self.scroll.grab_focus()  # arrow keys pan again
         self.update_title()
+        self.pump_warm()   # resume any cache warming the browser paused
 
     def populate_browser(self, folder, select=None):
         """One os.listdir deep: subfolders first, then this folder's
@@ -1085,6 +1094,10 @@ class Viewer(object):
         self.browser_folder = folder
         self.browser_store.clear()
         self.reset_thumb_work()
+        # The browser itself fills this folder's cache; pending warm work
+        # is dropped so the workers belong to the visible screen.
+        del self.warm_queue[:]
+        self.warm_folder = folder
         try:
             names = [n for n in os.listdir(folder) if not n.startswith(".")]
         except OSError as exc:
@@ -1281,6 +1294,62 @@ class Viewer(object):
         if not info or info[0] is None:
             return False
         return info[1] > self.THUMB_CACHE or info[2] > self.THUMB_CACHE
+
+    # -- background cache warming (image mode) ---------------------------
+
+    def start_thumb_warm(self):
+        """Queue the viewed image's folder for thumbnail cache warming.
+        Runs through the same worker pool as the browser but from a
+        LOW-priority idle, so it never competes with an open browser or
+        foreground work; a folder is warmed at most once per visit."""
+        if self.stack_mode or not self.path:
+            return
+        folder = os.path.dirname(os.path.abspath(self.path))
+        if folder == self.warm_folder:
+            return   # already warmed or warming
+        self.warm_folder = folder
+        self.warm_queue = self.folder_images(folder)
+        self.pump_warm()
+
+    def pump_warm(self):
+        if self.warm_source is None and self.warm_queue \
+                and not self.browser_active:
+            self.warm_source = GLib.idle_add(
+                self.on_warm_idle, priority=GLib.PRIORITY_LOW)
+
+    def on_warm_idle(self):
+        if self.browser_active or not self.warm_queue \
+                or self.warm_pending >= self.THUMB_PARALLEL:
+            self.warm_source = None
+            return False
+        if self.thumb_pool is None:
+            self.thumb_pool = ThreadPoolExecutor(
+                max_workers=self.THUMB_PARALLEL, thread_name_prefix="fe-thumb")
+        path = self.warm_queue.pop(0)
+        self.warm_pending += 1
+        self.thumb_pool.submit(self.warm_thumb_job, path)
+        return True
+
+    def warm_thumb_job(self, path):
+        """Worker thread: make sure the spec cache holds a fresh thumbnail
+        for path; the pixbuf itself is discarded.  Same decode/cache steps
+        as the browser's decode_thumb_job, minus the delivery."""
+        try:
+            thumb, mtime = self.load_thumb_cache(path)
+            if thumb is None:
+                decoded = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                    path, self.THUMB_CACHE, self.THUMB_CACHE, True)
+                decoded = decoded.apply_embedded_orientation() or decoded
+                if mtime is not None and self.worth_caching(path):
+                    self.save_thumb_cache(path, decoded, mtime)
+        except Exception:   # broken image: the browser will mark it later
+            pass
+        GLib.idle_add(self.on_warm_done)
+
+    def on_warm_done(self):
+        self.warm_pending -= 1
+        self.pump_warm()
+        return False
 
     def on_browser_activate(self, view, tree_path):
         row = self.browser_store[tree_path]
