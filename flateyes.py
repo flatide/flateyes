@@ -662,6 +662,8 @@ class Viewer(object):
         self.ruler_start = None
         self.ruler_end = None       # second point, once fixed
         self.ruler_cursor = None    # live preview point while picking
+        self.ruler_axis = None      # snapped axis Ctrl holds on to ("h"/"v")
+        self.ruler_dir = None       # free-angle unit vector Ctrl freezes
         self.ruler_drawn = None     # geometry of the rendered overlays
         self.ruler_line = Gtk.Image()
         self.ruler_label = Gtk.Label()
@@ -1769,6 +1771,7 @@ class Viewer(object):
             self.clear_selection()
         self.ruler_active = active
         self.ruler_start = self.ruler_end = self.ruler_cursor = None
+        self.ruler_axis = self.ruler_dir = None
         self.set_viewport_cursor(self.tool_cursor())
         self.update_view_overlays()
         self.update_mode_toast()
@@ -1830,11 +1833,31 @@ class Viewer(object):
         return "%d px" % round(dist_world)
 
     def snap_point(self, point, state):
-        """Constrain to the dominant axis unless Shift asks for free angle."""
-        if state & Gdk.ModifierType.SHIFT_MASK:
-            return point
+        """Constrain to the dominant axis unless Shift asks for free angle.
+        Holding Ctrl freezes the direction the measurement is already on:
+        snapped mode keeps its horizontal/vertical axis instead of
+        re-picking the dominant one at every motion, and free mode locks
+        the current angle, sliding the end along it (only the length still
+        follows the mouse)."""
         ax, ay = self.ruler_start
-        if abs(point[0] - ax) >= abs(point[1] - ay):
+        if state & Gdk.ModifierType.SHIFT_MASK:
+            self.ruler_axis = None
+            dx, dy = point[0] - ax, point[1] - ay
+            if state & Gdk.ModifierType.CONTROL_MASK \
+                    and self.ruler_dir is not None:
+                ux, uy = self.ruler_dir      # hold the angle, keep the length
+                t = dx * ux + dy * uy
+                return (ax + t * ux, ay + t * uy)
+            length = math.hypot(dx, dy)
+            if length:
+                self.ruler_dir = (dx / length, dy / length)
+            return point
+        self.ruler_dir = None
+        if not (state & Gdk.ModifierType.CONTROL_MASK) \
+                or self.ruler_axis is None:
+            self.ruler_axis = "h" \
+                if abs(point[0] - ax) >= abs(point[1] - ay) else "v"
+        if self.ruler_axis == "h":
             return (point[0], ay)
         return (ax, point[1])
 
@@ -2055,6 +2078,7 @@ class Viewer(object):
             if self.ruler_active:   # tools are exclusive
                 self.ruler_active = False
                 self.ruler_start = self.ruler_end = self.ruler_cursor = None
+                self.ruler_axis = self.ruler_dir = None
                 self.update_ruler_overlay()
             if not self.draw_visible:
                 self.draw_visible = True  # drawing needs its overlays back
@@ -3879,6 +3903,7 @@ class Viewer(object):
             if self.ruler_start is None:
                 self.ruler_start = point           # start a new measurement
                 self.ruler_end = self.ruler_cursor = None
+                self.ruler_axis = self.ruler_dir = None   # re-pick fresh
                 self.update_ruler_overlay()
             else:
                 # second click commits the measurement as an annotation:
@@ -3888,6 +3913,7 @@ class Viewer(object):
                 self.anno_undo.append(("add", self.annotations[-1], None))
                 del self.anno_redo[:]
                 self.ruler_start = self.ruler_end = self.ruler_cursor = None
+                self.ruler_axis = self.ruler_dir = None
                 self.update_ruler_overlay()        # clear the live preview
                 self.update_anno_overlay()
                 self.update_dirty()
