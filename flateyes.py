@@ -2179,9 +2179,10 @@ class Viewer(object):
             else:
                 anno["label"].hide()
         multi = len(vis) > 1
-        placed = []   # rects of ruler labels already positioned this pass
-        shown = []    # (segment, label rect) of visible rulers, for leaders
-        for anno, a, b, mid_x, mid_y in vis:
+        segs = [(a, b) for _, a, b, _, _ in vis]
+        placed = []    # rects of ruler labels already positioned this pass
+        leaders = []   # leader segments already claimed, kept clear of rects
+        for idx, (anno, a, b, mid_x, mid_y) in enumerate(vis):
             label = anno["label"]
             dist = math.hypot(anno["b"][0] - anno["a"][0],
                               anno["b"][1] - anno["a"][1])
@@ -2193,22 +2194,31 @@ class Viewer(object):
             text_w = nat.width - label.get_margin_start()
             text_h = nat.height - label.get_margin_top()
             if multi:   # off the shared crossing, beside each own line
-                dx, dy = self.ruler_label_spot(a, b, mid_x, mid_y,
-                                                text_w, text_h)
+                others = segs[:idx] + segs[idx + 1:]
+                x, y = self.pick_ruler_label_spot(a, b, text_w, text_h,
+                                                  placed, leaders, others,
+                                                  view)
             else:
-                dx, dy = mid_x + 10, mid_y - text_h - 6
-            x, y = self.avoid_label_overlap(dx, dy, text_w, text_h,
-                                            placed, view)
+                x, y = self.avoid_label_overlap(mid_x + 10,
+                                                mid_y - text_h - 6,
+                                                text_w, text_h, placed, view)
             label.set_margin_start(int(x))
             label.set_margin_top(int(y))
-            placed.append((x, y, x + text_w, y + text_h))
-            shown.append((a, b, x, y, text_w, text_h))
+            rect = (x, y, x + text_w, y + text_h)
+            placed.append(rect)
+            if multi:
+                seg = self.ruler_leader_seg(a, b, rect)
+                if seg is not None:
+                    leaders.append(seg)
         # With several rulers a bare readout no longer says which line it
         # measures (crossing rulers especially); tie each back to its own
         # line with a dotted leader, distinct from the solid ruler lines.
-        if multi:
-            for a, b, lx, ly, lw, lh in shown:
-                self.draw_label_leader(buf, a, b, lx, ly, lw, lh)
+        # Labels are widgets stacked above this pixbuf, so a leader can
+        # never paint over a chip -- the placement above keeps leaders and
+        # foreign chips apart instead.
+        for end, foot in leaders:
+            self.stamp_segment(buf, end, foot, self.RULER_CASING,
+                               self.RULER_CORE, 1, 2)
         self.anno_image.set_from_pixbuf(buf)
         self.anno_image.set_margin_start(0)
         self.anno_image.set_margin_top(0)
@@ -2263,28 +2273,94 @@ class Viewer(object):
         lift = (abs(nx) * w + abs(ny) * h) / 2.0 + 12
         return foot_x + nx * lift - w / 2.0, foot_y + ny * lift - h / 2.0
 
-    def draw_label_leader(self, buf, a, b, lx, ly, lw, lh):
-        """Dotted line from the ruler segment a-b to the nearest edge of its
-        readout.  The far end lands on the label's closest point along that
-        specific line (not the shared crossing), so several rulers' labels
-        stay identifiable even in a symmetric cross.  No line when the
-        segment already passes under the label."""
-        ax, ay = a
-        bx, by = b
-        # project the label centre onto the segment, clamped to its ends
-        lcx, lcy = lx + lw / 2.0, ly + lh / 2.0
-        dx, dy = bx - ax, by - ay
+    @staticmethod
+    def seg_hits_rect(p, q, rect):
+        """Does segment p-q pass through rect?  (Liang-Barsky reject test.)"""
+        x0, y0, x1, y1 = rect
+        dx, dy = q[0] - p[0], q[1] - p[1]
+        t0, t1 = 0.0, 1.0
+        for num, den in ((p[0] - x0, -dx), (x1 - p[0], dx),
+                         (p[1] - y0, -dy), (y1 - p[1], dy)):
+            if den == 0:
+                if num < 0:
+                    return False
+            else:
+                r = num / den
+                if den < 0:
+                    t0 = max(t0, r)   # entering this boundary
+                else:
+                    t1 = min(t1, r)   # leaving it
+                if t0 > t1:
+                    return False
+        return True
+
+    @staticmethod
+    def ruler_leader_seg(a, b, rect):
+        """Leader for a readout at rect: from the label edge to the closest
+        point of segment a-b.  The foot lands on that specific line (not a
+        shared crossing), so crossing rulers stay identifiable.  None when
+        the segment already passes under the label -- adjacency says it all."""
+        lx0, ly0, lx1, ly1 = rect
+        lcx, lcy = (lx0 + lx1) / 2.0, (ly0 + ly1) / 2.0
+        dx, dy = b[0] - a[0], b[1] - a[1]
         denom = dx * dx + dy * dy
         t = 0.0 if denom == 0 else \
-            ((lcx - ax) * dx + (lcy - ay) * dy) / denom
+            ((lcx - a[0]) * dx + (lcy - a[1]) * dy) / denom
         t = max(0.0, min(1.0, t))
-        px, py = ax + t * dx, ay + t * dy
-        ex = min(max(px, lx), lx + lw)   # stop at the label boundary
-        ey = min(max(py, ly), ly + lh)
+        px, py = a[0] + t * dx, a[1] + t * dy
+        ex = min(max(px, lx0), lx1)   # stop at the label boundary
+        ey = min(max(py, ly0), ly1)
         if abs(ex - px) < 1 and abs(ey - py) < 1:
-            return
-        self.stamp_segment(buf, (ex, ey), (px, py),
-                           self.RULER_CASING, self.RULER_CORE, 1, 2)
+            return None
+        return ((ex, ey), (px, py))
+
+    def pick_ruler_label_spot(self, a, b, w, h, placed, leaders, others,
+                              view):
+        """Place one ruler's readout so the whole arrangement stays legible:
+        try anchor points along the ruler's own line and both sides of it,
+        and take the first spot whose chip covers no other chip or leader
+        and whose own leader does not run under an earlier chip (chips are
+        widgets above the overlay, so anything under one is lost).  The
+        strict first sweep also refuses to cover the other rulers' lines
+        themselves, which walks chips away from a shared crossing; rulers
+        packed too closely for that (near-parallel neighbours) retry without
+        it, and the plain spread + shove remains the last resort."""
+        dvx, dvy = b[0] - a[0], b[1] - a[1]
+        length = math.hypot(dvx, dvy) or 1.0
+        tx, ty = dvx / length, dvy / length
+        # first side = the upward normal, matching the single-ruler habit
+        first = -1.0 if tx > 0 else 1.0
+        for strict in (True, False):
+            for frac in (0.5, 0.34, 0.66, 0.2, 0.8):
+                ax = a[0] + dvx * frac
+                ay = a[1] + dvy * frac
+                if not (0 <= ax <= view.width and 0 <= ay <= view.height):
+                    continue   # anchor scrolled out: label points nowhere
+                for side in (first, -first):
+                    nx, ny = -ty * side, tx * side
+                    lift = (abs(nx) * w + abs(ny) * h) / 2.0 + 12
+                    x = ax + nx * lift - w / 2.0
+                    y = ay + ny * lift - h / 2.0
+                    x = min(max(2, x), max(2, view.width - w - 2))
+                    y = min(max(2, y), max(2, view.height - h - 2))
+                    rect = (x, y, x + w, y + h)
+                    if any(self.rects_overlap(rect, r) for r in placed):
+                        continue
+                    if any(self.seg_hits_rect(s[0], s[1], rect)
+                           for s in leaders):
+                        continue   # chip would sit on an earlier leader
+                    if strict and any(self.seg_hits_rect(oa, ob, rect)
+                                      for oa, ob in others):
+                        continue   # chip would cover someone else's line
+                    seg = self.ruler_leader_seg(a, b, rect)
+                    if seg is not None and any(
+                            self.seg_hits_rect(seg[0], seg[1], r)
+                            for r in placed):
+                        continue   # leader would vanish under a chip
+                    return x, y
+        mid_x, mid_y = (a[0] + b[0]) / 2, (a[1] + b[1]) / 2
+        x, y = self.ruler_label_spot(a, b, mid_x, mid_y, w, h)
+        return self.avoid_label_overlap(x, y, w, h, placed, view)
 
     def stamp_annotation(self, buf, shape):
         a = self.image_px_to_view(self.px_from_world(shape["a"]))
