@@ -350,20 +350,20 @@ class TextViewEditable(object):
 # ---------------------------------------------------------------------------
 
 def import_gtk():
-    global Gtk, Gdk, GdkPixbuf, GLib
+    global Gtk, Gdk, GdkPixbuf, GLib, Gio
     try:
         import gi
         gi.require_version("Gtk", "3.0")
         gi.require_version("GdkPixbuf", "2.0")
         from gi.repository import Gtk as _Gtk, Gdk as _Gdk, \
-            GdkPixbuf as _GdkPixbuf, GLib as _GLib
+            GdkPixbuf as _GdkPixbuf, GLib as _GLib, Gio as _Gio
     except (ImportError, ValueError) as exc:
         sys.stderr.write(
             "%s: PyGObject/GTK3 is required to open a window (%s)\n"
             "  verify with: python3 -c 'import gi; gi.require_version(\"Gtk\", \"3.0\")'\n"
             % (APP, exc))
         sys.exit(3)
-    Gtk, Gdk, GdkPixbuf, GLib = _Gtk, _Gdk, _GdkPixbuf, _GLib
+    Gtk, Gdk, GdkPixbuf, GLib, Gio = _Gtk, _Gdk, _GdkPixbuf, _GLib, _Gio
     # PyGObject already ran gtk_init_check() while importing; when it
     # failed (DISPLAY set but the X server unreachable: dead or restarted
     # session, xauth mismatch, ...) the first widget would raise a
@@ -542,6 +542,8 @@ class Viewer(object):
     HINT_CORE = 0x33BBFFFF
     DRAG_SLOP = 4                # px: press-release within this is a click
     THUMB_SIZE = 120             # thumbnail browser: image cell size
+    THUMB_CACHE = 128            # freedesktop "normal" thumbnail size
+    THUMB_PARALLEL = 4           # async thumbnail decodes in flight
     ANNO_CASING = 0x000000A0     # shape annotation outline
     # One palette for the line and background pickers ("c" dialog).
     # English labels only: X servers without Hangul fonts (e.g. XQuartz)
@@ -604,6 +606,9 @@ class Viewer(object):
         self.browser_folder = None
         self.thumb_queue = []       # (row index, path) pending thumbnails
         self.thumb_source = None    # idle handler feeding them
+        self.thumb_pending = 0      # async decodes in flight
+        self.thumb_generation = 0   # bumped whenever the queue is replaced
+        self.thumb_cancel = Gio.Cancellable()
         self.icon_cache = {}
         self.browser_store = Gtk.ListStore(GdkPixbuf.Pixbuf, str, str, bool)
         self.browser_view = Gtk.IconView(model=self.browser_store)
@@ -1060,7 +1065,7 @@ class Viewer(object):
 
     def leave_browser(self):
         """Back to the image screen (only reachable with an image)."""
-        del self.thumb_queue[:]
+        self.reset_thumb_work()
         self.browser_active = False
         self.browser_box.hide()
         self.overlay.show()
@@ -1073,7 +1078,7 @@ class Viewer(object):
         folder = os.path.abspath(folder)
         self.browser_folder = folder
         self.browser_store.clear()
-        del self.thumb_queue[:]
+        self.reset_thumb_work()
         try:
             names = [n for n in os.listdir(folder) if not n.startswith(".")]
         except OSError as exc:
@@ -1100,8 +1105,7 @@ class Viewer(object):
             self.thumb_queue.append((row, path))
             if select and os.path.abspath(select) == os.path.abspath(path):
                 cursor = row
-        if self.thumb_queue and self.thumb_source is None:
-            self.thumb_source = GLib.idle_add(self.on_thumb_idle)
+        self.pump_thumbs()
         if cursor is not None:
             tree_path = Gtk.TreePath(cursor)
             self.browser_view.select_path(tree_path)
@@ -1115,22 +1119,177 @@ class Viewer(object):
             % (folder, len(dirs), "" if len(dirs) == 1 else "s",
                len(images), "" if len(images) == 1 else "s"))
 
+    def reset_thumb_work(self):
+        """Drop queued thumbnails and orphan the in-flight decodes:
+        their callbacks see a stale generation and discard the result."""
+        del self.thumb_queue[:]
+        self.thumb_generation += 1
+        self.thumb_cancel.cancel()
+        self.thumb_cancel = Gio.Cancellable()
+
+    def pump_thumbs(self):
+        """(Re)arm the idle feeder unless it is already running."""
+        if self.thumb_source is None and self.thumb_queue \
+                and self.browser_active:
+            self.thumb_source = GLib.idle_add(self.on_thumb_idle)
+
     def on_thumb_idle(self):
-        """Fill in one thumbnail per idle pass; the queue is replaced
-        whenever the folder changes, so stale work just drains away."""
-        if not self.thumb_queue or not self.browser_active:
+        """One queue entry per idle pass: cache hits fill their row
+        right away (a 128px PNG loads in well under a millisecond),
+        misses start an asynchronous decode.  Pauses itself while
+        THUMB_PARALLEL decodes are in flight; finish_thumb pumps it
+        again as slots free up."""
+        if not self.browser_active or not self.thumb_queue \
+                or self.thumb_pending >= self.THUMB_PARALLEL:
             self.thumb_source = None
             return False
-        row, path = self.thumb_queue.pop(0)
+        row, path = self.pop_thumb()
+        thumb, mtime = self.load_thumb_cache(path)
+        if thumb is not None:
+            self.set_thumb(row, thumb)
+        else:
+            self.start_thumb_decode(row, path, mtime)
+        return True
+
+    def pop_thumb(self):
+        """Next queue entry, preferring rows scrolled into view so the
+        user watches their own screen fill first."""
         try:
-            thumb = GdkPixbuf.Pixbuf.new_from_file_at_scale(
-                path, self.THUMB_SIZE, self.THUMB_SIZE, True)
-            thumb = thumb.apply_embedded_orientation() or thumb
-        except GLib.Error:
-            thumb = self.browser_icon("broken")
+            rng = self.browser_view.get_visible_range()
+        except (TypeError, ValueError):
+            rng = None              # return shape varies across minors
+        if rng and isinstance(rng[0], bool):
+            rng = rng[1:] if rng[0] else None
+        if rng:
+            lo = rng[0].get_indices()[0]
+            hi = rng[1].get_indices()[0]
+            for i, (row, _) in enumerate(self.thumb_queue):
+                if lo <= row <= hi:
+                    return self.thumb_queue.pop(i)
+        return self.thumb_queue.pop(0)
+
+    def set_thumb(self, row, thumb):
         if row < len(self.browser_store):
             self.browser_store[row][0] = thumb
-        return True
+
+    def fit_thumb(self, thumb):
+        """Scale a decoded or cached thumbnail into the browser cell."""
+        w, h = thumb.get_width(), thumb.get_height()
+        scale = min(float(self.THUMB_SIZE) / w, float(self.THUMB_SIZE) / h)
+        if abs(scale - 1.0) < 1e-6:
+            return thumb
+        return thumb.scale_simple(max(1, int(w * scale)),
+                                  max(1, int(h * scale)),
+                                  GdkPixbuf.InterpType.BILINEAR)
+
+    def thumb_cache_name(self, path):
+        """freedesktop thumbnail location: md5 of the file URI under
+        ~/.cache/thumbnails.  Sharing the spec cache means folders the
+        user already browsed with eog/nautilus show instantly here, and
+        our thumbnails help those tools in return."""
+        uri = GLib.filename_to_uri(os.path.abspath(path), None)
+        # FIPS-mode hosts refuse md5: the ValueError is caught by the
+        # callers and thumbnails just stay session-local there.
+        name = hashlib.md5(uri.encode("utf-8")).hexdigest() + ".png"
+        root = os.environ.get("XDG_CACHE_HOME") \
+            or os.path.join(os.path.expanduser("~"), ".cache")
+        return os.path.join(root, "thumbnails"), name, uri
+
+    def load_thumb_cache(self, path):
+        """Return (thumbnail, mtime-string).  The thumbnail is None
+        when missing or stale; mtime rides along so the decode path can
+        fill the cache without a second stat."""
+        try:
+            mtime = str(int(os.stat(path).st_mtime))
+        except OSError:
+            return None, None
+        try:
+            root, name, _uri = self.thumb_cache_name(path)
+        except (GLib.Error, ValueError):
+            return None, mtime
+        for level in ("normal", "large"):
+            cached = os.path.join(root, level, name)
+            if not os.path.exists(cached):
+                continue
+            try:
+                thumb = GdkPixbuf.Pixbuf.new_from_file(cached)
+            except GLib.Error:
+                continue
+            if thumb.get_option("tEXt::Thumb::MTime") == mtime:
+                return self.fit_thumb(thumb), mtime
+        return None, mtime
+
+    def save_thumb_cache(self, path, thumb, mtime):
+        """Write a spec-compliant "normal" thumbnail (Thumb:: keys,
+        mode 0600, atomic rename).  Failure only costs persistence."""
+        try:
+            root, name, uri = self.thumb_cache_name(path)
+            folder = os.path.join(root, "normal")
+            os.makedirs(folder, 0o700, exist_ok=True)
+            tmp = os.path.join(folder, "%s.%d.tmp" % (name, os.getpid()))
+            thumb.savev(tmp, "png",
+                        ["tEXt::Thumb::URI", "tEXt::Thumb::MTime"],
+                        [uri, mtime])
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, os.path.join(folder, name))
+        except (GLib.Error, OSError, ValueError):
+            pass
+
+    def start_thumb_decode(self, row, path, mtime):
+        """Decode off the main loop via gdk-pixbuf's own worker threads
+        (Gio async, no Python threads); the callbacks land back on the
+        main loop, so all widget/model access stays there."""
+        gen = self.thumb_generation
+        cancel = self.thumb_cancel
+        self.thumb_pending += 1
+        Gio.File.new_for_path(path).read_async(
+            GLib.PRIORITY_DEFAULT_IDLE, cancel,
+            lambda gfile, res: self.on_thumb_stream(
+                gfile, res, row, path, mtime, gen, cancel))
+
+    def on_thumb_stream(self, gfile, res, row, path, mtime, gen, cancel):
+        try:
+            stream = gfile.read_finish(res)
+        except GLib.Error:
+            self.finish_thumb(None, row, path, mtime, gen)
+            return
+        GdkPixbuf.Pixbuf.new_from_stream_at_scale_async(
+            stream, self.THUMB_CACHE, self.THUMB_CACHE, True, cancel,
+            lambda _src, r: self.on_thumb_decoded(
+                stream, r, row, path, mtime, gen))
+
+    def on_thumb_decoded(self, stream, res, row, path, mtime, gen):
+        try:
+            thumb = GdkPixbuf.Pixbuf.new_from_stream_finish(res)
+            thumb = thumb.apply_embedded_orientation() or thumb
+        except GLib.Error:
+            thumb = None
+        try:
+            stream.close(None)
+        except GLib.Error:
+            pass
+        self.finish_thumb(thumb, row, path, mtime, gen)
+
+    def finish_thumb(self, thumb, row, path, mtime, gen):
+        """Fill the cell, cache the result, release the decode slot."""
+        self.thumb_pending -= 1
+        if gen == self.thumb_generation and self.browser_active:
+            if thumb is None:
+                self.set_thumb(row, self.browser_icon("broken"))
+            else:
+                if mtime is not None and self.worth_caching(path):
+                    self.save_thumb_cache(path, thumb, mtime)
+                self.set_thumb(row, self.fit_thumb(thumb))
+        self.pump_thumbs()
+
+    def worth_caching(self, path):
+        """Cache only images larger than the thumbnail itself: tiny
+        files decode instantly, and an upscaled cache entry would look
+        soft in other spec users (nautilus, eog)."""
+        info = GdkPixbuf.Pixbuf.get_file_info(path)
+        if not info or info[0] is None:
+            return False
+        return info[1] > self.THUMB_CACHE or info[2] > self.THUMB_CACHE
 
     def on_browser_activate(self, view, tree_path):
         row = self.browser_store[tree_path]
