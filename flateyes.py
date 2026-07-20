@@ -765,6 +765,7 @@ class Viewer(object):
         self.anno_selected = None   # annotation picked with "s" (keyboard)
         self.anno_edit_anchor = None  # "a"/"b": arrows resize that anchor
         self.anno_dirty = False     # metadata differs from the saved state
+        self.anno_notable = False   # ...beyond rulers: prompts and titles
         self.saved_meta = []        # serialization at load/save time
         self.anno_font_size = 16    # last used text size (pt), sticky
         # Shape drawing ("d" dialog): kind, outline color, interior fill.
@@ -963,7 +964,7 @@ class Viewer(object):
         # The as-loaded state (request ppu included) is the clean baseline
         # for the title's unsaved marker.
         self.saved_meta = self.serialize_annotations()
-        self.anno_dirty = False
+        self.anno_dirty = self.anno_notable = False
         self.legend_pixbuf = legend_pixbuf
         self.legend_rendered = None
         if legend_pixbuf is not None:
@@ -1560,8 +1561,8 @@ class Viewer(object):
 
     def update_title(self):
         name = os.path.basename(self.path or "")
-        if self.anno_dirty:
-            name = "*" + name  # unsaved annotation changes
+        if self.anno_notable:
+            name = "*" + name  # unsaved changes beyond mere rulers
         self.window.set_title("%s - %s" % (name, APP_TITLE))
         full = self.path or ""
         shown = self.shorten_path(full)
@@ -3273,12 +3274,24 @@ class Viewer(object):
         lines.extend(self.serialize_anno(anno) for anno in self.annotations)
         return lines
 
+    @staticmethod
+    def notable_lines(lines):
+        """Metadata minus the ruler measurements: rulers are transient
+        working aids, so a delta made of nothing but rulers is not worth
+        a save question (Ctrl+S still stores them)."""
+        return [l for l in lines if not l.startswith("ruler=")]
+
     def update_dirty(self):
         """Retitle ("*name") when the metadata diverges from the saved
-        state; undoing back to it clears the marker again."""
-        dirty = self.serialize_annotations() != self.saved_meta
-        if dirty != self.anno_dirty:
+        state in a way worth asking about; undoing back to it (or a
+        rulers-only delta) clears the marker again."""
+        lines = self.serialize_annotations()
+        dirty = lines != self.saved_meta
+        notable = dirty and \
+            self.notable_lines(lines) != self.notable_lines(self.saved_meta)
+        if dirty != self.anno_dirty or notable != self.anno_notable:
             self.anno_dirty = dirty
+            self.anno_notable = notable
             self.update_title()
 
     def save_annotations(self):
@@ -3725,8 +3738,8 @@ class Viewer(object):
     def confirm_unsaved(self):
         """True when leaving the image (quit, close, browse) may proceed:
         clean, saved, or discarded."""
-        if not self.anno_dirty:
-            return True
+        if not self.anno_notable:
+            return True   # clean, or only transient ruler measurements
         dialog = Gtk.Dialog(title="Unsaved annotations",
                             transient_for=self.window, modal=True)
         dialog.set_keep_above(True)  # stay over a fullscreen parent
