@@ -2593,11 +2593,25 @@ class Viewer(object):
             self.fill_rect(buf, x - 6, y - 6, 13, 13, self.RULER_CASING)
             self.fill_rect(buf, x - 4, y - 4, 9, 9, 0xFFFFFFFF)
 
+    @staticmethod
+    def cancel_on_escape(dialog):
+        """Esc cancels the dialog even when the focus sits in a text
+        widget whose input method (macOS quartz) would swallow the key
+        before the dialog's default Esc-close binding runs: a handler on
+        the dialog itself sees the key before the focus-widget forward."""
+        def on_dialog_key(widget, event):
+            if Gdk.keyval_name(event.keyval) == "Escape":
+                dialog.response(Gtk.ResponseType.CANCEL)
+                return True
+            return False
+        dialog.connect("key-press-event", on_dialog_key)
+
     def ask_annotation_text(self, point, edit=None):
         """Text dialog: creates an annotation at point, or reworks the
         existing one passed as edit (selection + "e")."""
         dialog = Gtk.Dialog(title="Edit Text" if edit else "Text",
                             transient_for=self.window, modal=True)
+        self.cancel_on_escape(dialog)
         dialog.set_keep_above(True)  # stay over a fullscreen parent
         dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
         dialog.add_button("OK", Gtk.ResponseType.OK)
@@ -2821,6 +2835,7 @@ class Viewer(object):
             return  # animations are shown unscaled and unannotated
         dialog = Gtk.Dialog(title="Draw", transient_for=self.window,
                             modal=True)
+        self.cancel_on_escape(dialog)
         dialog.set_keep_above(True)  # stay over a fullscreen parent
         dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
         dialog.add_button("OK", Gtk.ResponseType.OK)
@@ -3711,6 +3726,7 @@ class Viewer(object):
     def ask_ppu(self):
         dialog = Gtk.Dialog(title="PPU", transient_for=self.window,
                             modal=True)
+        self.cancel_on_escape(dialog)
         dialog.set_keep_above(True)  # stay over a fullscreen parent
         dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
         dialog.add_button("OK", Gtk.ResponseType.OK)
