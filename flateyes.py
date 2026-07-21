@@ -2593,6 +2593,15 @@ class Viewer(object):
             self.fill_rect(buf, x - 6, y - 6, 13, 13, self.RULER_CASING)
             self.fill_rect(buf, x - 4, y - 4, 9, 9, 0xFFFFFFFF)
 
+    def restore_focus(self):
+        """Hand the keyboard back to the main window after a modal
+        dialog: some backends (macOS quartz notably) fail to refocus the
+        parent when a transient closes, leaving every key -- the Esc that
+        the mode toast promises included -- dead until a click."""
+        self.window.present()
+        target = self.browser_view if self.browser_active else self.scroll
+        target.grab_focus()
+
     @staticmethod
     def cancel_on_escape(dialog):
         """Esc cancels the dialog even when the focus sits in a text
@@ -2724,6 +2733,7 @@ class Viewer(object):
         bg_color = hexes[max(bg_combo.get_active(), 0)]
         bg_opaque = opaque.get_active()
         dialog.destroy()
+        self.restore_focus()
         if not confirmed or not text:
             return  # emptied text is a cancel; deleting is the Delete key
         self.anno_font_size = size
@@ -2936,6 +2946,7 @@ class Viewer(object):
         line_dash = max(type_combo.get_active(), 0)
         halo_on = halo_check.get_active()
         dialog.destroy()
+        self.restore_focus()
         if not confirmed:
             return
         self.anno_shape = shape
@@ -3709,6 +3720,7 @@ class Viewer(object):
         dialog.set_copyright("2026 FLATIDE LC.\nhttp://flatide.com")
         dialog.run()
         dialog.destroy()
+        self.restore_focus()
 
     def show_context_menu(self, event):
         menu = Gtk.Menu()
@@ -3754,6 +3766,7 @@ class Viewer(object):
                 if value > 0:
                     self.ppu = value
         dialog.destroy()
+        self.restore_focus()
         self.update_ruler_overlay()
         self.update_anno_overlay()  # ruler annotation labels show distances
         self.update_status()
@@ -3796,6 +3809,7 @@ class Viewer(object):
         dialog.show_all()
         response = dialog.run()
         dialog.destroy()
+        self.restore_focus()
         if response == Gtk.ResponseType.OK:
             self.save_annotations()
             return not self.anno_dirty  # a failed save keeps the window
