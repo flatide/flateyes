@@ -2278,8 +2278,16 @@ class Viewer(object):
                 anno["label"].set_margin_top(int(max(0, y)))
                 anno["label"].show()
                 if anno is selected:
-                    alloc = anno["label"].get_allocation()
-                    w, h = max(alloc.width, 10), max(alloc.height, 10)
+                    # get_preferred_size reflects the text as it is NOW;
+                    # the allocation lags a layout pass and reads 1x1
+                    # right after an edit rebuilt the label, which shrank
+                    # the handles to a dot.  Margins hold the position
+                    # set above, so subtract them for the text itself.
+                    _, nat = anno["label"].get_preferred_size()
+                    w = max(nat.width
+                            - anno["label"].get_margin_start(), 10)
+                    h = max(nat.height
+                            - anno["label"].get_margin_top(), 10)
                     self.stamp_selection(buf, ((x, y), (x + w, y),
                                                (x, y + h), (x + w, y + h)))
             else:
