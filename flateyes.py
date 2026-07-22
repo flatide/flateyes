@@ -36,7 +36,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -4413,7 +4413,11 @@ class Viewer(object):
         return False
 
     def present(self):
-        self.window.show_all()
+        # show(), not show_all(): the image screen and the thumbnail
+        # browser share the window and enter/leave_browser manage which
+        # one is visible; show_all would un-hide the inactive screen too
+        # (the window splits into image + browser halves).
+        self.window.show()
         self.window.deiconify()
         self.window.present_with_time(Gtk.get_current_event_time() or
                                       Gdk.CURRENT_TIME)
