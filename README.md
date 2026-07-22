@@ -1,6 +1,8 @@
 # flateyes
 
 폐쇄망 리눅스 환경용 초경량 이미지 뷰어 (단일 파일 Python 스크립트).
+동봉된 [`fe_embed.py`](#캡처-시점에-png에-주석-심기-fe_embedpy)로는 뷰어 없이도
+PNG에 주석을 임베드할 수 있다 (대량 캡처 서비스 연동용, 역시 단일 파일).
 
 eog를 대체하기 위해 만들어졌으며, eog의 두 가지 문제를 동시에 해결한다:
 
@@ -243,6 +245,63 @@ flateyes --text X,Y,TEXT image.png
 - 추가된 주석은 손으로 그린 것과 똑같이 동작한다: 파일에 저장돼 있던 주석
   위에 얹히고, 선택(`s`)·수정(`e`)·삭제·실행 취소(`u`)가 되며, **저장되지
   않은 상태**로 열리므로(제목에 `*`) 유지하려면 `Ctrl+S`로 저장해야 한다.
+
+### 캡처 시점에 PNG에 주석 심기 (fe_embed.py)
+
+뷰어를 띄우지 않고도 PNG 파일에 주석을 임베드할 수 있는 독립 유틸리티.
+대량 캡처 서비스가 캡처와 동시에 결함 박스·텍스트 등을 파일 안에 넣어 두면,
+flateyes로 여는 순간 그대로 표시되고 `Ctrl+S` 편집도 같은 청크에 이어진다.
+
+- flateyes와 동일한 방식: 픽셀은 건드리지 않고 `iTXt` 청크(keyword
+  `flateyes`)만 IEND 앞에 삽입하므로 다른 프로그램에서는 평범한 PNG다.
+- 표준 라이브러리만 사용 — `fe_embed.py` 한 파일만 복사하면 어디서든 동작
+  (뷰어와 달리 GTK도 필요 없다).
+- 좌표는 이미지 픽셀 기준. 옵션 문법(`--box` 등)과 색·굵기·점선 규칙은
+  위의 "실행 옵션으로 주석 추가"와 동일하다.
+
+```sh
+# CLI — 여러 파일에 같은 주석을 일괄 임베드
+python3 fe_embed.py --box 120,80,420,300,red,0,2 \
+                    --text '120,60,DEFECT #17' shot_*.png
+
+# JSON으로 대량 지정 ("-"는 stdin), PPU(측정 배율)도 함께 저장
+python3 fe_embed.py --json annos.json --ppu 8.5 --unit um shot_0001.png
+
+# 확인 / 기존 주석 유지하며 추가 / 제거
+python3 fe_embed.py --dump shot_0001.png
+python3 fe_embed.py --append --line 0,0,640,480,green shot_0001.png
+python3 fe_embed.py --strip shot_0001.png
+```
+
+JSON은 주석 객체의 배열이다 (색은 팔레트 이름 또는 `#RRGGBB`):
+
+```json
+[
+ {"kind": "box",  "x1": 5, "y1": 5, "x2": 40, "y2": 30,
+  "color": "sky", "fill": "sky", "width": 2},
+ {"kind": "text", "x": 5, "y": 32, "text": "불량 A",
+  "size": 12, "color": "white", "bg_opaque": true}
+]
+```
+
+파이썬 서비스라면 모듈로 직접 사용한다 (파일 저장 전 메모리 단계에서
+`embed_bytes`로 처리 가능):
+
+```python
+import fe_embed as fe
+
+fe.embed("shot_0001.png", [
+    fe.box(120, 80, 420, 300, color="red", width=2),
+    fe.text(120, 60, "DEFECT #17", size=20, color="white"),
+], ppu=8.5, unit="um")
+
+blob = fe.embed_bytes(png_bytes, annos)   # bytes -> bytes
+annos, ppu, unit = fe.read("shot_0001.png")
+```
+
+`python3 fe_embed.py --selftest`를 flateyes.py 옆에서 실행하면 모든 주석
+종류를 양쪽 구현으로 교차 왕복시켜 포맷 호환을 검증한다 (둘 중 한쪽의
+포맷을 수정했다면 반드시 실행).
 
 ### 썸네일 브라우저
 
