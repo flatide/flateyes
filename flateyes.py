@@ -34,7 +34,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.4.3"
+VERSION = "1.4.4"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -3881,6 +3881,46 @@ class Viewer(object):
                              % (kind, ", ".join(sorted(obj))))
         return anno
 
+    @staticmethod
+    def parse_json_document(data):
+        """A --json payload: either a plain array of annotation
+        objects, or an object {"ppu": N, "unit": U, "note": TEXT,
+        "annotations": [...]} (every key optional) so one file carries
+        everything — the same document format fe_embed.py takes.
+        Returns (annos, ppu, unit, note); raises ValueError."""
+        if isinstance(data, list):
+            return ([Viewer.parse_anno_json(obj) for obj in data],
+                    None, None, None)
+        if not isinstance(data, dict):
+            raise ValueError("expected a JSON array or object")
+        data = dict(data)
+        ppu = data.pop("ppu", None)
+        if ppu is not None:
+            try:
+                ppu = float(ppu)
+            except (TypeError, ValueError):
+                raise ValueError("bad ppu: %r" % (ppu,))
+            if ppu <= 0:
+                raise ValueError("ppu must be > 0")
+        unit = data.pop("unit", None)
+        if unit is not None:
+            unit = str(unit).strip()
+            if not unit:
+                raise ValueError("empty unit")
+        note = data.pop("note", None)
+        if note is not None:
+            note = str(note)
+            if not note.strip():
+                raise ValueError("empty note")
+        annos = data.pop("annotations", [])
+        if not isinstance(annos, list):
+            raise ValueError("\"annotations\" must be an array")
+        if data:
+            raise ValueError("unknown fields: %s"
+                             % ", ".join(sorted(data)))
+        return ([Viewer.parse_anno_json(obj) for obj in annos],
+                ppu, unit, note)
+
     def attach_annotation(self, anno):
         """Append one parsed annotation dict; texts and rulers get the
         overlay label they carry at runtime."""
@@ -4524,7 +4564,11 @@ def usage(stream):
         "  --json FILE               annotations from a JSON array of\n"
         "                            objects (\"-\" = stdin), the same\n"
         "                            format fe_embed.py takes; added in\n"
-        "                            option order like the DRAW options\n"
+        "                            option order like the DRAW options.\n"
+        "                            An object {ppu, unit, note,\n"
+        "                            annotations} also carries the\n"
+        "                            metadata (explicit -p/-u/--note\n"
+        "                            win over the document's values)\n"
         "\n"
         "keys: +/- zoom, 0 actual size, f fit, Enter/F11 fullscreen,\n"
         "      ,/. next/prev image in the folder,\n"
@@ -4575,6 +4619,7 @@ def parse_args(args):
     path is None when inline levels are given; is_stack marks a manifest.
     """
     legend = ppu = unit = stack_file = note = None
+    json_ppu = json_unit = json_note = None
     levels = []
     annos = []
     paths = []
@@ -4661,10 +4706,12 @@ def parse_args(args):
                         with open(took_value, "r",
                                   encoding="utf-8") as handle:
                             data = json.load(handle)
-                    if not isinstance(data, list):
-                        raise ValueError("expected a JSON array")
-                    annos.extend(Viewer.parse_anno_json(obj)
-                                 for obj in data)
+                    extra, doc_ppu, doc_unit, doc_note = \
+                        Viewer.parse_json_document(data)
+                    annos.extend(extra)
+                    json_ppu = doc_ppu if doc_ppu is not None else json_ppu
+                    json_unit = doc_unit or json_unit
+                    json_note = doc_note or json_note
                 except (OSError, ValueError) as exc:
                     sys.stderr.write("%s: --json %s: %s\n"
                                      % (APP, took_value, exc))
@@ -4672,6 +4719,14 @@ def parse_args(args):
             else:
                 stack_file = took_value
         i += 1
+    # explicit command-line options win over the JSON document's values
+    # (a json ppu never binds to --level lists: those are per-level)
+    if ppu is None and json_ppu is not None and not levels:
+        ppu = json_ppu
+    if unit is None and json_unit is not None:
+        unit = json_unit
+    if note is None and json_note is not None:
+        note = json_note.replace("\t", " ")  # request protocol safety
     sources = (1 if paths else 0) + (1 if stack_file else 0) \
         + (1 if levels else 0)
     if sources > 1 or len(paths) > 1:

@@ -276,9 +276,11 @@ flateyes --json annos.json image.png
 - `--note`는 `n` 키의 노트를 실행 시점에 지정한다 — 파일에 저장된 노트가
   있으면 화면에서 대체하며, 다른 DRAW 옵션과 마찬가지로 `Ctrl+S` 전까지는
   미저장 상태다. 리터럴 `\n`이 줄바꿈이 된다.
-- `--json`은 주석 여러 개를 JSON 배열 파일로 한 번에 받는다 (`-`는
-  표준 입력). 객체 형식은 아래 fe_embed.py의 것과 완전히 같고, 옵션이
-  놓인 위치 순서대로 다른 DRAW 옵션과 함께 적용된다 (반복 가능).
+- `--json`은 주석 여러 개를 JSON 파일로 한 번에 받는다 (`-`는 표준
+  입력, 반복 가능). 형식은 아래 fe_embed.py의 것과 완전히 같다 — 배열이면
+  주석 목록, 객체면 `ppu`/`unit`/`note`까지 함께 적용된다 (명시한
+  `-p`/`-u`/`--note`가 JSON 값보다 우선). 주석은 옵션이 놓인 위치
+  순서대로 다른 DRAW 옵션과 함께 적용된다.
 - 이미 실행 중인 창으로 전달(포워딩)될 때도 동일하게 적용되며, 스택
   (`--stack`/`--level`)과도 함께 쓸 수 있다. 폴더 인자와는 함께 쓸 수 없다.
 - 추가된 주석은 손으로 그린 것과 똑같이 동작한다: 파일에 저장돼 있던 주석
@@ -314,16 +316,48 @@ python3 fe_embed.py --append --line 0,0,640,480,green shot_0001.png
 python3 fe_embed.py --strip shot_0001.png
 ```
 
-JSON은 주석 객체의 배열이다 (색은 팔레트 이름 또는 `#RRGGBB`):
+JSON은 두 형식을 받는다. **배열**이면 주석 목록이고, **객체**면 ppu·unit·
+note까지 파일 하나에 담을 수 있다 (모든 키 선택, `--ppu`/`--unit`/`--note`를
+명시하면 그 값이 JSON보다 우선). 완전한 샘플:
 
 ```json
-[
- {"kind": "box",  "x1": 5, "y1": 5, "x2": 40, "y2": 30,
-  "color": "sky", "fill": "sky", "width": 2},
- {"kind": "text", "x": 5, "y": 32, "text": "불량 A",
-  "size": 12, "color": "white", "bg_opaque": true}
-]
+{
+  "ppu": 8.5,
+  "unit": "um",
+  "note": "캡처 장비 3호기\n조도 재확인",
+  "annotations": [
+    {"kind": "box", "x1": 120, "y1": 80, "x2": 420, "y2": 300,
+     "color": "red", "width": 2, "dash": "dashed"},
+    {"kind": "box", "x1": 40, "y1": 40, "x2": 90, "y2": 90,
+     "outline": false, "fill": "orange", "fill_opaque": true},
+    {"kind": "ellipse", "a": [500, 100], "b": [640, 200],
+     "color": "#35C5FF", "fill": "sky", "casing": false},
+    {"kind": "line", "x1": 0, "y1": 0, "x2": 300, "y2": 200,
+     "color": "green", "width": 4, "dash": "dotted"},
+    {"kind": "ruler", "x1": 100, "y1": 500, "x2": 400, "y2": 500},
+    {"kind": "text", "x": 120, "y": 50, "text": "DEFECT #17",
+     "size": 20, "color": "white", "bg_color": "black", "bg_opaque": true},
+    {"kind": "text", "at": [500, 220], "text": "배경 없는 라벨", "bg": false}
+  ]
+}
 ```
+
+필드 레퍼런스 (기울임 = 생략 가능, 색은 팔레트 이름
+black·white·red·orange·green·sky·pink 또는 `#RRGGBB`):
+
+| kind | 필수 | 선택 |
+|---|---|---|
+| 최상위 객체 | — | *ppu*(>0, ruler 환산 배율), *unit*(기본 um), *note*(이미지 메모, `\n` 줄바꿈), *annotations*(배열) |
+| `box` / `ellipse` | 좌표 | *color*(기본 red), *width*(1~8, 기본 1), *dash*(`solid`/`dashed`/`dotted`, 기본 solid), *casing*(검은 테두리, 기본 true), *fill*(채움 색, 기본 없음), *fill_opaque*(기본 false=반투명), *outline*(false면 윤곽선 없음 — fill 필수) |
+| `line` | 좌표 | *color*, *width*, *dash*, *casing* (box와 동일) |
+| `ruler` | 좌표 | 없음 (ppu/unit로 환산 표시) |
+| `text` | `text`, 위치 | *size*(6~96, 기본 16), *color*(기본 red), *bg*(배경 사용, 기본 true), *bg_color*(기본 black), *bg_opaque*(기본 false=반투명 0.35) |
+
+- 좌표: 도형·ruler는 `"x1"/"y1"/"x2"/"y2"` 또는 `"a": [x, y], "b": [x, y]`,
+  텍스트는 `"x"/"y"` 또는 `"at": [x, y]` — 모두 이미지 픽셀 기준.
+- 같은 파일을 `flateyes --json`에 줘도 동일하게 해석된다 (뷰어에서는
+  ppu가 `-p`, note가 `--note`에 해당하는 값으로 적용되고 `Ctrl+S` 전까지
+  미저장).
 
 파이썬 서비스라면 모듈로 직접 사용한다 (파일 저장 전 메모리 단계에서
 `embed_bytes`로 처리 가능):

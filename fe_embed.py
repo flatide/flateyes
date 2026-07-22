@@ -592,6 +592,42 @@ def from_json(obj):
         raise ValueError("%s: %s" % (kind, exc))
 
 
+def parse_json_document(data):
+    """A --json payload: either a plain array of annotation objects, or
+    an object {"ppu": N, "unit": U, "note": TEXT, "annotations": [...]}
+    (every key optional) so one file carries everything.  Returns
+    (annos, ppu, unit, note); raises ValueError on malformed input."""
+    if isinstance(data, list):
+        return [from_json(obj) for obj in data], None, None, None
+    if not isinstance(data, dict):
+        raise ValueError("expected a JSON array or object")
+    data = dict(data)
+    ppu = data.pop("ppu", None)
+    if ppu is not None:
+        try:
+            ppu = float(ppu)
+        except (TypeError, ValueError):
+            raise ValueError("bad ppu: %r" % (ppu,))
+        if ppu <= 0:
+            raise ValueError("ppu must be > 0")
+    unit = data.pop("unit", None)
+    if unit is not None:
+        unit = str(unit).strip()
+        if not unit:
+            raise ValueError("empty unit")
+    note = data.pop("note", None)
+    if note is not None:
+        note = str(note)
+        if not note.strip():
+            raise ValueError("empty note")
+    annos = data.pop("annotations", [])
+    if not isinstance(annos, list):
+        raise ValueError("\"annotations\" must be an array")
+    if data:
+        raise ValueError("unknown fields: %s" % ", ".join(sorted(data)))
+    return [from_json(obj) for obj in annos], ppu, unit, note
+
+
 class _AnnoOption(argparse.Action):
     """Collect every --box/--ellipse/... into one list, preserving the
     command-line order (draw order in the viewer)."""
@@ -622,7 +658,10 @@ def build_parser():
                                  " is a palette name or #RRGGBB)" % kind)
     parser.add_argument("--json", metavar="FILE",
                         help="annotations from a JSON array (\"-\" = "
-                             "stdin); appended after the option ones")
+                             "stdin), appended after the option ones; "
+                             "an object {ppu, unit, note, annotations} "
+                             "also carries the metadata (explicit "
+                             "--ppu/--unit/--note win)")
     parser.add_argument("--note", metavar="TEXT",
                         help="one free text for the whole image, no "
                              "position or style (flateyes shows it at "
@@ -632,7 +671,7 @@ def build_parser():
     parser.add_argument("--ppu", type=float, metavar="N",
                         help="pixels per unit stored with the "
                              "annotations (ruler scale)")
-    parser.add_argument("--unit", default="um", metavar="U",
+    parser.add_argument("--unit", metavar="U",
                         help="unit label for --ppu (default: um)")
     parser.add_argument("--append", action="store_true",
                         help="keep annotations already embedded instead "
@@ -681,6 +720,7 @@ def main(argv=None):
                 return 1
         return 0
     annos = list(args.annos)
+    json_ppu = json_unit = json_note = None
     if args.json:
         try:
             if args.json == "-":
@@ -688,18 +728,21 @@ def main(argv=None):
             else:
                 with open(args.json, "r", encoding="utf-8") as handle:
                     data = json.load(handle)
-            if not isinstance(data, list):
-                raise ValueError("expected a JSON array")
-            annos.extend(from_json(obj) for obj in data)
+            extra, json_ppu, json_unit, json_note = \
+                parse_json_document(data)
+            annos.extend(extra)
         except (OSError, ValueError) as exc:
             sys.stderr.write("--json %s: %s\n" % (args.json, exc))
             return 1
-    note = unescape_meta(args.note) if args.note else None
-    if not annos and not args.ppu and not note and not args.append:
+    # explicit command-line values win over the JSON document's
+    ppu = args.ppu if args.ppu is not None else json_ppu
+    unit = args.unit or json_unit or "um"
+    note = unescape_meta(args.note) if args.note else json_note
+    if not annos and not ppu and not note and not args.append:
         parser.error("no annotations given (use --strip to remove)")
     for path in args.png:
         try:
-            embed(path, annos, args.ppu, args.unit, args.append, note)
+            embed(path, annos, ppu, unit, args.append, note)
         except (OSError, ValueError) as exc:
             sys.stderr.write("%s: %s\n" % (path, exc))
             return 1
@@ -848,6 +891,15 @@ def selftest():
                   == [flateyes.Viewer.serialize_anno(
                       flateyes.Viewer.parse_anno_json(dict(o)))
                       for o in jsons])
+            doc = {"ppu": 8.5, "unit": "um", "note": "문서 노트",
+                   "annotations": jsons}
+            ours = parse_json_document(dict(doc))
+            theirs = flateyes.Viewer.parse_json_document(dict(doc))
+            check("JSON document parses identically",
+                  ours[1:] == theirs[1:] == (8.5, "um", "문서 노트")
+                  and [serialize_anno(a) for a in ours[0]]
+                  == [flateyes.Viewer.serialize_anno(a)
+                      for a in theirs[0]])
             flateyes.write_png_metadata(target, "# flateyes annotations\n"
                                         + "\n".join(lines) + "\n")
             with open(target, "rb") as handle:
