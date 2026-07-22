@@ -33,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -324,6 +324,7 @@ class TextViewEditable(object):
     """Entry-like facade over a Gtk.TextView for the hangul composer."""
 
     def __init__(self, view):
+        self.view = view
         self.buffer = view.get_buffer()
 
     def get_text(self):
@@ -345,6 +346,18 @@ class TextViewEditable(object):
 
     def delete_selection(self):
         self.buffer.delete_selection(True, True)
+
+    def replace_span(self, anchor, old_len, new):
+        """Swap just the preedit span, keeping the cursor onscreen.
+        Rewriting the whole buffer (set_text) empties it for a moment,
+        which collapses the scroll position to the top on multi-line
+        content — and a programmatic place_cursor never scrolls back."""
+        self.buffer.delete(self.buffer.get_iter_at_offset(anchor),
+                           self.buffer.get_iter_at_offset(anchor + old_len))
+        self.buffer.insert(self.buffer.get_iter_at_offset(anchor), new)
+        self.buffer.place_cursor(
+            self.buffer.get_iter_at_offset(anchor + len(new)))
+        self.view.scroll_mark_onscreen(self.buffer.get_insert())
 
 
 # ---------------------------------------------------------------------------
@@ -3126,6 +3139,10 @@ class Viewer(object):
     @staticmethod
     def entry_replace(entry, anchor, old_len, new):
         """Replace the preedit span at anchor, cursor after it."""
+        replace_span = getattr(entry, "replace_span", None)
+        if replace_span is not None:
+            replace_span(anchor, old_len, new)  # keeps the scroll put
+            return
         text = entry.get_text()
         entry.set_text(text[:anchor] + new + text[anchor + old_len:])
         entry.set_position(anchor + len(new))
