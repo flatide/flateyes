@@ -11,6 +11,8 @@ Behaviour:
     window over a unix socket and exit immediately.
   * Different DISPLAY values get independent windows, so many user displays
     can be served at the same time.
+  * --multi opts out of the single-instance behaviour: the process always
+    opens its own independent window and never touches the instance socket.
 
 Usage:
   DISPLAY=:1 flateyes.py /path/to/image.jpg
@@ -34,7 +36,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.4.4"
+VERSION = "1.5.0"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -888,7 +890,9 @@ class Viewer(object):
         if start_folder is not None:
             self.enter_browser(start_folder)
 
-        GLib.io_add_watch(server_sock.fileno(), GLib.IO_IN, self.on_incoming)
+        if server_sock is not None:  # None with --multi: no request socket
+            GLib.io_add_watch(server_sock.fileno(), GLib.IO_IN,
+                              self.on_incoming)
         for signum in (signal.SIGINT, signal.SIGTERM):
             try:
                 GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signum,
@@ -4507,7 +4511,7 @@ class Viewer(object):
 
 def usage(stream):
     stream.write(
-        "usage: %s [-l LEGEND_FILE] [-p PPU] [-u UNIT] [DRAW...]\n"
+        "usage: %s [-m] [-l LEGEND_FILE] [-p PPU] [-u UNIT] [DRAW...]\n"
         "                 [IMAGE_FILE|FOLDER]\n"
         "       %s [-l LEGEND_FILE] [-u UNIT] [DRAW...] -s STACK_FILE\n"
         "       %s [-l LEGEND_FILE] [-u UNIT] [DRAW...] --level IMG -p PPU\n"
@@ -4519,6 +4523,11 @@ def usage(stream):
         "(default: the current directory) a thumbnail browser of its\n"
         "images and subfolders opens instead.\n"
         "\n"
+        "  -m, --multi               always open a new, independent window\n"
+        "                            (any form above accepts it): no\n"
+        "                            forwarding to a running viewer, and\n"
+        "                            later runs without it still go to the\n"
+        "                            primary instance, never to this window\n"
         "  -l, --legend LEGEND_FILE  overlay LEGEND_FILE at the bottom-right\n"
         "                            corner; a request without -l removes it\n"
         "  -p, --ppu PPU             pixels per unit: the ruler converts\n"
@@ -4613,13 +4622,14 @@ def usage(stream):
 
 
 def parse_args(args):
-    """Returns (path, legend, ppu, unit, is_stack, levels, annos, note)
-    or an exit code.
+    """Returns (path, legend, ppu, unit, is_stack, levels, annos, note,
+    multi) or an exit code.
 
     path is None when inline levels are given; is_stack marks a manifest.
     """
     legend = ppu = unit = stack_file = note = None
     json_ppu = json_unit = json_note = None
+    multi = False
     levels = []
     annos = []
     paths = []
@@ -4630,6 +4640,8 @@ def parse_args(args):
         if arg in ("-h", "--help"):
             usage(sys.stdout)
             return 0
+        elif arg in ("-m", "--multi"):
+            multi = True
         elif arg in ("-l", "--legend", "-p", "--ppu", "-u", "--unit",
                      "-s", "--stack", "--level", "--center",
                      "--box", "--ellipse", "--line", "--ruler", "--text",
@@ -4744,17 +4756,17 @@ def parse_args(args):
                 sys.stderr.write("%s: --level %s needs a --ppu\n"
                                  % (APP, meta["path"]))
                 return 2
-        return None, legend, None, unit, False, levels, annos, note
+        return None, legend, None, unit, False, levels, annos, note, multi
     if stack_file is not None:
-        return stack_file, legend, ppu, unit, True, None, annos, note
-    return paths[0], legend, ppu, unit, False, None, annos, note
+        return stack_file, legend, ppu, unit, True, None, annos, note, multi
+    return paths[0], legend, ppu, unit, False, None, annos, note, multi
 
 
 def main(argv):
     parsed = parse_args(argv[1:])
     if isinstance(parsed, int):
         return parsed
-    path, legend, ppu, unit, stack, levels, annos, note = parsed
+    path, legend, ppu, unit, stack, levels, annos, note, multi = parsed
 
     if levels is not None:
         for meta in levels:
@@ -4788,43 +4800,45 @@ def main(argv):
         sys.stderr.write("%s: DISPLAY is not set\n" % APP)
         return 1
 
-    addr = socket_address(display)
-    fields = [path if levels is None else ""]
-    if legend is not None:
-        fields.append("legend=%s" % legend)
-    if ppu is not None:
-        fields.append("ppu=%.10g" % ppu)
-    if unit is not None:
-        fields.append("unit=%s" % unit)
-    if stack:
-        fields.append("stack=1")
-    if levels is not None:
-        for meta in levels:
-            fields.append("level=%s" % meta["path"])
-            fields.append("ppu=%.10g" % meta["ppu"])
-            if meta["center"] != (0.0, 0.0):
-                fields.append("center=%.10g,%.10g" % meta["center"])
-    # annotations travel as the same key=value lines Ctrl+S would write
-    fields.extend(Viewer.serialize_anno(anno) for anno in annos)
-    if note is not None:
-        fields.append("note=%s" % Viewer.escape_meta(note))
-    request = "\t".join(fields)
     server = None
-    for _ in range(5):
-        code = try_forward(addr, request)
-        if code is not None:
-            return code
-        server = try_bind(addr)
-        if server is not None:
-            break
-        time.sleep(0.2)
-    if server is None:
-        sys.stderr.write("%s: could not create or reach the instance socket\n" % APP)
-        return 1
+    if not multi:  # --multi: independent window, no instance socket at all
+        addr = socket_address(display)
+        fields = [path if levels is None else ""]
+        if legend is not None:
+            fields.append("legend=%s" % legend)
+        if ppu is not None:
+            fields.append("ppu=%.10g" % ppu)
+        if unit is not None:
+            fields.append("unit=%s" % unit)
+        if stack:
+            fields.append("stack=1")
+        if levels is not None:
+            for meta in levels:
+                fields.append("level=%s" % meta["path"])
+                fields.append("ppu=%.10g" % meta["ppu"])
+                if meta["center"] != (0.0, 0.0):
+                    fields.append("center=%.10g,%.10g" % meta["center"])
+        # annotations travel as the same key=value lines Ctrl+S would write
+        fields.extend(Viewer.serialize_anno(anno) for anno in annos)
+        if note is not None:
+            fields.append("note=%s" % Viewer.escape_meta(note))
+        request = "\t".join(fields)
+        for _ in range(5):
+            code = try_forward(addr, request)
+            if code is not None:
+                return code
+            server = try_bind(addr)
+            if server is not None:
+                break
+            time.sleep(0.2)
+        if server is None:
+            sys.stderr.write("%s: could not create or reach the instance "
+                             "socket\n" % APP)
+            return 1
 
-    if not addr.startswith("\0"):
-        import atexit
-        atexit.register(lambda: os.path.exists(addr) and os.unlink(addr))
+        if not addr.startswith("\0"):
+            import atexit
+            atexit.register(lambda: os.path.exists(addr) and os.unlink(addr))
 
     import_gtk()
     Viewer(server, path if levels is None else levels[0]["path"],
