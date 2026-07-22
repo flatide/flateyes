@@ -18,6 +18,7 @@ Usage:
 
 import errno
 import hashlib
+import json
 import math
 import os
 import re
@@ -33,7 +34,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -3809,6 +3810,77 @@ class Viewer(object):
             raise ValueError("too many fields: %s" % ",".join(rest))
         return anno
 
+    @staticmethod
+    def parse_anno_json(obj):
+        """One --json entry as a full annotation dict — the same JSON
+        object format fe_embed.py takes: shapes give "a"/"b" pairs or
+        x1/y1/x2/y2, texts "at" or x/y plus "text", with the optional
+        style fields on top.  Raises ValueError on malformed input."""
+        if not isinstance(obj, dict) or "kind" not in obj:
+            raise ValueError("each entry needs a \"kind\"")
+        obj = dict(obj)
+        kind = obj.pop("kind")
+        try:
+            if kind == "text":
+                at = obj.pop("at", None) or (obj.pop("x"), obj.pop("y"))
+                anno = {"kind": "text", "at": (float(at[0]), float(at[1])),
+                        "text": str(obj.pop("text"))}
+                if not anno["text"].strip():
+                    raise ValueError("empty text")
+                anno["size"] = int(obj.pop("size", 16))
+                if not 6 <= anno["size"] <= 96:
+                    raise ValueError("size must be 6-96, got: %s"
+                                     % anno["size"])
+                anno["color"] = Viewer.option_color(
+                    str(obj.pop("color", Viewer.DEFAULT_LINE)))
+                anno["bg"] = bool(obj.pop("bg", True))
+                anno["bg_color"] = Viewer.option_color(
+                    str(obj.pop("bg_color", Viewer.DEFAULT_BG)))
+                anno["bg_opaque"] = bool(obj.pop("bg_opaque", False))
+            elif kind in ("box", "ellipse", "line", "ruler"):
+                a = obj.pop("a", None) or (obj.pop("x1"), obj.pop("y1"))
+                b = obj.pop("b", None) or (obj.pop("x2"), obj.pop("y2"))
+                anno = {"kind": kind, "a": (float(a[0]), float(a[1])),
+                        "b": (float(b[0]), float(b[1]))}
+                if kind != "ruler":
+                    anno["color"] = Viewer.option_color(
+                        str(obj.pop("color", Viewer.DEFAULT_LINE)))
+                    anno["width"] = int(obj.pop("width", 1))
+                    if not 1 <= anno["width"] <= 8:
+                        raise ValueError("width must be 1-8, got: %s"
+                                         % anno["width"])
+                    dash = obj.pop("dash", 0)
+                    dashes = {"solid": 0, "dashed": 1, "dotted": 2}
+                    if isinstance(dash, str) and dash.lower() in dashes:
+                        anno["dash"] = dashes[dash.lower()]
+                    elif dash in (0, 1, 2):
+                        anno["dash"] = int(dash)
+                    else:
+                        raise ValueError("dash must be solid/dashed/"
+                                         "dotted, got: %r" % (dash,))
+                    if not obj.pop("casing", True):
+                        anno["casing"] = False
+                if kind in ("box", "ellipse"):
+                    fill = obj.pop("fill", None)
+                    fill_opaque = bool(obj.pop("fill_opaque", False))
+                    if fill is not None:
+                        anno["fill"] = Viewer.option_color(str(fill))
+                        anno["fill_opaque"] = fill_opaque
+                    if not obj.pop("outline", True):
+                        if fill is None:
+                            raise ValueError("outline=false needs a fill")
+                        anno["outline"] = False
+            else:
+                raise ValueError("unknown kind: %s" % kind)
+        except KeyError as exc:
+            raise ValueError("%s: missing field %s" % (kind, exc))
+        except (TypeError, IndexError):
+            raise ValueError("%s: bad coordinates" % kind)
+        if obj:
+            raise ValueError("%s: unknown fields: %s"
+                             % (kind, ", ".join(sorted(obj))))
+        return anno
+
     def attach_annotation(self, anno):
         """Append one parsed annotation dict; texts and rulers get the
         overlay label they carry at runtime."""
@@ -4449,6 +4521,10 @@ def usage(stream):
         "                            replaces the saved note on screen,\n"
         "                            unsaved until Ctrl+S; a literal \\n\n"
         "                            breaks the line\n"
+        "  --json FILE               annotations from a JSON array of\n"
+        "                            objects (\"-\" = stdin), the same\n"
+        "                            format fe_embed.py takes; added in\n"
+        "                            option order like the DRAW options\n"
         "\n"
         "keys: +/- zoom, 0 actual size, f fit, Enter/F11 fullscreen,\n"
         "      ,/. next/prev image in the folder,\n"
@@ -4512,7 +4588,7 @@ def parse_args(args):
         elif arg in ("-l", "--legend", "-p", "--ppu", "-u", "--unit",
                      "-s", "--stack", "--level", "--center",
                      "--box", "--ellipse", "--line", "--ruler", "--text",
-                     "--note"):
+                     "--note", "--json"):
             i += 1
             if i == len(args):
                 sys.stderr.write("%s: %s requires an argument\n" % (APP, arg))
@@ -4521,7 +4597,7 @@ def parse_args(args):
         elif arg.startswith(("--legend=", "--ppu=", "--unit=", "--stack=",
                              "--level=", "--center=", "--box=",
                              "--ellipse=", "--line=", "--ruler=",
-                             "--text=", "--note=")):
+                             "--text=", "--note=", "--json=")):
             arg, took_value = arg.split("=", 1)
         elif arg.startswith("-") and arg != "-":
             sys.stderr.write("%s: unknown option: %s\n" % (APP, arg))
@@ -4576,6 +4652,22 @@ def parse_args(args):
                 note = Viewer.unescape_meta(took_value).replace("\t", " ")
                 if not note.strip():
                     sys.stderr.write("%s: --note expects a text\n" % APP)
+                    return 2
+            elif arg == "--json":
+                try:
+                    if took_value == "-":
+                        data = json.load(sys.stdin)
+                    else:
+                        with open(took_value, "r",
+                                  encoding="utf-8") as handle:
+                            data = json.load(handle)
+                    if not isinstance(data, list):
+                        raise ValueError("expected a JSON array")
+                    annos.extend(Viewer.parse_anno_json(obj)
+                                 for obj in data)
+                except (OSError, ValueError) as exc:
+                    sys.stderr.write("%s: --json %s: %s\n"
+                                     % (APP, took_value, exc))
                     return 2
             else:
                 stack_file = took_value

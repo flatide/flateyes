@@ -248,6 +248,7 @@ flateyes --line X1,Y1,X2,Y2[,COLOR[,WIDTH[,DASH]]] image.png
 flateyes --ruler X1,Y1,X2,Y2 image.png
 flateyes --text X,Y[,STYLE...],TEXT image.png
 flateyes --note TEXT image.png
+flateyes --json annos.json image.png
 ```
 
 - **좌표**는 이미지 픽셀 기준 (스택은 ruler와 같은 um 세계 좌표).
@@ -275,6 +276,9 @@ flateyes --note TEXT image.png
 - `--note`는 `n` 키의 노트를 실행 시점에 지정한다 — 파일에 저장된 노트가
   있으면 화면에서 대체하며, 다른 DRAW 옵션과 마찬가지로 `Ctrl+S` 전까지는
   미저장 상태다. 리터럴 `\n`이 줄바꿈이 된다.
+- `--json`은 주석 여러 개를 JSON 배열 파일로 한 번에 받는다 (`-`는
+  표준 입력). 객체 형식은 아래 fe_embed.py의 것과 완전히 같고, 옵션이
+  놓인 위치 순서대로 다른 DRAW 옵션과 함께 적용된다 (반복 가능).
 - 이미 실행 중인 창으로 전달(포워딩)될 때도 동일하게 적용되며, 스택
   (`--stack`/`--level`)과도 함께 쓸 수 있다. 폴더 인자와는 함께 쓸 수 없다.
 - 추가된 주석은 손으로 그린 것과 똑같이 동작한다: 파일에 저장돼 있던 주석

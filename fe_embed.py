@@ -829,6 +829,25 @@ def selftest():
                   == [flateyes.Viewer.serialize_anno(
                       flateyes.Viewer.parse_anno_option(k, v))
                       for k, v in options])
+            jsons = [
+                {"kind": "box", "x1": 5, "y1": 5, "x2": 40, "y2": 30,
+                 "color": "sky", "fill": "sky", "width": 2},
+                {"kind": "ellipse", "a": [1, 2], "b": [30, 40],
+                 "fill": "#FF9F1A", "fill_opaque": True,
+                 "outline": False},
+                {"kind": "line", "x1": 0, "y1": 0, "x2": 9, "y2": 9,
+                 "dash": "dotted", "casing": False},
+                {"kind": "ruler", "x1": 1, "y1": 1, "x2": 8, "y2": 1},
+                {"kind": "text", "x": 5, "y": 32, "text": "불량 A",
+                 "size": 12, "color": "white", "bg_opaque": True},
+                {"kind": "text", "at": [7, 8], "text": "no bg",
+                 "bg": False},
+            ]
+            check("JSON entries parse identically",
+                  [serialize_anno(from_json(dict(o))) for o in jsons]
+                  == [flateyes.Viewer.serialize_anno(
+                      flateyes.Viewer.parse_anno_json(dict(o)))
+                      for o in jsons])
             flateyes.write_png_metadata(target, "# flateyes annotations\n"
                                         + "\n".join(lines) + "\n")
             with open(target, "rb") as handle:
