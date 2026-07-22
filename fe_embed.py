@@ -28,7 +28,8 @@ Library use:
 CLI use (same option syntax as flateyes itself):
 
     python3 fe_embed.py --box 120,80,420,300,red,0,2 \
-                        --text '120,60,DEFECT #17' shot_*.png
+                        --text '120,60,size=20,color=white,DEFECT #17' \
+                        shot_*.png
     python3 fe_embed.py --json annos.json shot_0001.png
     python3 fe_embed.py --dump shot_0001.png
 
@@ -474,8 +475,48 @@ def parse_anno_option(kind, value):
     if kind == "text":
         parts = value.split(",", 2)
         if len(parts) < 3 or not parts[2].strip():
-            raise ValueError("expects X,Y,TEXT")
-        return text(parts[0], parts[1], unescape_meta(parts[2]))
+            raise ValueError("expects X,Y[,STYLE...],TEXT")
+        kwargs = {}
+        # Optional size=/color=/bg= fields before the text proper; the
+        # text starts at the first field that is none of them (or right
+        # after an explicit text=, which lets a note begin with
+        # "size=" literally).  Same syntax as the flateyes CLI.
+        rest = parts[2]
+        while True:
+            head, sep, tail = rest.partition(",")
+            key, eq, val = head.partition("=")
+            key = key.strip().lower()
+            if eq and key == "text":
+                rest = val + sep + tail
+                break
+            if not (eq and key in ("size", "color", "bg")):
+                break
+            if not sep or not tail.strip():
+                raise ValueError("TEXT missing after %s" % head)
+            val = val.strip()
+            if key == "size":
+                try:
+                    kwargs["size"] = int(val)
+                except ValueError:
+                    raise ValueError("bad size: %s" % val)
+            elif key == "color":
+                kwargs["color"] = val
+            elif val == "0":    # bg=0: no backdrop
+                kwargs["bg"] = False
+            elif val.startswith("#") and len(val) == 9:
+                try:  # bg=#RRGGBBAA, AA >= 80 = opaque (like FILL)
+                    int(val[1:9], 16)
+                except ValueError:
+                    raise ValueError("bad bg: %s" % val)
+                kwargs["bg"] = True
+                kwargs["bg_color"] = val[:7]
+                kwargs["bg_opaque"] = int(val[7:9], 16) >= 0x80
+            else:
+                kwargs["bg"] = True
+                kwargs["bg_color"] = val
+                kwargs["bg_opaque"] = False
+            rest = tail
+        return text(parts[0], parts[1], unescape_meta(rest), **kwargs)
     parts = [part.strip() for part in value.split(",")]
     if len(parts) < 4:
         raise ValueError("expects X1,Y1,X2,Y2")
@@ -563,7 +604,7 @@ def build_parser():
             ("ellipse", "X1,Y1,X2,Y2[,COLOR[,FILL[,WIDTH[,DASH]]]]"),
             ("line", "X1,Y1,X2,Y2[,COLOR[,WIDTH[,DASH]]]"),
             ("ruler", "X1,Y1,X2,Y2"),
-            ("text", "X,Y,TEXT")):
+            ("text", "X,Y[,STYLE...],TEXT")):
         parser.add_argument("--" + kind, action=_AnnoOption, const=kind,
                             metavar=metavar, dest="annos",
                             help="add a %s annotation (repeatable; COLOR"
@@ -740,6 +781,24 @@ def selftest():
                   == [flateyes.Viewer.parse_anno_line(
                       l.partition("=")[0], l.partition("=")[2])
                       for l in lines])
+            options = [
+                ("box", "10,20,200,120,red,0,2"),
+                ("box", "30,40,90,80,0,orange"),
+                ("ellipse", "50.5,60.25,150,160,#123ABC,sky,1,dashed"),
+                ("line", "0,0,199,99,green,8,dotted"),
+                ("ruler", "5,5,105,5"),
+                ("text", "12,14,DEFECT #17"),
+                ("text", "12,14,size=20,color=white,bg=#000000FF,A"),
+                ("text", "12,14,bg=sky,반투명 배경"),
+                ("text", "12,14,bg=0,label only"),
+                ("text", "12,14,text=size=6 is tiny, right"),
+            ]
+            check("CLI options parse identically",
+                  [serialize_anno(parse_anno_option(k, v))
+                   for k, v in options]
+                  == [flateyes.Viewer.serialize_anno(
+                      flateyes.Viewer.parse_anno_option(k, v))
+                      for k, v in options])
             flateyes.write_png_metadata(target, "# flateyes annotations\n"
                                         + "\n".join(lines) + "\n")
             with open(target, "rb") as handle:

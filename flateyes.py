@@ -33,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.3.8"
+VERSION = "1.3.9"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -3570,18 +3570,64 @@ class Viewer(object):
         if kind == "text":
             parts = value.split(",", 2)
             if len(parts) < 3 or not parts[2].strip():
-                raise ValueError("expects X,Y,TEXT")
+                raise ValueError("expects X,Y[,STYLE...],TEXT")
             try:
                 at = (float(parts[0]), float(parts[1]))
             except ValueError:
                 raise ValueError("bad position: %s,%s"
                                  % (parts[0], parts[1]))
-            # literal \n starts a new line, like in the metadata format;
-            # tabs would break the request protocol
-            text = Viewer.unescape_meta(parts[2]).replace("\t", " ")
-            return {"kind": "text", "at": at, "text": text, "size": 16,
+            anno = {"kind": "text", "at": at, "size": 16,
                     "color": Viewer.DEFAULT_LINE, "bg": True,
                     "bg_color": Viewer.DEFAULT_BG, "bg_opaque": False}
+            # Optional size=/color=/bg= fields before the text proper;
+            # the text starts at the first field that is none of them
+            # (or right after an explicit text=, which lets a note
+            # begin with "size=" literally).
+            rest = parts[2]
+            while True:
+                head, sep, tail = rest.partition(",")
+                key, eq, val = head.partition("=")
+                key = key.strip().lower()
+                if eq and key == "text":
+                    rest = val + sep + tail
+                    break
+                if not (eq and key in ("size", "color", "bg")):
+                    break
+                if not sep or not tail.strip():
+                    raise ValueError("TEXT missing after %s" % head)
+                val = val.strip()
+                if key == "size":
+                    try:
+                        anno["size"] = int(val)
+                    except ValueError:
+                        raise ValueError("bad size: %s" % val)
+                    if not 6 <= anno["size"] <= 96:
+                        raise ValueError("size must be 6-96, got: %s"
+                                         % val)
+                elif key == "color":
+                    anno["color"] = Viewer.option_color(val)
+                elif val == "0":    # bg=0: no backdrop
+                    anno["bg"] = False
+                elif val.startswith("#") and len(val) == 9:
+                    try:  # bg=#RRGGBBAA, AA >= 80 = opaque (like FILL)
+                        int(val[1:9], 16)
+                    except ValueError:
+                        raise ValueError("bad bg: %s" % val)
+                    anno["bg"] = True
+                    anno["bg_color"] = val[:7]
+                    anno["bg_opaque"] = int(val[7:9], 16) >= 0x80
+                else:
+                    anno["bg"] = True
+                    anno["bg_color"] = Viewer.option_color(val)
+                    anno["bg_opaque"] = False
+                rest = tail
+            # literal \n starts a new line, like in the metadata format;
+            # tabs would break the request protocol
+            text = Viewer.unescape_meta(rest).replace("\t", " ")
+            if not text.strip():
+                raise ValueError("empty text")
+            anno["text"] = text
+            return anno
         parts = [part.strip() for part in value.split(",")]
         if len(parts) < 4:
             raise ValueError("expects X1,Y1,X2,Y2")
@@ -4253,8 +4299,14 @@ def usage(stream):
         "  --line X1,Y1,X2,Y2[,COLOR[,WIDTH[,DASH]]]\n"
         "  --ruler X1,Y1,X2,Y2       finished ruler measurement (uses\n"
         "                            the PPU/unit in effect)\n"
-        "  --text X,Y,TEXT           note at X,Y (16pt, default colors;\n"
-        "                            a literal \\n breaks the line)\n"
+        "  --text X,Y[,STYLE...],TEXT\n"
+        "                            note at X,Y; STYLE fields are\n"
+        "                            size=6-96, color=COLOR and\n"
+        "                            bg=0|COLOR|#RRGGBBAA (else 16pt,\n"
+        "                            default colors).  TEXT runs to the\n"
+        "                            end (commas allowed; text= starts\n"
+        "                            it explicitly, a literal \\n breaks\n"
+        "                            the line)\n"
         "\n"
         "keys: +/- zoom, 0 actual size, f fit, Enter/F11 fullscreen,\n"
         "      ,/. next/prev image in the folder,\n"
