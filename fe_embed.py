@@ -20,10 +20,10 @@ Library use:
     fe.embed("shot_0001.png", [
         fe.box(120, 80, 420, 300, color="red", width=2),
         fe.text(120, 60, "DEFECT #17", size=20, color="white"),
-    ], ppu=8.0, unit="um")
+    ], ppu=8.0, unit="um", note="capture rig #3")
 
     blob = fe.embed_bytes(png_bytes, annos)   # in-memory pipelines
-    annos, ppu, unit = fe.read("shot_0001.png")
+    annos, ppu, unit, note = fe.read("shot_0001.png")
 
 CLI use (same option syntax as flateyes itself):
 
@@ -217,14 +217,18 @@ def serialize_anno(anno):
                anno["b"][0], anno["b"][1], color, fill, extra))
 
 
-def serialize(annos, ppu=None, unit="um"):
-    """The full chunk text, or None when there is nothing to store."""
+def serialize(annos, ppu=None, unit="um", note=None):
+    """The full chunk text, or None when there is nothing to store.
+    note is one free text for the whole image (no position or style);
+    flateyes shows it at the top-left with the info overlays."""
     lines = []
     if ppu:
         if float(ppu) <= 0:
             raise ValueError("ppu must be > 0")
         lines.append("ppu=%.10g" % float(ppu))
         lines.append("unit=%s" % unit)
+    if note and str(note).strip():
+        lines.append("note=%s" % escape_meta(str(note).strip()))
     lines.extend(serialize_anno(anno) for anno in annos)
     if not lines:
         return None
@@ -295,9 +299,9 @@ def parse_anno_line(key, value):
 
 
 def parse_metadata(text):
-    """Chunk text -> (annotations, ppu, unit); malformed lines skipped
-    like flateyes does."""
-    annos, ppu, unit = [], None, None
+    """Chunk text -> (annotations, ppu, unit, note); malformed lines
+    skipped like flateyes does."""
+    annos, ppu, unit, note = [], None, None, None
     for raw in (text or "").splitlines():
         stripped = raw.strip()
         if not stripped or stripped.startswith("#"):
@@ -312,11 +316,14 @@ def parse_metadata(text):
             elif key == "unit":
                 if value.strip():
                     unit = value.strip()
+            elif key == "note":
+                if unescape_meta(value).strip():
+                    note = unescape_meta(value).strip()
             elif key in ("box", "ellipse", "line", "ruler", "text"):
                 annos.append(parse_anno_line(key, value))
         except ValueError:
             continue
-    return annos, ppu, unit
+    return annos, ppu, unit, note
 
 
 # ---------------------------------------------------------------------------
@@ -393,9 +400,10 @@ def insert_text(blob, text):
     raise ValueError("no IEND chunk")
 
 
-def _combine(existing, annos, ppu, unit):
+def _combine(existing, annos, ppu, unit, note):
     """Chunk text for append mode: keep the lines already embedded, but
-    a newly given ppu replaces the stored ppu/unit pair."""
+    a newly given ppu replaces the stored ppu/unit pair and a newly
+    given note replaces the stored note."""
     kept = []
     for raw in (existing or "").splitlines():
         stripped = raw.strip()
@@ -404,9 +412,12 @@ def _combine(existing, annos, ppu, unit):
         if ppu and (stripped.startswith("ppu=")
                     or stripped.startswith("unit=")):
             continue
+        if note and stripped.startswith("note="):
+            continue
         kept.append(stripped)
-    fresh = (serialize(annos, ppu, unit) or "").splitlines()[1:]
-    lines = (fresh[:2] if ppu else []) + kept + (fresh[2:] if ppu else fresh)
+    fresh = (serialize(annos, ppu, unit, note) or "").splitlines()[1:]
+    head = (2 if ppu else 0) + (1 if note and str(note).strip() else 0)
+    lines = fresh[:head] + kept + fresh[head:]
     if not lines:
         return None
     return "# flateyes annotations\n" + "\n".join(lines) + "\n"
@@ -416,23 +427,23 @@ def _combine(existing, annos, ppu, unit):
 # public entry points
 # ---------------------------------------------------------------------------
 
-def embed_bytes(blob, annos, ppu=None, unit="um", append=False):
+def embed_bytes(blob, annos, ppu=None, unit="um", append=False, note=None):
     """PNG bytes with the given annotations embedded.  With append=True
     they are added after any already-embedded ones; otherwise the chunk
     is replaced.  Empty input (and not appending) removes the chunk."""
     if append:
-        text = _combine(extract_text(blob), annos, ppu, unit)
+        text = _combine(extract_text(blob), annos, ppu, unit, note)
     else:
-        text = serialize(annos, ppu, unit)
+        text = serialize(annos, ppu, unit, note)
     return insert_text(blob, text)
 
 
-def embed(path, annos, ppu=None, unit="um", append=False):
+def embed(path, annos, ppu=None, unit="um", append=False, note=None):
     """Embed annotations into the PNG at path (atomic tmp + os.replace,
     so an interrupted write never corrupts the capture)."""
     with open(path, "rb") as handle:
         blob = handle.read()
-    out = embed_bytes(blob, annos, ppu, unit, append)
+    out = embed_bytes(blob, annos, ppu, unit, append, note)
     folder = os.path.dirname(os.path.abspath(path))
     fd, tmp = tempfile.mkstemp(prefix=".fe-embed-", dir=folder)
     try:
@@ -449,12 +460,12 @@ def embed(path, annos, ppu=None, unit="um", append=False):
 
 
 def read_bytes(blob):
-    """(annotations, ppu, unit) embedded in PNG bytes."""
+    """(annotations, ppu, unit, note) embedded in PNG bytes."""
     return parse_metadata(extract_text(blob))
 
 
 def read(path):
-    """(annotations, ppu, unit) embedded in the PNG at path."""
+    """(annotations, ppu, unit, note) embedded in the PNG at path."""
     with open(path, "rb") as handle:
         return read_bytes(handle.read())
 
@@ -612,6 +623,12 @@ def build_parser():
     parser.add_argument("--json", metavar="FILE",
                         help="annotations from a JSON array (\"-\" = "
                              "stdin); appended after the option ones")
+    parser.add_argument("--note", metavar="TEXT",
+                        help="one free text for the whole image, no "
+                             "position or style (flateyes shows it at "
+                             "the top-left; a literal \\n breaks the "
+                             "line; with --append it replaces a stored "
+                             "note)")
     parser.add_argument("--ppu", type=float, metavar="N",
                         help="pixels per unit stored with the "
                              "annotations (ruler scale)")
@@ -653,7 +670,7 @@ def main(argv=None):
                              else "(no embedded metadata)\n")
         return 0
     if args.strip:
-        if args.annos or args.json or args.ppu:
+        if args.annos or args.json or args.ppu or args.note:
             parser.error("--strip takes no annotations")
         for path in args.png:
             try:
@@ -677,11 +694,12 @@ def main(argv=None):
         except (OSError, ValueError) as exc:
             sys.stderr.write("--json %s: %s\n" % (args.json, exc))
             return 1
-    if not annos and not args.ppu and not args.append:
+    note = unescape_meta(args.note) if args.note else None
+    if not annos and not args.ppu and not note and not args.append:
         parser.error("no annotations given (use --strip to remove)")
     for path in args.png:
         try:
-            embed(path, annos, args.ppu, args.unit, args.append)
+            embed(path, annos, args.ppu, args.unit, args.append, note)
         except (OSError, ValueError) as exc:
             sys.stderr.write("%s: %s\n" % (path, exc))
             return 1
@@ -733,19 +751,23 @@ def selftest():
         sys.stdout.write("  %s %s\n" % ("ok " if ok else "FAIL", label))
 
     annos = _sample_annos()
+    sample_note = "capture rig #3\n확인 요망"
     blob = _sample_png()
-    stamped = embed_bytes(blob, annos, ppu=8.5, unit="um")
-    got, ppu, unit = read_bytes(stamped)
+    stamped = embed_bytes(blob, annos, ppu=8.5, unit="um",
+                          note=sample_note)
+    got, ppu, unit, note = read_bytes(stamped)
     check("round-trip count", len(got) == len(annos))
-    check("round-trip ppu/unit", ppu == 8.5 and unit == "um")
+    check("round-trip ppu/unit/note",
+          ppu == 8.5 and unit == "um" and note == sample_note)
     check("round-trip lines",
           [serialize_anno(a) for a in got]
           == [serialize_anno(a) for a in annos])
-    appended = embed_bytes(stamped, [text(1, 1, "late")], append=True)
-    got2, ppu2, _ = read_bytes(appended)
-    check("append keeps old + ppu",
+    appended = embed_bytes(stamped, [text(1, 1, "late")], append=True,
+                           note="replaced")
+    got2, ppu2, _, note2 = read_bytes(appended)
+    check("append keeps old + ppu, replaces note",
           len(got2) == len(annos) + 1 and ppu2 == 8.5
-          and got2[-1]["text"] == "late")
+          and got2[-1]["text"] == "late" and note2 == "replaced")
     check("strip restores original bytes",
           insert_text(stamped, None) == blob)
 
@@ -766,9 +788,17 @@ def selftest():
             theirs = flateyes.read_png_metadata(target)
             check("flateyes reads our chunk",
                   theirs == extract_text(stamped))
+            stub = object.__new__(flateyes.Viewer)
+            stub.ppu, stub.unit, stub.stack_mode = 8.5, "um", False
+            stub.note = sample_note
+            stub.annotations = annos
+            check("flateyes serializes the same chunk",
+                  "# flateyes annotations\n"
+                  + "\n".join(stub.serialize_annotations()) + "\n"
+                  == extract_text(stamped))
             lines = [l for l in (theirs or "").splitlines()
                      if l and not l.startswith("#")
-                     and not l.startswith(("ppu=", "unit="))]
+                     and not l.startswith(("ppu=", "unit=", "note="))]
             mirrored = []
             for entry in lines:
                 key, _, value = entry.partition("=")

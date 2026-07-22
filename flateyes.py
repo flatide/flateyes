@@ -33,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.3.9"
+VERSION = "1.4.0"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -560,7 +560,7 @@ class Viewer(object):
                  ("Enter", "full"), (",/.", "file"), ("b", "browse"),
                  ("drag", "pan"), ("Ctrl+wheel", "zoom"),
                  ("r", "ruler"), ("d", "draw"), ("t", "text"),
-                 ("s", "select"), ("u/y", "undo/redo"),
+                 ("n", "note"), ("s", "select"), ("u/y", "undo/redo"),
                  ("Ctrl+C", "copy"), ("Ctrl+Shift+C", "path"),
                  ("Ctrl+S", "save"), ("p", "PPU"),
                  ("o", "outline"), ("[/]", "level"), ("i", "info"),
@@ -718,6 +718,23 @@ class Viewer(object):
         self.status_label.set_margin_bottom(8)
         self.status_label.set_no_show_all(True)
 
+        # Per-image note ("n"): free-form text without position or
+        # style, pinned to the top-left as an info chip and saved into
+        # the same metadata (note= line).  The left side keeps it clear
+        # of the legend, and the top margin drops it below the key help
+        # strip (like the legend clears the path readout).
+        self.note = ""
+        self.note_label = Gtk.Label()
+        self.note_label.set_name("flateyes-status")
+        self.note_label.set_halign(Gtk.Align.START)
+        self.note_label.set_valign(Gtk.Align.START)
+        self.note_label.set_margin_top(48)
+        self.note_label.set_margin_start(8)
+        self.note_label.set_line_wrap(True)
+        self.note_label.set_max_width_chars(44)
+        self.note_label.set_xalign(0)   # multi-line notes read flush left
+        self.note_label.set_no_show_all(True)
+
         # Transient feedback message (e.g. after copying to the clipboard).
         # While a drawing mode is active, mode_toast holds a persistent
         # text that stays up and returns after transient toasts expire.
@@ -744,7 +761,7 @@ class Viewer(object):
             b" color: #f0f0f0; padding: 2px 9px; border-radius: 4px;"
             b" font-size: 11px; }")
         for widget in (self.ruler_label, self.help_label, self.toast_label,
-                       self.status_label, self.path_label):
+                       self.status_label, self.path_label, self.note_label):
             widget.get_style_context().add_provider(
                 css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.chip_css = css  # for dynamically created readout labels
@@ -815,10 +832,12 @@ class Viewer(object):
         self.overlay.add_overlay(self.help_label)
         self.overlay.add_overlay(self.status_label)
         self.overlay.add_overlay(self.path_label)
+        self.overlay.add_overlay(self.note_label)
         self.overlay.add_overlay(self.toast_label)
         for child in (self.legend_frame, self.hint_image, self.anno_image,
                       self.ruler_line, self.ruler_label, self.help_label,
-                      self.status_label, self.path_label, self.toast_label):
+                      self.status_label, self.path_label, self.note_label,
+                      self.toast_label):
             try:
                 # Let clicks/wheel over the overlays fall through to the image.
                 self.overlay.set_overlay_pass_through(child, True)
@@ -1654,7 +1673,7 @@ class Viewer(object):
         self.toast_label.hide()
         hidden = []
         for widget in (self.help_label, self.status_label, self.path_label,
-                       self.legend_frame, self.hint_image):
+                       self.note_label, self.legend_frame, self.hint_image):
             if widget.get_visible():
                 widget.hide()
                 hidden.append(widget)
@@ -1825,6 +1844,16 @@ class Viewer(object):
             self.help_label.hide()
             self.status_label.hide()
             self.path_label.hide()
+        self.update_note_overlay()
+
+    def update_note_overlay(self):
+        """The note chip at the top-left: follows the info overlays,
+        and only exists while the image has a note."""
+        if self.note and self.info_visible:
+            self.note_label.set_text(self.note)
+            self.note_label.show()
+        else:
+            self.note_label.hide()
 
     def apply_legend_visibility(self):
         if self.legend_pixbuf is not None and self.info_visible:
@@ -2766,6 +2795,71 @@ class Viewer(object):
         self.update_anno_overlay()
         self.update_dirty()
 
+    def ask_note(self):
+        """Note dialog ("n"): free-form text for the whole image — no
+        position or style, shown at the top-left like the info chips
+        and saved into the same metadata on Ctrl+S.  OK with the text
+        emptied removes the note; notes bypass the undo stack."""
+        if self.pixbuf is None:
+            return  # animations carry no metadata (like annotations)
+        dialog = Gtk.Dialog(title="Edit Note" if self.note else "Note",
+                            transient_for=self.window, modal=True)
+        self.cancel_on_escape(dialog)
+        dialog.set_keep_above(True)  # stay over a fullscreen parent
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("OK", Gtk.ResponseType.OK)
+        dialog.set_default_response(Gtk.ResponseType.OK)
+        view = Gtk.TextView()
+        view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        editable = TextViewEditable(view)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC,
+                          Gtk.PolicyType.AUTOMATIC)
+        scroll.set_shadow_type(Gtk.ShadowType.IN)
+        scroll.set_size_request(340, 90)  # room for a few lines
+        scroll.add(view)
+        if self.note:
+            editable.set_text(self.note)
+            editable.set_position(len(self.note))
+        # Built-in hangul input for hosts without an input method.
+        hangul = Gtk.CheckButton(label="Hangul (Shift+Space)")
+        state = {"composer": HangulComposer(), "check": hangul,
+                 "anchor": None}
+        hangul.connect("toggled",
+                       lambda *a: state["composer"].reset())
+
+        def on_view_key(widget, event):
+            name = Gdk.keyval_name(event.keyval)
+            if name in ("Return", "KP_Enter") and \
+                    event.state & Gdk.ModifierType.CONTROL_MASK:
+                dialog.response(Gtk.ResponseType.OK)  # plain Enter: new line
+                return True
+            return self.on_text_entry_key(editable, event, state)
+
+        view.connect("key-press-event", on_view_key)
+        hint = Gtk.Label()
+        hint.set_markup("<small>Enter: new line · Ctrl+Enter: OK · "
+                        "empty removes the note</small>")
+        hint.set_halign(Gtk.Align.START)
+        box = dialog.get_content_area()
+        box.set_border_width(10)
+        box.set_spacing(6)
+        box.pack_start(scroll, True, True, 0)
+        box.pack_start(hangul, False, False, 0)
+        box.pack_start(hint, False, False, 0)
+        dialog.show_all()
+        confirmed = dialog.run() == Gtk.ResponseType.OK
+        text = editable.get_text().strip()
+        dialog.destroy()
+        self.restore_focus()
+        if not confirmed or text == self.note:
+            return
+        removed = bool(self.note) and not text
+        self.note = text
+        self.update_note_overlay()
+        self.update_dirty()
+        self.show_toast("note removed" if removed else "note set")
+
     def make_text_label(self, text, size, color, bg, bg_color, bg_opaque):
         """A styled overlay label for one text annotation."""
         label = Gtk.Label()
@@ -3261,6 +3355,8 @@ class Viewer(object):
             if "label" in anno:
                 self.overlay.remove(anno["label"])
         self.annotations = []
+        self.note = ""
+        self.update_note_overlay()
         self.anno_undo = []
         self.anno_redo = []
         self.anno_selected = None
@@ -3328,6 +3424,8 @@ class Viewer(object):
         if self.ppu and not self.stack_mode:
             lines.append("ppu=%.10g" % self.ppu)
             lines.append("unit=%s" % self.unit)
+        if self.note:
+            lines.append("note=%s" % self.escape_meta(self.note))
         lines.extend(self.serialize_anno(anno) for anno in self.annotations)
         return lines
 
@@ -3435,6 +3533,10 @@ class Viewer(object):
                 elif key == "unit":
                     if not self.stack_mode and value.strip():
                         self.unit = value.strip()
+                elif key == "note":
+                    text = self.unescape_meta(value)
+                    if text.strip():
+                        self.note = text.strip()
                 elif key in ("box", "ellipse", "line", "ruler", "text"):
                     self.attach_annotation(self.parse_anno_line(key, value))
             except ValueError:
@@ -3444,7 +3546,8 @@ class Viewer(object):
         # alike (delete-last is folded into undo/redo).
         self.anno_undo.extend(("add", anno, None)
                               for anno in self.annotations)
-        if self.annotations or ppu_restored:
+        self.update_note_overlay()
+        if self.annotations or ppu_restored or self.note:
             parts = []
             if self.annotations:
                 parts.append("%d annotation%s"
@@ -3453,6 +3556,8 @@ class Viewer(object):
             if ppu_restored:
                 parts.append("PPU %s px/%s"
                              % (self.trim_decimal(self.ppu, 4), self.unit))
+            if self.note:
+                parts.append("note")
             self.anno_rev += 1
             self.update_anno_overlay()
             self.show_toast(", ".join(parts) + " restored")
@@ -3923,6 +4028,8 @@ class Viewer(object):
             self.edit_selection()   # resize anchors / the text dialog
         elif key in ("t", "T"):
             self.set_anno_tool(None if self.anno_tool == "text" else "text")
+        elif key in ("n", "N"):
+            self.ask_note()
         elif key in ("u", "U"):
             self.undo_annotation()
         elif key in ("y", "Y"):
@@ -4326,6 +4433,9 @@ def usage(stream):
         "        themselves; Shift while clicking = square/circle/\n"
         "        45-degree line,\n"
         "      t text,\n"
+        "      n note: one free text per image, no position or style,\n"
+        "        shown at the top-left with the info overlays and\n"
+        "        saved with the annotations (empty text removes it),\n"
         "      s select annotations, newest first (Shift+s backwards):\n"
         "        arrows move the selection (Shift = 10 px steps),\n"
         "        e edits it - shapes cycle a resize corner/endpoint\n"
