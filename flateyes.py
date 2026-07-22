@@ -33,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -568,7 +568,7 @@ class Viewer(object):
 
     def __init__(self, server_sock, first_path, first_legend=None,
                  ppu=None, unit=None, stack=False, levels=None,
-                 annos=None):
+                 annos=None, note=None):
         self.server_sock = server_sock
         self.path = None
         self.capture_pending = False  # a Ctrl+C grab is waiting to run
@@ -863,6 +863,7 @@ class Viewer(object):
                 sys.stderr.write("%s\n" % error)
                 sys.exit(1)
             self.apply_request_annotations(annos or [])
+            self.apply_request_note(note)
             self.set_initial_size()
         else:  # folder request: start in the thumbnail browser
             work_w, work_h = workarea_size()
@@ -884,11 +885,11 @@ class Viewer(object):
     # -- image loading -----------------------------------------------------
 
     def open_request(self, path, legend=None, ppu=None, unit=None,
-                     stack=False, levels=None, annos=None):
+                     stack=False, levels=None, annos=None, note=None):
         """An incoming open: folders switch to the thumbnail browser,
         anything else loads as an image/stack."""
         if levels is None and not stack and os.path.isdir(path):
-            if annos:
+            if annos or note:
                 return "ERR annotations need an image, not a folder: %s" \
                     % path
             self.enter_browser(os.path.abspath(path))
@@ -896,6 +897,7 @@ class Viewer(object):
         result = self.load(path, legend, ppu, unit, stack, levels)
         if result == "OK":
             self.apply_request_annotations(annos or [])
+            self.apply_request_note(note)
             if self.browser_active:
                 self.leave_browser()
         return result
@@ -3821,6 +3823,15 @@ class Viewer(object):
         self.update_anno_overlay()
         self.update_dirty()
 
+    def apply_request_note(self, note):
+        """A note passed on the command line (--note): replaces the
+        file's saved note on screen, unsaved until Ctrl+S."""
+        if not note or not note.strip() or self.pixbuf is None:
+            return
+        self.note = note.strip()
+        self.update_note_overlay()
+        self.update_dirty()
+
     def update_hint_overlay(self):
         """Outline the area the next magnification level covers."""
         if not self.stack_mode or not self.hint_enabled \
@@ -4295,7 +4306,7 @@ class Viewer(object):
             line = data.decode("utf-8", "replace").strip()
             fields = line.split("\t")
             path = fields[0].strip()
-            legend = ppu = unit = None
+            legend = ppu = unit = note = None
             stack = False
             inline = []   # ppu=/center= after a level= bind to that level
             annos = []    # annotations to draw once the image is open
@@ -4332,6 +4343,8 @@ class Viewer(object):
                     unit = value or None
                 elif key == "stack":
                     stack = value not in ("", "0")
+                elif key == "note":
+                    note = self.unescape_meta(value)
                 elif key in ("box", "ellipse", "line", "ruler", "text"):
                     try:
                         annos.append(self.parse_anno_line(key, value))
@@ -4342,10 +4355,10 @@ class Viewer(object):
                 reply = bad
             elif inline:
                 reply = self.open_request(inline[0]["path"], legend, None,
-                                          unit, True, inline, annos)
+                                          unit, True, inline, annos, note)
             elif path:
                 reply = self.open_request(path, legend, ppu, unit, stack,
-                                          annos=annos)
+                                          annos=annos, note=note)
             else:
                 reply = "ERR empty request"
             try:
@@ -4414,6 +4427,11 @@ def usage(stream):
         "                            end (commas allowed; text= starts\n"
         "                            it explicitly, a literal \\n breaks\n"
         "                            the line)\n"
+        "  --note TEXT               one note for the whole image, no\n"
+        "                            position or style (the \"n\" key):\n"
+        "                            replaces the saved note on screen,\n"
+        "                            unsaved until Ctrl+S; a literal \\n\n"
+        "                            breaks the line\n"
         "\n"
         "keys: +/- zoom, 0 actual size, f fit, Enter/F11 fullscreen,\n"
         "      ,/. next/prev image in the folder,\n"
@@ -4458,12 +4476,12 @@ def usage(stream):
 
 
 def parse_args(args):
-    """Returns (path, legend, ppu, unit, is_stack, levels, annos) or an
-    exit code.
+    """Returns (path, legend, ppu, unit, is_stack, levels, annos, note)
+    or an exit code.
 
     path is None when inline levels are given; is_stack marks a manifest.
     """
-    legend = ppu = unit = stack_file = None
+    legend = ppu = unit = stack_file = note = None
     levels = []
     annos = []
     paths = []
@@ -4476,7 +4494,8 @@ def parse_args(args):
             return 0
         elif arg in ("-l", "--legend", "-p", "--ppu", "-u", "--unit",
                      "-s", "--stack", "--level", "--center",
-                     "--box", "--ellipse", "--line", "--ruler", "--text"):
+                     "--box", "--ellipse", "--line", "--ruler", "--text",
+                     "--note"):
             i += 1
             if i == len(args):
                 sys.stderr.write("%s: %s requires an argument\n" % (APP, arg))
@@ -4485,7 +4504,7 @@ def parse_args(args):
         elif arg.startswith(("--legend=", "--ppu=", "--unit=", "--stack=",
                              "--level=", "--center=", "--box=",
                              "--ellipse=", "--line=", "--ruler=",
-                             "--text=")):
+                             "--text=", "--note=")):
             arg, took_value = arg.split("=", 1)
         elif arg.startswith("-") and arg != "-":
             sys.stderr.write("%s: unknown option: %s\n" % (APP, arg))
@@ -4534,6 +4553,13 @@ def parse_args(args):
                 except ValueError as exc:
                     sys.stderr.write("%s: %s: %s\n" % (APP, arg, exc))
                     return 2
+            elif arg == "--note":
+                # literal \n breaks the line; tabs would break the
+                # request protocol
+                note = Viewer.unescape_meta(took_value).replace("\t", " ")
+                if not note.strip():
+                    sys.stderr.write("%s: --note expects a text\n" % APP)
+                    return 2
             else:
                 stack_file = took_value
         i += 1
@@ -4554,17 +4580,17 @@ def parse_args(args):
                 sys.stderr.write("%s: --level %s needs a --ppu\n"
                                  % (APP, meta["path"]))
                 return 2
-        return None, legend, None, unit, False, levels, annos
+        return None, legend, None, unit, False, levels, annos, note
     if stack_file is not None:
-        return stack_file, legend, ppu, unit, True, None, annos
-    return paths[0], legend, ppu, unit, False, None, annos
+        return stack_file, legend, ppu, unit, True, None, annos, note
+    return paths[0], legend, ppu, unit, False, None, annos, note
 
 
 def main(argv):
     parsed = parse_args(argv[1:])
     if isinstance(parsed, int):
         return parsed
-    path, legend, ppu, unit, stack, levels, annos = parsed
+    path, legend, ppu, unit, stack, levels, annos, note = parsed
 
     if levels is not None:
         for meta in levels:
@@ -4583,7 +4609,7 @@ def main(argv):
             sys.stderr.write("%s: no such file or folder: %s\n"
                              % (APP, path))
             return 1
-        if annos and os.path.isdir(path):
+        if (annos or note) and os.path.isdir(path):
             sys.stderr.write("%s: annotations need an image, not a "
                              "folder: %s\n" % (APP, path))
             return 2
@@ -4616,6 +4642,8 @@ def main(argv):
                 fields.append("center=%.10g,%.10g" % meta["center"])
     # annotations travel as the same key=value lines Ctrl+S would write
     fields.extend(Viewer.serialize_anno(anno) for anno in annos)
+    if note is not None:
+        fields.append("note=%s" % Viewer.escape_meta(note))
     request = "\t".join(fields)
     server = None
     for _ in range(5):
@@ -4636,7 +4664,7 @@ def main(argv):
 
     import_gtk()
     Viewer(server, path if levels is None else levels[0]["path"],
-           legend, ppu, unit, stack, levels, annos)
+           legend, ppu, unit, stack, levels, annos, note)
     Gtk.main()
     return 0
 

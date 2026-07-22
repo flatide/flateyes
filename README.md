@@ -232,7 +232,8 @@ DISPLAY=:1 flateyes --level site_5x.png --ppu 0.8 \
 - 저장은 주석과 동일하게 `Ctrl+S` — PNG는 파일 안에(`note=` 줄), 그 외
   포맷은 `.fe` 사이드카에. 파일을 다시 열면 자동 복원된다.
 - 캡처 서비스에서 fe_embed.py로도 넣을 수 있다: CLI `--note TEXT`,
-  파이썬 `fe.embed(..., note="...")`.
+  파이썬 `fe.embed(..., note="...")`. 뷰어를 띄우면서 지정하려면
+  `flateyes --note TEXT image.png` (미저장 상태로 표시).
 
 ### 실행 옵션으로 주석 추가
 
@@ -246,6 +247,7 @@ flateyes --ellipse X1,Y1,X2,Y2[,COLOR[,FILL[,WIDTH[,DASH]]]] image.png
 flateyes --line X1,Y1,X2,Y2[,COLOR[,WIDTH[,DASH]]] image.png
 flateyes --ruler X1,Y1,X2,Y2 image.png
 flateyes --text X,Y[,STYLE...],TEXT image.png
+flateyes --note TEXT image.png
 ```
 
 - **좌표**는 이미지 픽셀 기준 (스택은 ruler와 같은 um 세계 좌표).
@@ -270,6 +272,9 @@ flateyes --text X,Y[,STYLE...],TEXT image.png
   TEXT는 스타일 필드가 아닌 첫 필드부터 끝까지 전부이며 쉼표를 포함할 수
   있고 리터럴 `\n`이 줄바꿈이 된다. 내용이 하필 `size=` 등으로 시작한다면
   `text=`를 붙여 시작점을 명시한다 (`--text '10,10,text=size=6 메모'`).
+- `--note`는 `n` 키의 노트를 실행 시점에 지정한다 — 파일에 저장된 노트가
+  있으면 화면에서 대체하며, 다른 DRAW 옵션과 마찬가지로 `Ctrl+S` 전까지는
+  미저장 상태다. 리터럴 `\n`이 줄바꿈이 된다.
 - 이미 실행 중인 창으로 전달(포워딩)될 때도 동일하게 적용되며, 스택
   (`--stack`/`--level`)과도 함께 쓸 수 있다. 폴더 인자와는 함께 쓸 수 없다.
 - 추가된 주석은 손으로 그린 것과 똑같이 동작한다: 파일에 저장돼 있던 주석
