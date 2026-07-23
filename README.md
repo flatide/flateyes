@@ -161,22 +161,29 @@ DISPLAY=:1 flateyes --level site_5x.png --ppu 0.8 \
 이미지 위에 표시용 주석을 얹을 수 있다. 주석은 이미지 좌표(스택은 um 좌표)에
 고정되어 확대/스크롤/레벨 전환을 그대로 따라간다.
 
-- `d`(도형 그리기): 대화상자에서 도형 종류(box·ellipse·line)와 스타일을 함께
-  고르고 확인하면 그리기 모드가 시작된다. 스타일은 outline 색(윤곽선 — line
-  도형을 고르면 행 라벨이 "line"으로 바뀌어 라인 색이 된다)과 fill
+- `d`(도형 그리기): 대화상자에서 도형 종류(box·ellipse·line·path)와 스타일을
+  함께 고르고 확인하면 그리기 모드가 시작된다. 스타일은 outline 색(윤곽선 —
+  line/path 도형을 고르면 행 라벨이 "line"으로 바뀌어 선 색이 된다)과 fill
   색(박스·타원 내부)을 공통 팔레트(black·white·red·orange·green·sky·pink,
   색 견본 표시)에서 고르고, 각 행의 "use" 체크로 윤곽선/채우기 사용 여부를,
   "opaque" 체크로 채우기의 불투명/반투명(0.35)을 정한다. "black halo" 체크는
   윤곽선·라인을 둘러싸는 검은 테두리 여부다 (색이 배경에 묻히지 않게 하는
-  용도, 기본 켜짐). 도형이 안 보이는
-  조합을 막기 위해 윤곽선과 채우기 중 마지막 남은 하나는 끌 수 없고, 선(line)은
-  항상 라인 색으로 그려진다. 굵기("width" 1~8px)와 선 종류(solid/dashed/dotted)는
-  라인과 박스·타원 윤곽선에 공통으로 적용된다. 선택은 이후 그리는 도형에
-  적용된다 (기존 주석은 유지, 마지막 설정 기억).
+  용도, 기본 켜짐). 도형이 안 보이는 조합을 막기 위해 윤곽선과 채우기 중
+  마지막 남은 하나는 끌 수 없고, 선(line·path)은 항상 라인 색으로 그려진다.
+  굵기("width" 1~8px)와 선 종류(solid/dashed/dotted)는 라인·패쓰와 박스·타원
+  윤곽선에 공통으로 적용된다. 선택은 이후 그리는 도형에 적용된다 (기존 주석은
+  유지, 마지막 설정 기억).
   그리기는 클릭 두 번으로 두 모서리(라인은 양 끝점)를 지정한다 (포인트는
   버튼을 뗄 때 찍히고, 드래그는 패닝). 첫 클릭 후 미리보기가 표시되며,
   `Shift`를 누르면 박스·타원은 정사각형/정원, 라인은 수평/수직/45°로 고정된다.
   모드 종료는 `Esc`.
+- **path(연속 선분)**: 클릭할 때마다 꼭짓점이 추가되고 마우스까지 미리보기
+  선이 따라온다. **더블클릭 또는 `Enter`로 확정**하면 지금까지의 꼭짓점(2개
+  이상)이 하나의 패쓰 주석이 되고, 도구는 켜진 채 다음 패쓰를 이어 그릴 수
+  있다. 그리던 중 `Esc`는 진행 중인 꼭짓점만 버리고(도구 유지), 한 번 더
+  누르면 모드가 끝난다. `Shift` 클릭은 직전 꼭짓점 기준 수평/수직/45° 고정.
+  드래그 패닝은 그리는 중에도 그대로 동작한다. 선택(`s`) 후 `e`를 누르면
+  꼭짓점을 최신 것부터 하나씩 순회하며 방향키로 개별 이동할 수 있다.
 - `t`(텍스트): 클릭한 위치에 대화상자로 텍스트와 폰트 크기(6~96pt)를 입력한다.
   여러 줄 입력 가능 — `Enter`는 줄바꿈, `Ctrl+Enter`가 확인. 글자 색("text")과
   배경("background" 사용 여부·색·"opaque" 불투명 여부)을 대화상자 안의 콤보로
@@ -204,7 +211,8 @@ DISPLAY=:1 flateyes --level site_5x.png --ppu 0.8 \
   삭제도 `u`/`y` 실행 취소에 포함된다 (연속 이동은 한 번으로 묶인다).
   도형·측정 모드 키를 누르면 선택은 해제된다.
 - 선택 중 `e`: 주석 수정 — 도형·선·측정은 누를 때마다 방향키가 움직이는
-  대상이 순환한다 (전체 이동 → 모서리/끝점 B → A → 전체 이동, 활성 앵커는
+  대상이 순환한다 (전체 이동 → 모서리/끝점 B → A → 전체 이동, 패쓰는 전체
+  이동 → 마지막 꼭짓점 → … → 첫 꼭짓점 순환, 활성 앵커는
   흰색 핸들로 표시). 앵커가 켜진 동안 방향키는 그 점만 끌어 크기·길이·각도를
   조절하고, `Esc`는 전체 이동으로 한 단계 돌아온다. 텍스트는 기존
   내용·크기·색·배경이 채워진 입력 대화상자가 다시 열려 세밀하게 수정할 수
@@ -263,6 +271,7 @@ DISPLAY=:1 flateyes --level site_5x.png --ppu 0.8 \
 flateyes --box X1,Y1,X2,Y2[,COLOR[,FILL[,WIDTH[,DASH]]]] image.png
 flateyes --ellipse X1,Y1,X2,Y2[,COLOR[,FILL[,WIDTH[,DASH]]]] image.png
 flateyes --line X1,Y1,X2,Y2[,COLOR[,WIDTH[,DASH]]] image.png
+flateyes --path X1,Y1,X2,Y2[,X3,Y3...][,COLOR[,WIDTH[,DASH]]] image.png
 flateyes --ruler X1,Y1,X2,Y2 image.png
 flateyes --text X,Y[,STYLE...],TEXT image.png
 flateyes --note TEXT image.png
@@ -276,6 +285,8 @@ flateyes --json annos.json image.png
   `#RRGGBBAA`로 주면 AA가 `80` 이상일 때 불투명. 생략하면 채우기 없음.
 - **WIDTH**: 굵기 1~8px (기본 1). **DASH**: `solid`/`dashed`/`dotted`
   (또는 0/1/2, 기본 solid).
+- `--path`는 나열한 좌표를 순서대로 잇는 연속 선분(꼭짓점 2개 이상)이다 —
+  숫자가 아닌 첫 필드부터 COLOR·WIDTH·DASH 스타일로 읽는다.
 - `--ruler`는 확정된 측정으로 추가되어 현재 PPU/단위로 환산 표시된다
   (`--ppu`와 조합 가능).
 - `--text`의 STYLE 자리에는 `size=`(6~96), `color=`(COLOR와 동일 규칙),
@@ -352,6 +363,8 @@ note까지 파일 하나에 담을 수 있다 (모든 키 선택, `--ppu`/`--uni
      "color": "#35C5FF", "fill": "sky", "casing": false},
     {"kind": "line", "x1": 0, "y1": 0, "x2": 300, "y2": 200,
      "color": "green", "width": 4, "dash": "dotted"},
+    {"kind": "path", "points": [[30, 300], [120, 260], [120, 380], [260, 380]],
+     "color": "pink", "width": 2},
     {"kind": "ruler", "x1": 100, "y1": 500, "x2": 400, "y2": 500},
     {"kind": "text", "x": 120, "y": 50, "text": "DEFECT #17",
      "size": 20, "color": "white", "bg_color": "black", "bg_opaque": true},
@@ -368,6 +381,7 @@ black·white·red·orange·green·sky·pink 또는 `#RRGGBB`):
 | 최상위 객체 | — | *ppu*(>0, ruler 환산 배율), *unit*(기본 um), *note*(이미지 메모, `\n` 줄바꿈), *annotations*(배열) |
 | `box` / `ellipse` | 좌표 | *color*(기본 red), *width*(1~8, 기본 1), *dash*(`solid`/`dashed`/`dotted`, 기본 solid), *casing*(검은 테두리, 기본 true), *fill*(채움 색, 기본 없음), *fill_opaque*(기본 false=반투명), *outline*(false면 윤곽선 없음 — fill 필수) |
 | `line` | 좌표 | *color*, *width*, *dash*, *casing* (box와 동일) |
+| `path` | `points`(`[[x, y], ...]` 2개 이상, 순서대로 잇는 연속 선분) | *color*, *width*, *dash*, *casing* (line과 동일) |
 | `ruler` | 좌표 | 없음 (ppu/unit로 환산 표시) |
 | `text` | `text`, 위치 | *size*(6~96, 기본 16), *color*(기본 red), *bg*(배경 사용, 기본 true), *bg_color*(기본 black), *bg_opaque*(기본 false=반투명 0.35) |
 
@@ -385,6 +399,7 @@ import fe_embed as fe
 
 fe.embed("shot_0001.png", [
     fe.box(120, 80, 420, 300, color="red", width=2),
+    fe.path([(30, 300), (120, 260), (120, 380)], color="pink"),
     fe.text(120, 60, "DEFECT #17", size=20, color="white"),
 ], ppu=8.5, unit="um", note="캡처 장비 3호기")
 
@@ -491,7 +506,7 @@ sudo -u tduser DISPLAY=:1 XAUTHORITY=/home/tduser/.Xauthority \
 | `o` | 다음 레벨 영역 외곽선 표시/숨김 |
 | `r` | ruler 측정 모드 시작/종료 (`Shift` 자유 방향, `Ctrl` 진행 중인 방향 고정 — 스냅 축 또는 자유 각도). `m`으로 엣지 스냅을 켜면 측정점이 주변의 가장 뚜렷한 밝기 경계로 서브픽셀 정밀도로 붙으며, 첫 점은 십자 마커로 스냅 위치를 미리 보여준다 (평탄한 영역에서는 동작 안 함) |
 | `m` | ruler 엣지 스냅 켜기/끄기 (기본 꺼짐) — 켠 상태는 뷰어를 닫을 때까지 유지된다 |
-| `d` | 도형 그리기 — 대화상자에서 도형 종류(box/ellipse/line)와 외곽선(use·색)·검은 테두리(black halo)·박스/타원 채우기(use·색·opaque)·선 스타일(굵기 1~8px, solid/dashed/dotted — 라인·윤곽선 공통)을 고르면 그리기 모드가 시작된다 (`Shift` 클릭은 정사각형·정원·수평/수직/45°, 종료는 `Esc`). 윤곽선·채우기 중 하나는 항상 켜져 있으며 텍스트 스타일은 `t` 대화상자에서 별도 선택 |
+| `d` | 도형 그리기 — 대화상자에서 도형 종류(box/ellipse/line/path)와 외곽선(use·색)·검은 테두리(black halo)·박스/타원 채우기(use·색·opaque)·선 스타일(굵기 1~8px, solid/dashed/dotted — 라인·윤곽선 공통)을 고르면 그리기 모드가 시작된다 (`Shift` 클릭은 정사각형·정원·수평/수직/45°, 종료는 `Esc`). path는 클릭마다 꼭짓점을 추가하고 더블클릭/`Enter`로 확정, 그리던 중 `Esc`는 취소. 윤곽선·채우기 중 하나는 항상 켜져 있으며 텍스트 스타일은 `t` 대화상자에서 별도 선택 |
 | `t` | 텍스트 주석 — 클릭 위치에 입력, 폰트 크기·글자 색·배경(사용/색/불투명)을 대화상자에서 직접 선택 (실시간 미리보기, 도형 설정과 별개) |
 | `n` | 노트 — 이미지 전체에 대한 메모 입력/수정. 위치·크기·색상이 없고 좌상단(키 안내 아래)에 정보 칩으로 고정 표시된다. 내용을 비우고 OK 하면 제거, `Ctrl+S`로 주석과 함께 저장 |
 | `s` / `Shift+s` | 주석 선택 순회 (최신부터 / 반대 방향) — 선택 중에는 방향키가 주석을 이동(`Shift`+방향키는 10px)하고 `e`가 수정(도형은 크기 조절 앵커 순회, 텍스트는 입력 대화상자 재열기), `Delete`/`BackSpace`가 삭제, `Esc`가 해제한다. 이동·수정·삭제도 `u`/`y`로 되돌릴 수 있다 |

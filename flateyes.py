@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.6.4"
+VERSION = "1.7.0"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -803,9 +803,12 @@ class Viewer(object):
         # Annotations: boxes/ellipses stamped into one viewport-sized
         # overlay pixbuf, texts as Pango labels; all anchored in world
         # coordinates like the ruler.
-        self.anno_tool = None       # "box" | "ellipse" | "text"
-        self.anno_start = None      # first corner (world)
+        self.anno_tool = None       # "box" | "ellipse" | "line" | "path"
+                                    # | "text"
+        self.anno_start = None      # first corner (world); for the path
+                                    # tool: the last vertex placed
         self.anno_cursor = None     # preview corner (world)
+        self.anno_path = []         # path tool: vertices placed so far
         self.annotations = []       # committed shapes and texts
         self.is_png = False         # PNG: annotations embed on Ctrl+S,
         self.embedded_meta = False  # ... and this file carries a chunk
@@ -1889,11 +1892,18 @@ class Viewer(object):
         Transient toasts overlay it and it returns when they expire."""
         selected = self.valid_selection()
         if selected is not None:
-            if self.anno_edit_anchor:
-                part = "endpoint" if selected["kind"] in ("line", "ruler") \
-                    else "corner"
-                text = ("resize: %s %s  (arrows drag it, e next, Esc back)"
-                        % (part, self.anno_edit_anchor.upper()))
+            if self.anno_edit_anchor is not None:
+                if selected["kind"] == "path":
+                    label = ("point %d/%d"
+                             % (self.anno_edit_anchor + 1,
+                                len(selected["points"])))
+                else:
+                    part = "endpoint" \
+                        if selected["kind"] in ("line", "ruler") \
+                        else "corner"
+                    label = "%s %s" % (part, self.anno_edit_anchor.upper())
+                text = ("resize: %s  (arrows drag it, e next, Esc back)"
+                        % label)
             else:
                 pos = next(i for i, a in enumerate(self.annotations)
                            if a is selected)
@@ -1906,6 +1916,10 @@ class Viewer(object):
                 "Esc ends)" % ("on" if self.snap_enabled else "off")
         elif self.anno_tool == "text":
             text = "text: click to place  (Esc ends)"
+        elif self.anno_tool == "path":
+            text = self.draw_mode_desc() \
+                + "  (click adds a point, double-click/Enter finishes, " \
+                "Esc cancels)"
         elif self.anno_tool in ("box", "ellipse", "line"):
             text = self.draw_mode_desc() + "  (Esc ends)"
         else:
@@ -1927,9 +1941,9 @@ class Viewer(object):
         stroke = "%dpx %s" % (self.anno_line_width,
                               ("solid", "dashed",
                                "dotted")[self.anno_line_dash])
-        if self.anno_tool == "line":
-            desc = ('draw line <span foreground="%s">■■</span> %s'
-                    % (self.anno_line_color, stroke))
+        if self.anno_tool in ("line", "path"):
+            desc = ('draw %s <span foreground="%s">■■</span> %s'
+                    % (self.anno_tool, self.anno_line_color, stroke))
             if not self.anno_casing:
                 desc += "  no halo"
             return desc
@@ -2547,6 +2561,7 @@ class Viewer(object):
             self.clear_selection()
         self.anno_tool = tool
         self.anno_start = self.anno_cursor = None
+        del self.anno_path[:]
         self.set_viewport_cursor(self.tool_cursor())
         self.update_view_overlays()
         self.update_mode_toast()
@@ -2559,13 +2574,35 @@ class Viewer(object):
         """"#RRGGBB" -> the 0xRRGGBBAA pixbuf fill value."""
         return (int(hex_color[1:], 16) << 8) | alpha
 
+    def finish_path(self):
+        """Commit the in-progress path (double-click or Enter); fewer
+        than two vertices is just a cancel.  The tool stays active for
+        the next path."""
+        points = list(self.anno_path)
+        del self.anno_path[:]
+        self.anno_start = self.anno_cursor = None
+        self.anno_rev += 1
+        if len(points) >= 2:
+            anno = {"kind": "path", "points": points,
+                    "color": self.anno_color(),
+                    "width": self.anno_line_width,
+                    "dash": self.anno_line_dash}
+            if not self.anno_casing:
+                anno["casing"] = False
+            self.annotations.append(anno)
+            self.anno_undo.append(("add", anno, None))
+            del self.anno_redo[:]
+        self.update_anno_overlay()
+        self.update_dirty()
+        self.update_mode_toast()
+
     def constrain_corner(self, point, state):
         """Shift constrains: square/circle for shapes, 0/45/90 for lines."""
         if not state & Gdk.ModifierType.SHIFT_MASK:
             return point
         ax, ay = self.anno_start
         dx, dy = point[0] - ax, point[1] - ay
-        if self.anno_tool == "line":
+        if self.anno_tool in ("line", "path"):
             if abs(dx) > 2 * abs(dy):
                 return (point[0], ay)        # horizontal
             if abs(dy) > 2 * abs(dx):
@@ -2595,6 +2632,17 @@ class Viewer(object):
                     preview["outline"] = False
             if not self.anno_casing:
                 preview["casing"] = False
+        elif self.anno_tool == "path" and self.anno_path:
+            pts = list(self.anno_path)
+            if self.anno_cursor is not None:
+                pts.append(self.anno_cursor)  # rubber band to the mouse
+            if len(pts) >= 2:
+                preview = {"kind": "path", "points": pts,
+                           "color": self.anno_color(),
+                           "width": self.anno_line_width,
+                           "dash": self.anno_line_dash}
+                if not self.anno_casing:
+                    preview["casing"] = False
         if not self.draw_visible or self.rendered_size is None \
                 or not (shapes or preview or texts):
             self.anno_drawn = None
@@ -2612,7 +2660,8 @@ class Viewer(object):
         key = (self.anno_rev, self.anno_line_color, self.anno_line_width,
                self.anno_line_dash, self.anno_casing, self.anno_outline,
                self.anno_fill, self.anno_fill_color, self.anno_fill_opaque,
-               preview and (preview["a"], preview["b"]),
+               preview and (preview.get("a"), preview.get("b"),
+                            tuple(preview.get("points", ()))),
                self.scroll.get_hadjustment().get_value(),
                self.scroll.get_vadjustment().get_value(),
                self.scale_shown, self.level_index, self.rendered_size,
@@ -2630,15 +2679,24 @@ class Viewer(object):
         if preview is not None:
             self.stamp_annotation(buf, preview)
         if selected is not None and selected["kind"] != "text":
-            a = self.image_px_to_view(self.px_from_world(selected["a"]))
-            b = self.image_px_to_view(self.px_from_world(selected["b"]))
-            if selected["kind"] in ("box", "ellipse"):
-                x0, x1 = sorted((a[0], b[0]))
-                y0, y1 = sorted((a[1], b[1]))
-                corners = ((x0, y0), (x1, y0), (x0, y1), (x1, y1))
+            if selected["kind"] == "path":
+                corners = tuple(
+                    self.image_px_to_view(self.px_from_world(p))
+                    for p in selected["points"])
+                active = corners[self.anno_edit_anchor] \
+                    if isinstance(self.anno_edit_anchor, int) else None
             else:
-                corners = (a, b)   # line/ruler: the two endpoints
-            active = {"a": a, "b": b}.get(self.anno_edit_anchor)
+                a = self.image_px_to_view(
+                    self.px_from_world(selected["a"]))
+                b = self.image_px_to_view(
+                    self.px_from_world(selected["b"]))
+                if selected["kind"] in ("box", "ellipse"):
+                    x0, x1 = sorted((a[0], b[0]))
+                    y0, y1 = sorted((a[1], b[1]))
+                    corners = ((x0, y0), (x1, y0), (x0, y1), (x1, y1))
+                else:
+                    corners = (a, b)   # line/ruler: the two endpoints
+                active = {"a": a, "b": b}.get(self.anno_edit_anchor)
             self.stamp_selection(buf, corners, active)
         for anno in texts:
             x, y = self.image_px_to_view(self.px_from_world(anno["at"]))
@@ -2857,6 +2915,24 @@ class Viewer(object):
         return self.avoid_label_overlap(x, y, w, h, placed, view)
 
     def stamp_annotation(self, buf, shape):
+        if shape["kind"] == "path":
+            pts = [self.image_px_to_view(self.px_from_world(p))
+                   for p in shape["points"]]
+            core = self.color_rgba(shape["color"])
+            casing = self.ANNO_CASING if shape.get("casing", True) \
+                else None
+            width = shape.get("width", 1)
+            dash = shape.get("dash", 0)
+            segments = list(zip(pts, pts[1:]))
+            # all casing first, then all core, so a later segment cannot
+            # cut into a finished corner's core
+            if casing is not None:
+                for sa, sb in segments:
+                    self.stamp_segment(buf, sa, sb, casing, None,
+                                       width, dash)
+            for sa, sb in segments:
+                self.stamp_segment(buf, sa, sb, None, core, width, dash)
+            return
         a = self.image_px_to_view(self.px_from_world(shape["a"]))
         b = self.image_px_to_view(self.px_from_world(shape["b"]))
         if shape["kind"] == "ruler":
@@ -3293,13 +3369,13 @@ class Viewer(object):
         dialog.add_button("OK", Gtk.ResponseType.OK)
         dialog.set_default_response(Gtk.ResponseType.OK)
         current = self.anno_tool \
-            if self.anno_tool in ("box", "ellipse", "line") \
+            if self.anno_tool in ("box", "ellipse", "line", "path") \
             else self.anno_shape
         shape_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
                             spacing=10)
         radios = {}
         group = None
-        for kind in ("box", "ellipse", "line"):
+        for kind in ("box", "ellipse", "line", "path"):
             radio = Gtk.RadioButton.new_with_label_from_widget(group, kind)
             group = group if group is not None else radio
             radio.set_active(kind == current)
@@ -3328,10 +3404,11 @@ class Viewer(object):
         halo_check.set_active(self.anno_casing)
 
         def sync_style_widgets(*args):
-            # A line always draws with the line color: its fill and the
-            # outline toggle rest while it is chosen.  The stroke style
-            # (width/type/halo) follows the outline for box/ellipse.
-            is_line = radios["line"].get_active()
+            # A line/path always draws with the line color: its fill and
+            # the outline toggle rest while one is chosen.  The stroke
+            # style (width/type/halo) follows the outline for box/ellipse.
+            is_line = radios["line"].get_active() \
+                or radios["path"].get_active()
             stroked = is_line or use_outline.get_active()
             outline_label.set_text("line" if is_line else "outline")
             line_combo.set_sensitive(stroked)
@@ -3527,8 +3604,25 @@ class Viewer(object):
 
     @staticmethod
     def anchor_points(anno):
-        return (anno["at"],) if anno["kind"] == "text" \
-            else (anno["a"], anno["b"])
+        if anno["kind"] == "text":
+            return (anno["at"],)
+        if anno["kind"] == "path":
+            return tuple(anno["points"])
+        return (anno["a"], anno["b"])
+
+    # An edit anchor is "a"/"b" for two-point shapes and a vertex index
+    # for paths; 0 is a valid anchor, so tests are "is not None".
+    @staticmethod
+    def anchor_get(anno, which):
+        return anno["points"][which] if isinstance(which, int) \
+            else anno[which]
+
+    @staticmethod
+    def anchor_set(anno, which, point):
+        if isinstance(which, int):
+            anno["points"][which] = point
+        else:
+            anno[which] = point
 
     def cycle_selection(self, step):
         """"s": select annotations newest-first (Shift+s: the other way)."""
@@ -3588,7 +3682,8 @@ class Viewer(object):
         hi = self.world_from_px((float(base.get_width()),
                                  float(base.get_height())), 0)
         target = self.anno_edit_anchor
-        pts = (anno[target],) if target else self.anchor_points(anno)
+        pts = (self.anchor_get(anno, target),) if target is not None \
+            else self.anchor_points(anno)
         dx = max(lo[0] - min(p[0] for p in pts),
                  min(dx, hi[0] - max(p[0] for p in pts)))
         dy = max(lo[1] - min(p[1] for p in pts),
@@ -3597,8 +3692,9 @@ class Viewer(object):
             return
         # a run of nudges coalesces into a single undo step
         top = self.anno_undo[-1] if self.anno_undo else None
-        if target:
-            anno[target] = (anno[target][0] + dx, anno[target][1] + dy)
+        if target is not None:
+            point = self.anchor_get(anno, target)
+            self.anchor_set(anno, target, (point[0] + dx, point[1] + dy))
             if top is not None and top[0] == "anchor" and top[1] is anno \
                     and top[2][0] == target:
                 self.anno_undo[-1] = ("anchor", anno,
@@ -3627,7 +3723,10 @@ class Viewer(object):
         if anno["kind"] == "text":
             self.ask_annotation_text(anno["at"], edit=anno)
             return
-        order = (None, "b", "a")
+        if anno["kind"] == "path":   # newest vertex first, like "b"
+            order = (None,) + tuple(range(len(anno["points"]) - 1, -1, -1))
+        else:
+            order = (None, "b", "a")
         which = order[(order.index(self.anno_edit_anchor) + 1) % len(order)]
         self.anno_edit_anchor = which
         self.anno_rev += 1
@@ -3639,6 +3738,9 @@ class Viewer(object):
         for key in ("a", "b", "at"):
             if key in anno:
                 anno[key] = (anno[key][0] + dx, anno[key][1] + dy)
+        if "points" in anno:
+            anno["points"] = [(x + dx, y + dy)
+                              for x, y in anno["points"]]
 
     def delete_selection(self):
         """Delete/BackSpace: remove the selection (undoable with "u")."""
@@ -3668,8 +3770,9 @@ class Viewer(object):
         elif action == "anchor":            # one corner/endpoint dragged
             which, dx, dy = extra
             sign = -1 if invert else 1
-            anno[which] = (anno[which][0] + sign * dx,
-                           anno[which][1] + sign * dy)
+            point = self.anchor_get(anno, which)
+            self.anchor_set(anno, which, (point[0] + sign * dx,
+                                          point[1] + sign * dy))
         elif action == "edit":              # text reworded/restyled
             self.apply_text_fields(anno, extra[0] if invert else extra[1])
         elif (action == "add") == invert:   # take the annotation out
@@ -3708,6 +3811,7 @@ class Viewer(object):
         self.anno_rev += 1
         self.anno_tool = None
         self.anno_start = self.anno_cursor = None
+        del self.anno_path[:]
         self.update_anno_overlay()
         self.update_mode_toast()
 
@@ -3730,6 +3834,15 @@ class Viewer(object):
                     % (anno["a"][0], anno["a"][1],
                        anno["b"][0], anno["b"][1]))
         color = anno.get("color", Viewer.DEFAULT_LINE)
+        if anno["kind"] == "path":
+            # variable-length coordinate list, then the same style tail
+            # as the fixed shapes ("0" = the reserved fill slot)
+            extra = ",%d,%d" % (anno.get("width", 1), anno.get("dash", 0))
+            if not anno.get("casing", True):
+                extra += ",0"
+            return ("path=%s,%s,0%s"
+                    % (",".join("%.10g,%.10g" % (p[0], p[1])
+                                for p in anno["points"]), color, extra))
         if anno["kind"] == "text":
             if anno.get("bg", True):
                 # backdrop as #RRGGBBAA (0x59 = the translucent 0.35);
@@ -3881,7 +3994,8 @@ class Viewer(object):
                     text = self.unescape_meta(value)
                     if text.strip():
                         self.note = text.strip()
-                elif key in ("box", "ellipse", "line", "ruler", "text"):
+                elif key in ("box", "ellipse", "line", "path", "ruler",
+                             "text"):
                     self.attach_annotation(self.parse_anno_line(key, value))
             except ValueError:
                 continue  # skip malformed lines
@@ -3948,6 +4062,36 @@ class Viewer(object):
             ax, ay, bx, by = value.split(",")[:4]
             return {"kind": "ruler", "a": (float(ax), float(ay)),
                     "b": (float(bx), float(by))}
+        if key == "path":
+            # the coordinate list runs until the first non-number (the
+            # color); the style fields after it match the fixed shapes
+            parts = value.split(",")
+            coords = []
+            index = 0
+            while index < len(parts):
+                try:
+                    coords.append(float(parts[index]))
+                except ValueError:
+                    break
+                index += 1
+            if len(coords) < 4 or len(coords) % 2 or index >= len(parts):
+                raise ValueError("bad path: %s" % value)
+            anno = {"kind": "path",
+                    "points": [(coords[i], coords[i + 1])
+                               for i in range(0, len(coords), 2)],
+                    "color": Viewer.parse_color(parts[index])}
+            tail = parts[index + 1:]   # fill (reserved), width, dash, halo
+            if len(tail) > 1:
+                try:
+                    anno["width"] = max(1, min(int(float(tail[1])), 8))
+                    if len(tail) > 2:
+                        code = int(float(tail[2]))
+                        anno["dash"] = code if code in (1, 2) else 0
+                except ValueError:
+                    pass  # keep the path, default 1px solid
+            if len(tail) > 3 and tail[3].strip() == "0":
+                anno["casing"] = False
+            return anno
         if key == "text":
             x, y, size, color, bg, text = value.split(",", 5)
             text = Viewer.unescape_meta(text)
@@ -4077,6 +4221,42 @@ class Viewer(object):
                 raise ValueError("empty text")
             anno["text"] = text
             return anno
+        if kind == "path":
+            parts = [part.strip() for part in value.split(",")]
+            coords = []
+            while parts:
+                try:
+                    coords.append(float(parts[0]))
+                except ValueError:
+                    break
+                parts.pop(0)
+            if len(coords) < 4 or len(coords) % 2:
+                raise ValueError("expects X1,Y1,X2,Y2[,X3,Y3...]")
+            anno = {"kind": "path",
+                    "points": [(coords[i], coords[i + 1])
+                               for i in range(0, len(coords), 2)],
+                    "color": Viewer.DEFAULT_LINE}
+            if parts:
+                anno["color"] = Viewer.option_color(parts.pop(0))
+            if parts:
+                width = parts.pop(0)
+                try:
+                    anno["width"] = int(width)
+                except ValueError:
+                    raise ValueError("bad width: %s" % width)
+                if not 1 <= anno["width"] <= 8:
+                    raise ValueError("width must be 1-8, got: %s" % width)
+            if parts:
+                dashes = {"solid": 0, "dashed": 1, "dotted": 2,
+                          "0": 0, "1": 1, "2": 2}
+                dash = parts.pop(0)
+                if dash.lower() not in dashes:
+                    raise ValueError("dash must be solid/dashed/dotted, "
+                                     "got: %s" % dash)
+                anno["dash"] = dashes[dash.lower()]
+            if parts:
+                raise ValueError("too many fields: %s" % ",".join(parts))
+            return anno
         parts = [part.strip() for part in value.split(",")]
         if len(parts) < 4:
             raise ValueError("expects X1,Y1,X2,Y2")
@@ -4161,6 +4341,31 @@ class Viewer(object):
                 anno["bg_color"] = Viewer.option_color(
                     str(obj.pop("bg_color", Viewer.DEFAULT_BG)))
                 anno["bg_opaque"] = bool(obj.pop("bg_opaque", False))
+            elif kind == "path":
+                points = obj.pop("points")
+                if not isinstance(points, list) or len(points) < 2:
+                    raise ValueError("path needs a \"points\" array "
+                                     "of 2+ [x, y] pairs")
+                anno = {"kind": "path",
+                        "points": [(float(p[0]), float(p[1]))
+                                   for p in points],
+                        "color": Viewer.option_color(
+                            str(obj.pop("color", Viewer.DEFAULT_LINE)))}
+                anno["width"] = int(obj.pop("width", 1))
+                if not 1 <= anno["width"] <= 8:
+                    raise ValueError("width must be 1-8, got: %s"
+                                     % anno["width"])
+                dash = obj.pop("dash", 0)
+                dashes = {"solid": 0, "dashed": 1, "dotted": 2}
+                if isinstance(dash, str) and dash.lower() in dashes:
+                    anno["dash"] = dashes[dash.lower()]
+                elif dash in (0, 1, 2):
+                    anno["dash"] = int(dash)
+                else:
+                    raise ValueError("dash must be solid/dashed/"
+                                     "dotted, got: %r" % (dash,))
+                if not obj.pop("casing", True):
+                    anno["casing"] = False
             elif kind in ("box", "ellipse", "line", "ruler"):
                 a = obj.pop("a", None) or (obj.pop("x1"), obj.pop("y1"))
                 b = obj.pop("b", None) or (obj.pop("x2"), obj.pop("y2"))
@@ -4474,6 +4679,12 @@ class Viewer(object):
                 self.update_mode_toast()
             elif self.ruler_active:
                 self.set_ruler_active(False)
+            elif self.anno_tool == "path" and self.anno_path:
+                # drop the unfinished path; the tool stays for a retry
+                del self.anno_path[:]
+                self.anno_start = self.anno_cursor = None
+                self.anno_rev += 1
+                self.update_anno_overlay()
             elif self.anno_tool is not None:
                 self.set_anno_tool(None)
             elif self.from_browser and not self.stack_mode:
@@ -4572,6 +4783,9 @@ class Viewer(object):
             self.update_mode_toast()
         elif key == "F1":
             self.show_about()
+        elif key in ("Return", "KP_Enter") and self.anno_tool == "path" \
+                and self.anno_path:
+            self.finish_path()  # commit with the points placed so far
         elif key in ("F11", "Return", "KP_Enter"):
             # Enter as well: remote/VNC clients often swallow F11.
             state = self.window.get_window().get_state() if self.window.get_window() else 0
@@ -4612,6 +4826,13 @@ class Viewer(object):
             and (self.ruler_active or self.anno_tool is not None))
 
     def on_button_press(self, widget, event):
+        if event.type == Gdk.EventType.DOUBLE_BUTTON_PRESS \
+                and self.anno_tool == "path" and self.anno_path \
+                and self.tool_click(event):
+            # the pair's first click already placed this vertex
+            self.finish_path()
+            self.drag_origin = None  # swallow the pair's second release
+            return True
         if event.type != Gdk.EventType.BUTTON_PRESS:
             return False
         if not self.tool_click(event):
@@ -4709,6 +4930,14 @@ class Viewer(object):
                 self.update_dirty()
         elif self.anno_tool == "text":
             self.ask_annotation_text(point)
+        elif self.anno_tool == "path":
+            if self.anno_path:  # Shift constrains against the last vertex
+                point = self.constrain_corner(point, event.state)
+            self.anno_path.append(point)
+            self.anno_start = point    # constraint base and motion gate
+            self.anno_cursor = None
+            self.anno_rev += 1
+            self.update_anno_overlay()
         elif self.anno_start is None:
             self.anno_start = point                # first corner
             self.anno_cursor = None
@@ -4740,7 +4969,7 @@ class Viewer(object):
         if self.ruler_active:
             return "crosshair"
         return {"box": "cell", "ellipse": "cell", "line": "cell",
-                "text": "text"}.get(self.anno_tool)
+                "path": "cell", "text": "text"}.get(self.anno_tool)
 
     def set_viewport_cursor(self, name):
         win = self.scroll.get_window()
@@ -4832,7 +5061,8 @@ class Viewer(object):
                     stack = value not in ("", "0")
                 elif key == "note":
                     note = self.unescape_meta(value)
-                elif key in ("box", "ellipse", "line", "ruler", "text"):
+                elif key in ("box", "ellipse", "line", "path", "ruler",
+                             "text"):
                     try:
                         annos.append(self.parse_anno_line(key, value))
                     except ValueError:
@@ -4909,6 +5139,9 @@ def usage(stream):
         "  --box X1,Y1,X2,Y2[,COLOR[,FILL[,WIDTH[,DASH]]]]\n"
         "  --ellipse X1,Y1,X2,Y2[,COLOR[,FILL[,WIDTH[,DASH]]]]\n"
         "  --line X1,Y1,X2,Y2[,COLOR[,WIDTH[,DASH]]]\n"
+        "  --path X1,Y1,X2,Y2[,X3,Y3...][,COLOR[,WIDTH[,DASH]]]\n"
+        "                            connected line segments through\n"
+        "                            every X,Y in order (2+ points)\n"
         "  --ruler X1,Y1,X2,Y2       finished ruler measurement (uses\n"
         "                            the PPU/unit in effect)\n"
         "  --text X,Y[,STYLE...],TEXT\n"
@@ -4946,14 +5179,15 @@ def usage(stream):
         "        snap to the nearest image edge - a crosshair previews\n"
         "        the first point, the end snaps only along the\n"
         "        measuring direction,\n"
-        "      d draw shapes: a dialog picks box/ellipse/line and the\n"
-        "        style - outline (use, color), stroke width (1-8 px)\n"
+        "      d draw shapes: a dialog picks box/ellipse/line/path and\n"
+        "        the style - outline (use, color), stroke width (1-8 px)\n"
         "        and type (solid/dashed/dotted) for lines and outlines\n"
         "        alike, the black halo around strokes (on/off) and the\n"
         "        box/ellipse fill (use, color, opaque/translucent); one\n"
         "        of outline/fill always stays on and texts style\n"
         "        themselves; Shift while clicking = square/circle/\n"
-        "        45-degree line,\n"
+        "        45-degree line; a path adds a vertex per click and\n"
+        "        double-click/Enter finishes it (Esc drops it),\n"
         "      t text,\n"
         "      n note: one free text per image, no position or style,\n"
         "        shown at the top-left with the info overlays and\n"
@@ -5002,8 +5236,8 @@ def parse_args(args):
             multi = True
         elif arg in ("-l", "--legend", "-p", "--ppu", "-u", "--unit",
                      "-s", "--stack", "--level", "--center",
-                     "--box", "--ellipse", "--line", "--ruler", "--text",
-                     "--note", "--json"):
+                     "--box", "--ellipse", "--line", "--path", "--ruler",
+                     "--text", "--note", "--json"):
             i += 1
             if i == len(args):
                 sys.stderr.write("%s: %s requires an argument\n" % (APP, arg))
@@ -5011,8 +5245,9 @@ def parse_args(args):
             took_value = args[i]
         elif arg.startswith(("--legend=", "--ppu=", "--unit=", "--stack=",
                              "--level=", "--center=", "--box=",
-                             "--ellipse=", "--line=", "--ruler=",
-                             "--text=", "--note=", "--json=")):
+                             "--ellipse=", "--line=", "--path=",
+                             "--ruler=", "--text=", "--note=",
+                             "--json=")):
             arg, took_value = arg.split("=", 1)
         elif arg.startswith("-") and arg != "-":
             sys.stderr.write("%s: unknown option: %s\n" % (APP, arg))
@@ -5053,8 +5288,8 @@ def parse_args(args):
                                      % (APP, took_value))
                     return 2
                 levels[-1]["center"] = (x, y)
-            elif arg in ("--box", "--ellipse", "--line", "--ruler",
-                         "--text"):
+            elif arg in ("--box", "--ellipse", "--line", "--path",
+                         "--ruler", "--text"):
                 try:
                     annos.append(Viewer.parse_anno_option(arg[2:],
                                                           took_value))

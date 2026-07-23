@@ -140,6 +140,20 @@ def line(x1, y1, x2, y2, color=DEFAULT_LINE, width=1, dash="solid",
                   width, dash, casing)
 
 
+def path(points, color=DEFAULT_LINE, width=1, dash="solid", casing=True):
+    """Connected line segments through 2+ (x, y) points, in order."""
+    pts = [(float(p[0]), float(p[1])) for p in points]
+    if len(pts) < 2:
+        raise ValueError("path needs 2+ points")
+    if not 1 <= int(width) <= 8:
+        raise ValueError("width must be 1-8, got: %r" % (width,))
+    anno = {"kind": "path", "points": pts, "color": _color(color),
+            "width": int(width), "dash": _dash(dash)}
+    if not casing:
+        anno["casing"] = False
+    return anno
+
+
 def text(x, y, content, size=16, color=DEFAULT_LINE, bg=True,
          bg_color=DEFAULT_BG, bg_opaque=False):
     """Text note anchored at (x,y); "\\n" in content starts a new line."""
@@ -192,6 +206,15 @@ def serialize_anno(anno):
         return ("ruler=%.10g,%.10g,%.10g,%.10g"
                 % (anno["a"][0], anno["a"][1], anno["b"][0], anno["b"][1]))
     color = anno.get("color", DEFAULT_LINE)
+    if anno["kind"] == "path":
+        # variable-length coordinate list, then the same style tail as
+        # the fixed shapes ("0" = the reserved fill slot)
+        extra = ",%d,%d" % (anno.get("width", 1), anno.get("dash", 0))
+        if not anno.get("casing", True):
+            extra += ",0"
+        return ("path=%s,%s,0%s"
+                % (",".join("%.10g,%.10g" % (p[0], p[1])
+                            for p in anno["points"]), color, extra))
     if anno["kind"] == "text":
         if anno.get("bg", True):
             backdrop = "%s%02X" % (anno.get("bg_color", DEFAULT_BG),
@@ -253,6 +276,36 @@ def parse_anno_line(key, value):
         ax, ay, bx, by = value.split(",")[:4]
         return {"kind": "ruler", "a": (float(ax), float(ay)),
                 "b": (float(bx), float(by))}
+    if key == "path":
+        # the coordinate list runs until the first non-number (the
+        # color); the style fields after it match the fixed shapes
+        parts = value.split(",")
+        coords = []
+        index = 0
+        while index < len(parts):
+            try:
+                coords.append(float(parts[index]))
+            except ValueError:
+                break
+            index += 1
+        if len(coords) < 4 or len(coords) % 2 or index >= len(parts):
+            raise ValueError("bad path: %s" % value)
+        anno = {"kind": "path",
+                "points": [(coords[i], coords[i + 1])
+                           for i in range(0, len(coords), 2)],
+                "color": _parse_color(parts[index])}
+        tail = parts[index + 1:]   # fill (reserved), width, dash, halo
+        if len(tail) > 1:
+            try:
+                anno["width"] = max(1, min(int(float(tail[1])), 8))
+                if len(tail) > 2:
+                    code = int(float(tail[2]))
+                    anno["dash"] = code if code in (1, 2) else 0
+            except ValueError:
+                pass  # keep the path, default 1px solid
+        if len(tail) > 3 and tail[3].strip() == "0":
+            anno["casing"] = False
+        return anno
     if key == "text":
         x, y, size, color, bg, content = value.split(",", 5)
         content = unescape_meta(content)
@@ -319,7 +372,8 @@ def parse_metadata(text):
             elif key == "note":
                 if unescape_meta(value).strip():
                     note = unescape_meta(value).strip()
-            elif key in ("box", "ellipse", "line", "ruler", "text"):
+            elif key in ("box", "ellipse", "line", "path", "ruler",
+                         "text"):
                 annos.append(parse_anno_line(key, value))
         except ValueError:
             continue
@@ -528,6 +582,27 @@ def parse_anno_option(kind, value):
                 kwargs["bg_opaque"] = False
             rest = tail
         return text(parts[0], parts[1], unescape_meta(rest), **kwargs)
+    if kind == "path":
+        parts = [part.strip() for part in value.split(",")]
+        coords = []
+        while parts:
+            try:
+                coords.append(float(parts[0]))
+            except ValueError:
+                break
+            parts.pop(0)
+        if len(coords) < 4 or len(coords) % 2:
+            raise ValueError("expects X1,Y1,X2,Y2[,X3,Y3...]")
+        kwargs = {}
+        if parts:
+            kwargs["color"] = parts.pop(0)
+        if parts:
+            kwargs["width"] = int(parts.pop(0))
+        if parts:
+            kwargs["dash"] = parts.pop(0)
+        if parts:
+            raise ValueError("too many fields: %s" % ",".join(parts))
+        return path(list(zip(coords[0::2], coords[1::2])), **kwargs)
     parts = [part.strip() for part in value.split(",")]
     if len(parts) < 4:
         raise ValueError("expects X1,Y1,X2,Y2")
@@ -578,6 +653,11 @@ def from_json(obj):
         if kind == "text":
             at = obj.pop("at", None) or (obj.pop("x"), obj.pop("y"))
             return text(at[0], at[1], obj.pop("text"), **obj)
+        if kind == "path":
+            points = obj.pop("points")
+            if not isinstance(points, list):
+                raise ValueError("path needs a \"points\" array")
+            return path(points, **obj)
         a = obj.pop("a", None) or (obj.pop("x1"), obj.pop("y1"))
         b = obj.pop("b", None) or (obj.pop("x2"), obj.pop("y2"))
         if kind == "ruler":
@@ -650,6 +730,7 @@ def build_parser():
             ("box", "X1,Y1,X2,Y2[,COLOR[,FILL[,WIDTH[,DASH]]]]"),
             ("ellipse", "X1,Y1,X2,Y2[,COLOR[,FILL[,WIDTH[,DASH]]]]"),
             ("line", "X1,Y1,X2,Y2[,COLOR[,WIDTH[,DASH]]]"),
+            ("path", "X1,Y1,X2,Y2[,X3,Y3...][,COLOR[,WIDTH[,DASH]]]"),
             ("ruler", "X1,Y1,X2,Y2"),
             ("text", "X,Y[,STYLE...],TEXT")):
         parser.add_argument("--" + kind, action=_AnnoOption, const=kind,
@@ -778,6 +859,9 @@ def _sample_annos():
         ellipse(50.5, 60.25, 150, 160, color="#123ABC", fill="sky",
                 dash="dashed", casing=False),
         line(0, 0, 199, 99, color="green", width=8, dash="dotted"),
+        path([(5, 5), (60, 40.5), (60, 90), (110.25, 90)],
+             color="pink", width=3, dash="dashed"),
+        path([(0, 0), (10, 10)], casing=False),
         ruler(5, 5, 105, 5),
         text(12, 14, "DEFECT #17\n불량 위치\\메모", size=20,
              color="white", bg_color="black", bg_opaque=True),
@@ -859,6 +943,8 @@ def selftest():
                 ("box", "30,40,90,80,0,orange"),
                 ("ellipse", "50.5,60.25,150,160,#123ABC,sky,1,dashed"),
                 ("line", "0,0,199,99,green,8,dotted"),
+                ("path", "5,5,60,40.5,60,90,110.25,90,pink,3,dashed"),
+                ("path", "0,0,10,10,20,0"),
                 ("ruler", "5,5,105,5"),
                 ("text", "12,14,DEFECT #17"),
                 ("text", "12,14,size=20,color=white,bg=#000000FF,A"),
@@ -880,6 +966,8 @@ def selftest():
                  "outline": False},
                 {"kind": "line", "x1": 0, "y1": 0, "x2": 9, "y2": 9,
                  "dash": "dotted", "casing": False},
+                {"kind": "path", "points": [[1, 2], [30, 2], [30, 44]],
+                 "color": "orange", "width": 2, "dash": "dashed"},
                 {"kind": "ruler", "x1": 1, "y1": 1, "x2": 8, "y2": 1},
                 {"kind": "text", "x": 5, "y": 32, "text": "불량 A",
                  "size": 12, "color": "white", "bg_opaque": True},
