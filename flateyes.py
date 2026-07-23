@@ -36,7 +36,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -695,9 +695,11 @@ class Viewer(object):
         self.ruler_drawn = None     # geometry of the rendered overlays
         self.ruler_line = Gtk.Image()
         self.ruler_label = Gtk.Label()
-        # Edge snap ("m", off by default): ruler points attract to the
-        # nearest luminance edge; the pointer itself never warps (remote
-        # X lag), a crosshair previews where the first click would land.
+        # Edge snap ("m" toggles, off by default): ruler points attract
+        # to the nearest luminance edge; the pointer itself never warps
+        # (remote X lag), a crosshair previews where the first click
+        # would land.  A plain key, not a modifier: window managers
+        # grab Alt+click for window moves.
         self.snap_enabled = False
         self.snap_hover = None      # world point the next click snaps to
         self.snap_last = None       # (level, px point) hysteresis holds
@@ -1828,9 +1830,8 @@ class Viewer(object):
                         % (len(self.annotations) - pos,
                            len(self.annotations), selected["kind"]))
         elif self.ruler_active:
-            text = "ruler: click two points  (snap %s: m toggles, " \
-                "Alt bypasses; Esc ends)" \
-                % ("on" if self.snap_enabled else "off")
+            text = "ruler: click two points  (snap %s: m toggles; " \
+                "Esc ends)" % ("on" if self.snap_enabled else "off")
         elif self.anno_tool == "text":
             text = "text: click to place  (Esc ends)"
         elif self.anno_tool in ("box", "ellipse", "line"):
@@ -1943,9 +1944,14 @@ class Viewer(object):
         if win is None or self.rendered_size is None:
             return None
         _, org_x, org_y = win.get_origin()
+        return self.win_to_image_px(event.x_root - org_x,
+                                    event.y_root - org_y)
+
+    def win_to_image_px(self, x, y):
+        """Image-window coordinates -> image pixels (clamped)."""
         alloc = self.image.get_allocation()
-        x = event.x_root - org_x - alloc.x
-        y = event.y_root - org_y - alloc.y
+        x -= alloc.x
+        y -= alloc.y
         # GtkImage centers the pixbuf inside its allocation.
         rend_w, rend_h = self.rendered_size
         x -= max(0, (alloc.width - rend_w) // 2)
@@ -1953,6 +1959,21 @@ class Viewer(object):
         img_w, img_h = self.image_size()
         return (min(max(x / self.scale_shown, 0.0), img_w),
                 min(max(y / self.scale_shown, 0.0), img_h))
+
+    def pointer_state(self):
+        """Current pointer position (image px) and modifier mask, read
+        directly off the device: pressing/releasing a key generates no
+        motion event, so snapping needs the position without one."""
+        win = self.image.get_window()
+        if win is None or self.rendered_size is None:
+            return None
+        display = self.window.get_display()
+        try:
+            device = display.get_default_seat().get_pointer()
+        except AttributeError:  # GTK < 3.20
+            device = display.get_device_manager().get_client_pointer()
+        _, x, y, state = win.get_device_position(device)
+        return self.win_to_image_px(x, y), state
 
     def event_to_world(self, event):
         point = self.event_to_image_px(event)
@@ -2024,9 +2045,8 @@ class Viewer(object):
 
     # -- ruler edge snap -----------------------------------------------------
 
-    def edge_snap_allowed(self, state):
-        return self.snap_enabled \
-            and not state & Gdk.ModifierType.MOD1_MASK  # Alt: raw point
+    def edge_snap_allowed(self):
+        return self.snap_enabled
 
     def edge_snap(self, point, direction=None):
         """Snap an image-px point onto the strongest luminance edge
@@ -2149,7 +2169,7 @@ class Viewer(object):
         attract the point, edges running with it never do -- projected
         back so a constrained point stays on its line."""
         point = self.snap_point(point, state)
-        if not self.edge_snap_allowed(state):
+        if not self.edge_snap_allowed():
             return point
         ax, ay = self.ruler_start
         dx, dy = point[0] - ax, point[1] - ay
@@ -2171,12 +2191,34 @@ class Viewer(object):
         """Before the first ruler point: preview where a click would
         snap, as a crosshair (the pointer itself never warps)."""
         hover = None
-        if self.edge_snap_allowed(event.state):
+        if self.edge_snap_allowed():
             point = self.event_to_world(event)
             if point is not None:
                 hover = self.edge_snap_world(point)
         self.snap_hover = hover
         self.update_snap_marker()
+
+    def refresh_snap_preview(self):
+        """Toggling "m" fires no motion event: bring the hover marker or
+        the live end point up to date from the pointer position itself."""
+        if not self.ruler_active:
+            return
+        pos = self.pointer_state()
+        if pos is None:
+            return
+        point, state = pos
+        if self.ruler_start is None:
+            hover = None
+            if self.edge_snap_allowed():
+                snapped = self.edge_snap(point)
+                hover = None if snapped is None \
+                    else self.world_from_px(snapped)
+            self.snap_hover = hover
+            self.update_snap_marker()
+        elif self.ruler_end is None and self.ruler_cursor is not None:
+            self.ruler_cursor = self.snap_ruler_end(
+                self.world_from_px(point), state)
+            self.update_ruler_overlay()
 
     def update_snap_marker(self):
         point = self.snap_hover
@@ -4441,10 +4483,8 @@ class Viewer(object):
                 self.set_view_scale(self.levels[target]["ppu"])
         elif key in ("m", "M"):  # ruler points snap to the nearest edge
             self.snap_enabled = not self.snap_enabled
-            if not self.snap_enabled:
-                self.snap_hover = None
-                self.update_snap_marker()
             self.update_mode_toast()
+            self.refresh_snap_preview()  # react without waiting for motion
             self.show_toast("ruler edge snap %s"
                             % ("on" if self.snap_enabled else "off"))
         elif key in ("o", "O"):
@@ -4489,12 +4529,22 @@ class Viewer(object):
             self.set_view_scale(self.current_view_scale() / self.ZOOM_STEP)
         return True
 
+    def tool_click(self, event):
+        """True when the press/release places tool points.  Quartz (the
+        mac dev environment) turns Ctrl+left-click into a button-3
+        event; while measuring/drawing Ctrl is a modifier (direction
+        lock), so such an event is a click, not a context menu."""
+        return event.button == 1 or (
+            event.button == 3
+            and bool(event.state & Gdk.ModifierType.CONTROL_MASK)
+            and (self.ruler_active or self.anno_tool is not None))
+
     def on_button_press(self, widget, event):
         if event.type != Gdk.EventType.BUTTON_PRESS:
             return False
-        if event.button == 3:
-            return self.show_context_menu(event)
-        if event.button != 1:
+        if not self.tool_click(event):
+            if event.button == 3:
+                return self.show_context_menu(event)
             return False
         # Dragging pans in BOTH modes; the ruler places its point on the
         # release of a motionless click, so measuring and panning coexist.
@@ -4548,7 +4598,7 @@ class Viewer(object):
         return False
 
     def on_button_release(self, widget, event):
-        if event.button != 1 or self.drag_origin is None:
+        if not self.tool_click(event) or self.drag_origin is None:
             return False
         self.drag_origin = None
         panned = self.drag_panned
@@ -4564,7 +4614,7 @@ class Viewer(object):
             return True
         if self.ruler_active:
             if self.ruler_start is None:
-                if self.edge_snap_allowed(event.state):
+                if self.edge_snap_allowed():
                     point = self.edge_snap_world(point) or point
                 self.ruler_start = point           # start a new measurement
                 self.ruler_end = self.ruler_cursor = None
@@ -4823,7 +4873,7 @@ def usage(stream):
         "      m edge snap for the ruler (off by default): the points\n"
         "        snap to the nearest image edge - a crosshair previews\n"
         "        the first point, the end snaps only along the\n"
-        "        measuring direction; holding Alt pauses the snap,\n"
+        "        measuring direction,\n"
         "      d draw shapes: a dialog picks box/ellipse/line and the\n"
         "        style - outline (use, color), stroke width (1-8 px)\n"
         "        and type (solid/dashed/dotted) for lines and outlines\n"
