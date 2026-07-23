@@ -36,7 +36,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.5.1"
+VERSION = "1.6.0"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -559,6 +559,9 @@ class Viewer(object):
     HINT_CASING = 0x00000090     # next-level coverage outline
     HINT_CORE = 0x33BBFFFF
     DRAG_SLOP = 4                # px: press-release within this is a click
+    SNAP_RADIUS = 14             # ruler edge snap: search radius, screen px
+    SNAP_MIN_GRAD = 40           # Sobel magnitude below this is "flat"
+    SNAP_STICKY = 1.25           # a rival edge must beat the held snap 25%
     THUMB_SIZE = 120             # thumbnail browser: image cell size
     THUMB_CACHE = 128            # freedesktop "normal" thumbnail size
     THUMB_PARALLEL = 4           # async thumbnail decodes in flight
@@ -665,11 +668,13 @@ class Viewer(object):
                                Gdk.EventMask.BUTTON_PRESS_MASK |
                                Gdk.EventMask.BUTTON_RELEASE_MASK |
                                Gdk.EventMask.POINTER_MOTION_MASK |
-                               Gdk.EventMask.BUTTON1_MOTION_MASK)
+                               Gdk.EventMask.BUTTON1_MOTION_MASK |
+                               Gdk.EventMask.LEAVE_NOTIFY_MASK)
         self.scroll.connect("scroll-event", self.on_scroll)
         self.scroll.connect("button-press-event", self.on_button_press)
         self.scroll.connect("motion-notify-event", self.on_motion)
         self.scroll.connect("button-release-event", self.on_button_release)
+        self.scroll.connect("leave-notify-event", self.on_leave)
         self.scroll.connect("size-allocate", self.on_size_allocate)
         self.drag_origin = None
         self.drag_panned = False
@@ -690,10 +695,19 @@ class Viewer(object):
         self.ruler_drawn = None     # geometry of the rendered overlays
         self.ruler_line = Gtk.Image()
         self.ruler_label = Gtk.Label()
+        # Edge snap ("m", off by default): ruler points attract to the
+        # nearest luminance edge; the pointer itself never warps (remote
+        # X lag), a crosshair previews where the first click would land.
+        self.snap_enabled = False
+        self.snap_hover = None      # world point the next click snaps to
+        self.snap_last = None       # (level, px point) hysteresis holds
+        self.snap_cache = None      # (query key, result) of the last snap
+        self.snap_marker = Gtk.Image()
         # Stack hint: outline of the area the next magnification covers.
         self.hint_drawn = None
         self.hint_image = Gtk.Image()
-        for widget in (self.ruler_line, self.ruler_label, self.hint_image):
+        for widget in (self.ruler_line, self.ruler_label, self.hint_image,
+                       self.snap_marker):
             widget.set_halign(Gtk.Align.START)
             widget.set_valign(Gtk.Align.START)
             widget.set_no_show_all(True)
@@ -845,15 +859,16 @@ class Viewer(object):
         self.overlay.add_overlay(self.anno_image)
         self.overlay.add_overlay(self.ruler_line)
         self.overlay.add_overlay(self.ruler_label)
+        self.overlay.add_overlay(self.snap_marker)
         self.overlay.add_overlay(self.help_label)
         self.overlay.add_overlay(self.status_label)
         self.overlay.add_overlay(self.path_label)
         self.overlay.add_overlay(self.note_label)
         self.overlay.add_overlay(self.toast_label)
         for child in (self.legend_frame, self.hint_image, self.anno_image,
-                      self.ruler_line, self.ruler_label, self.help_label,
-                      self.status_label, self.path_label, self.note_label,
-                      self.toast_label):
+                      self.ruler_line, self.ruler_label, self.snap_marker,
+                      self.help_label, self.status_label, self.path_label,
+                      self.note_label, self.toast_label):
             try:
                 # Let clicks/wheel over the overlays fall through to the image.
                 self.overlay.set_overlay_pass_through(child, True)
@@ -1693,7 +1708,8 @@ class Viewer(object):
         self.toast_label.hide()
         hidden = []
         for widget in (self.help_label, self.status_label, self.path_label,
-                       self.note_label, self.legend_frame, self.hint_image):
+                       self.note_label, self.legend_frame, self.hint_image,
+                       self.snap_marker):
             if widget.get_visible():
                 widget.hide()
                 hidden.append(widget)
@@ -1812,7 +1828,9 @@ class Viewer(object):
                         % (len(self.annotations) - pos,
                            len(self.annotations), selected["kind"]))
         elif self.ruler_active:
-            text = "ruler: click two points  (Esc ends)"
+            text = "ruler: click two points  (snap %s: m toggles, " \
+                "Alt bypasses; Esc ends)" \
+                % ("on" if self.snap_enabled else "off")
         elif self.anno_tool == "text":
             text = "text: click to place  (Esc ends)"
         elif self.anno_tool in ("box", "ellipse", "line"):
@@ -1914,6 +1932,7 @@ class Viewer(object):
         self.ruler_active = active
         self.ruler_start = self.ruler_end = self.ruler_cursor = None
         self.ruler_axis = self.ruler_dir = None
+        self.snap_hover = self.snap_last = self.snap_cache = None
         self.set_viewport_cursor(self.tool_cursor())
         self.update_view_overlays()
         self.update_mode_toast()
@@ -2002,6 +2021,192 @@ class Viewer(object):
         if self.ruler_axis == "h":
             return (point[0], ay)
         return (ax, point[1])
+
+    # -- ruler edge snap -----------------------------------------------------
+
+    def edge_snap_allowed(self, state):
+        return self.snap_enabled \
+            and not state & Gdk.ModifierType.MOD1_MASK  # Alt: raw point
+
+    def edge_snap(self, point, direction=None):
+        """Snap an image-px point onto the strongest luminance edge
+        nearby: Sobel gradients over a small window, scored with a
+        falloff by distance to the cursor.  With a unit direction only
+        the gradient component along it counts, so edges running with
+        the measurement never attract the point.  Returns a sub-pixel
+        point, or None where the neighbourhood is flat (no snap)."""
+        if self.pixbuf is None:
+            return None
+        radius = max(3, min(20, int(round(self.SNAP_RADIUS
+                                          / self.scale_shown))))
+        img_w, img_h = self.pixbuf.get_width(), self.pixbuf.get_height()
+        cx = min(max(int(round(point[0])), 0), img_w - 1)
+        cy = min(max(int(round(point[1])), 0), img_h - 1)
+        dir_key = None if direction is None \
+            else (round(direction[0], 2), round(direction[1], 2))
+        key = (self.level_index, cx, cy, radius, dir_key)
+        if self.snap_cache is not None and self.snap_cache[0] == key:
+            return self.snap_cache[1]
+        x0, y0 = max(0, cx - radius - 1), max(0, cy - radius - 1)
+        x1, y1 = min(img_w, cx + radius + 2), min(img_h, cy + radius + 2)
+        result = None
+        if x1 - x0 >= 3 and y1 - y0 >= 3:
+            result = self.edge_snap_window(point, direction, radius,
+                                           x0, y0, x1 - x0, y1 - y0)
+        self.snap_cache = (key, result)
+        return result
+
+    def edge_snap_window(self, point, direction, radius, x0, y0, w, h):
+        # copy() first: get_pixels() on a bare subpixbuf would copy the
+        # parent's full-width rows.
+        sub = self.pixbuf.new_subpixbuf(x0, y0, w, h).copy()
+        data = sub.get_pixels()
+        stride = sub.get_rowstride()
+        nch = sub.get_n_channels()
+        lum = [0] * (w * h)   # luminance x256 (BT.601 integer weights)
+        i = 0
+        for row in range(h):
+            base = row * stride
+            for col in range(w):
+                p = base + col * nch
+                lum[i] = data[p] * 77 + data[p + 1] * 150 + data[p + 2] * 29
+                i += 1
+        fx, fy = point[0] - x0, point[1] - y0
+        r2 = float(radius * radius)
+        ux, uy = direction if direction is not None else (0.0, 0.0)
+        directed = direction is not None
+        score = [0] * (w * h)  # unweighted, kept for the sub-pixel fit
+        best = None            # (weighted, col, row, gx, gy)
+        for row in range(1, h - 1):
+            up, mid, down = (row - 1) * w, row * w, (row + 1) * w
+            dy2 = (row - fy) * (row - fy)
+            for col in range(1, w - 1):
+                nw, no, ne = lum[up + col - 1], lum[up + col], \
+                    lum[up + col + 1]
+                we, ea = lum[mid + col - 1], lum[mid + col + 1]
+                sw, so, se = lum[down + col - 1], lum[down + col], \
+                    lum[down + col + 1]
+                gx = (ne + 2 * ea + se) - (nw + 2 * we + sw)
+                gy = (sw + 2 * so + se) - (nw + 2 * no + ne)
+                if directed:
+                    s = gx * ux + gy * uy
+                    s = s * s
+                else:
+                    s = gx * gx + gy * gy
+                score[mid + col] = s
+                d2 = (col - fx) * (col - fx) + dy2
+                if d2 > r2:
+                    continue
+                weighted = s * (1.0 - d2 / (r2 + 1.0))
+                if best is None or weighted > best[0]:
+                    best = (weighted, col, row, gx, gy)
+        floor = (self.SNAP_MIN_GRAD * 256) ** 2
+        if best is None or score[best[2] * w + best[1]] < floor:
+            return None
+        # Hysteresis: hold the previous snap unless the rival clearly
+        # wins, so the point does not hop between parallel edges.
+        if self.snap_last is not None and self.snap_last[0] == \
+                self.level_index:
+            lx, ly = self.snap_last[1]
+            pc, pr = int(round(lx)) - x0, int(round(ly)) - y0
+            if 1 <= pc < w - 1 and 1 <= pr < h - 1:
+                d2 = (pc - fx) * (pc - fx) + (pr - fy) * (pr - fy)
+                if d2 <= r2:
+                    held = score[pr * w + pc] * (1.0 - d2 / (r2 + 1.0))
+                    if held >= floor and best[0] < held * self.SNAP_STICKY:
+                        return self.snap_last[1]
+        _, col, row, gx, gy = best
+        # Sub-pixel: parabola through the scores along the dominant axis
+        # of the refinement direction (the measurement direction, or the
+        # gradient = the edge normal).
+        vx, vy = (ux, uy) if directed else (gx, gy)
+        mid = row * w
+        if abs(vx) >= abs(vy):
+            s_m, s_0, s_p = score[mid + col - 1], score[mid + col], \
+                score[mid + col + 1]
+        else:
+            s_m, s_0, s_p = score[mid - w + col], score[mid + col], \
+                score[mid + w + col]
+        denom = s_m - 2 * s_0 + s_p
+        delta = 0.0 if denom == 0 else \
+            max(-0.5, min(0.5, 0.5 * (s_m - s_p) / denom))
+        if abs(vx) >= abs(vy):
+            result = (x0 + col + delta, y0 + row)
+        else:
+            result = (x0 + col, y0 + row + delta)
+        self.snap_last = (self.level_index, result)
+        return result
+
+    def edge_snap_world(self, point, direction=None):
+        """edge_snap in world coordinates (the direction passes through
+        unchanged: world -> px is a uniform scale)."""
+        snapped = self.edge_snap(self.px_from_world(point), direction)
+        return None if snapped is None else self.world_from_px(snapped)
+
+    def snap_ruler_end(self, point, state):
+        """The ruler end: axis/angle constraint first, then edge snap
+        along the measurement direction only -- edges crossing the ruler
+        attract the point, edges running with it never do -- projected
+        back so a constrained point stays on its line."""
+        point = self.snap_point(point, state)
+        if not self.edge_snap_allowed(state):
+            return point
+        ax, ay = self.ruler_start
+        dx, dy = point[0] - ax, point[1] - ay
+        length = math.hypot(dx, dy)
+        if not length:
+            return point
+        direction = (dx / length, dy / length)
+        snapped = self.edge_snap_world(point, direction)
+        if snapped is None:
+            return point
+        if state & Gdk.ModifierType.SHIFT_MASK \
+                and not state & Gdk.ModifierType.CONTROL_MASK:
+            return snapped     # free angle: the point may leave the ray
+        t = (snapped[0] - ax) * direction[0] \
+            + (snapped[1] - ay) * direction[1]
+        return (ax + t * direction[0], ay + t * direction[1])
+
+    def update_snap_hover(self, event):
+        """Before the first ruler point: preview where a click would
+        snap, as a crosshair (the pointer itself never warps)."""
+        hover = None
+        if self.edge_snap_allowed(event.state):
+            point = self.event_to_world(event)
+            if point is not None:
+                hover = self.edge_snap_world(point)
+        self.snap_hover = hover
+        self.update_snap_marker()
+
+    def update_snap_marker(self):
+        point = self.snap_hover
+        if point is None or not self.ruler_active or not self.draw_visible \
+                or self.ruler_start is not None \
+                or self.rendered_size is None:
+            self.snap_marker.hide()
+            return
+        x, y = self.image_px_to_view(self.px_from_world(point))
+        view = self.scroll.get_allocation()
+        if not (0 <= x <= view.width and 0 <= y <= view.height):
+            self.snap_marker.hide()
+            return
+        if self.snap_marker.get_pixbuf() is None:  # draw once, then move
+            size, c = 17, 8
+            buf = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8,
+                                       size, size)
+            buf.fill(0x00000000)
+            # Four arms with an open centre, so the snapped pixel itself
+            # stays visible through the gap.
+            for rect in ((0, c - 1, c - 2, 3), (c + 3, c - 1, c - 2, 3),
+                         (c - 1, 0, 3, c - 2), (c - 1, c + 3, 3, c - 2)):
+                self.fill_rect(buf, *rect, rgba=self.RULER_CASING)
+            for rect in ((0, c, c - 2, 1), (c + 3, c, c - 2, 1),
+                         (c, 0, 1, c - 2), (c, c + 3, 1, c - 2)):
+                self.fill_rect(buf, *rect, rgba=self.RULER_CORE)
+            self.snap_marker.set_from_pixbuf(buf)
+        self.snap_marker.set_margin_start(max(0, int(round(x)) - 8))
+        self.snap_marker.set_margin_top(max(0, int(round(y)) - 8))
+        self.snap_marker.show()
 
     def image_px_to_widget(self, point):
         alloc = self.image.get_allocation()
@@ -2208,6 +2413,7 @@ class Viewer(object):
 
     def update_view_overlays(self):
         self.update_ruler_overlay()
+        self.update_snap_marker()
         self.update_hint_overlay()
         self.update_anno_overlay()
 
@@ -4233,6 +4439,14 @@ class Viewer(object):
                 target = min(max(self.level_index + step, 0),
                              len(self.levels) - 1)
                 self.set_view_scale(self.levels[target]["ppu"])
+        elif key in ("m", "M"):  # ruler points snap to the nearest edge
+            self.snap_enabled = not self.snap_enabled
+            if not self.snap_enabled:
+                self.snap_hover = None
+                self.update_snap_marker()
+            self.update_mode_toast()
+            self.show_toast("ruler edge snap %s"
+                            % ("on" if self.snap_enabled else "off"))
         elif key in ("o", "O"):
             if self.stack_mode:
                 self.hint_enabled = not self.hint_enabled
@@ -4311,8 +4525,11 @@ class Viewer(object):
             if self.ruler_start is not None and self.ruler_end is None:
                 point = self.event_to_world(event)
                 if point is not None:
-                    self.ruler_cursor = self.snap_point(point, event.state)
+                    self.ruler_cursor = self.snap_ruler_end(point,
+                                                            event.state)
                     self.update_ruler_overlay()
+            elif self.ruler_start is None:
+                self.update_snap_hover(event)
             return True
         if self.anno_tool is not None:
             if self.anno_tool != "text" and self.anno_start is not None:
@@ -4322,6 +4539,12 @@ class Viewer(object):
                                                              event.state)
                     self.update_anno_overlay()
             return True
+        return False
+
+    def on_leave(self, widget, event):
+        if self.snap_hover is not None:
+            self.snap_hover = None
+            self.update_snap_marker()
         return False
 
     def on_button_release(self, widget, event):
@@ -4341,15 +4564,20 @@ class Viewer(object):
             return True
         if self.ruler_active:
             if self.ruler_start is None:
+                if self.edge_snap_allowed(event.state):
+                    point = self.edge_snap_world(point) or point
                 self.ruler_start = point           # start a new measurement
                 self.ruler_end = self.ruler_cursor = None
                 self.ruler_axis = self.ruler_dir = None   # re-pick fresh
+                self.snap_hover = None
+                self.update_snap_marker()
                 self.update_ruler_overlay()
             else:
                 # second click commits the measurement as an annotation:
                 # it persists, undoes and saves like any drawn shape
                 self.add_ruler_annotation(
-                    self.ruler_start, self.snap_point(point, event.state))
+                    self.ruler_start, self.snap_ruler_end(point,
+                                                          event.state))
                 self.anno_undo.append(("add", self.annotations[-1], None))
                 del self.anno_redo[:]
                 self.ruler_start = self.ruler_end = self.ruler_cursor = None
@@ -4592,6 +4820,10 @@ def usage(stream):
         "      Tab all overlays (drawings and info) on/off,\n"
         "      [/] stack level, p set PPU,\n"
         "      r ruler (Shift = free angle, Esc ends),\n"
+        "      m edge snap for the ruler (off by default): the points\n"
+        "        snap to the nearest image edge - a crosshair previews\n"
+        "        the first point, the end snaps only along the\n"
+        "        measuring direction; holding Alt pauses the snap,\n"
         "      d draw shapes: a dialog picks box/ellipse/line and the\n"
         "        style - outline (use, color), stroke width (1-8 px)\n"
         "        and type (solid/dashed/dotted) for lines and outlines\n"
