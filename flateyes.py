@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -567,6 +567,7 @@ class Viewer(object):
     THUMB_CACHE = 128            # freedesktop "normal" thumbnail size
     THUMB_PARALLEL = 4           # async thumbnail decodes in flight
     ANNO_CASING = 0x000000A0     # shape annotation outline
+    HIGHLIGHT_CASING = 0x39FF14FF  # "a" highlight: neon-green halo
     # One palette for the line and background pickers ("c" dialog).
     # English labels only: X servers without Hangul fonts (e.g. XQuartz)
     # render Korean UI text as boxes.
@@ -614,6 +615,7 @@ class Viewer(object):
         self.info_visible = True    # "i"
         self.draw_visible = True    # Tab
         self.hint_enabled = True    # "o"
+        self.anno_highlight = False  # "a": emphasize the drawn shapes
 
         self.window = Gtk.Window(title=APP)
         self.window.connect("destroy", lambda *a: Gtk.main_quit())
@@ -2660,6 +2662,7 @@ class Viewer(object):
         key = (self.anno_rev, self.anno_line_color, self.anno_line_width,
                self.anno_line_dash, self.anno_casing, self.anno_outline,
                self.anno_fill, self.anno_fill_color, self.anno_fill_opaque,
+               self.anno_highlight,
                preview and (preview.get("a"), preview.get("b"),
                             tuple(preview.get("points", ()))),
                self.scroll.get_hadjustment().get_value(),
@@ -2675,9 +2678,9 @@ class Viewer(object):
                                    max(view.width, 1), max(view.height, 1))
         buf.fill(0x00000000)
         for shape in shapes:
-            self.stamp_annotation(buf, shape)
+            self.stamp_annotation(buf, shape, self.anno_highlight)
         if preview is not None:
-            self.stamp_annotation(buf, preview)
+            self.stamp_annotation(buf, preview, self.anno_highlight)
         if selected is not None and selected["kind"] != "text":
             if selected["kind"] == "path":
                 corners = tuple(
@@ -2914,7 +2917,10 @@ class Viewer(object):
         x, y = self.ruler_label_spot(a, b, mid_x, mid_y, w, h)
         return self.avoid_label_overlap(x, y, w, h, placed, view)
 
-    def stamp_annotation(self, buf, shape):
+    def stamp_annotation(self, buf, shape, highlight=False):
+        """highlight ("a"): thicker stroke under a neon-green halo, so
+        the drawn shapes pop on a busy image.  Rulers keep their own
+        colors (the branch below returns first) and texts are labels."""
         if shape["kind"] == "path":
             pts = [self.image_px_to_view(self.px_from_world(p))
                    for p in shape["points"]]
@@ -2923,6 +2929,9 @@ class Viewer(object):
                 else None
             width = shape.get("width", 1)
             dash = shape.get("dash", 0)
+            if highlight:
+                casing = self.HIGHLIGHT_CASING
+                width = min(width + 2, 12)
             segments = list(zip(pts, pts[1:]))
             # all casing first, then all core, so a later segment cannot
             # cut into a finished corner's core
@@ -2944,9 +2953,13 @@ class Viewer(object):
             return
         core = self.color_rgba(shape["color"])
         casing = self.ANNO_CASING if shape.get("casing", True) else None
+        stroke_w = shape.get("width", 1)
+        if highlight:
+            casing = self.HIGHLIGHT_CASING
+            stroke_w = min(stroke_w + 2, 12)
         if shape["kind"] == "line":
             self.stamp_segment(buf, a, b, casing, core,
-                               shape.get("width", 1), shape.get("dash", 0))
+                               stroke_w, shape.get("dash", 0))
             return
         x0, x1 = sorted((a[0], b[0]))
         y0, y1 = sorted((a[1], b[1]))
@@ -2958,7 +2971,6 @@ class Viewer(object):
             fill_rgba = self.color_rgba(
                 shape["fill"], 0xFF if shape.get("fill_opaque") else 0x59)
         outline = shape.get("outline", True)
-        stroke_w = shape.get("width", 1)
         stroke_dash = shape.get("dash", 0)
         if shape["kind"] == "box":
             if fill_rgba is not None:
@@ -4764,6 +4776,13 @@ class Viewer(object):
                 target = min(max(self.level_index + step, 0),
                              len(self.levels) - 1)
                 self.set_view_scale(self.levels[target]["ppu"])
+        elif key in ("a", "A"):  # emphasize the drawn shapes
+            self.anno_highlight = not self.anno_highlight
+            if self.anno_highlight and not self.draw_visible:
+                self.draw_visible = True  # highlighting hidden shapes
+            self.update_view_overlays()
+            self.show_toast("shape highlight %s"
+                            % ("on" if self.anno_highlight else "off"))
         elif key in ("m", "M"):  # ruler points snap to the nearest edge
             self.snap_enabled = not self.snap_enabled
             self.update_mode_toast()
@@ -5192,6 +5211,9 @@ def usage(stream):
         "      n note: one free text per image, no position or style,\n"
         "        shown at the top-left with the info overlays and\n"
         "        saved with the annotations (empty text removes it),\n"
+        "      a highlight the drawn shapes on/off: thicker strokes\n"
+        "        under a neon-green halo, to spot them on a busy\n"
+        "        image (texts and rulers stay as they are),\n"
         "      s select annotations, newest first (Shift+s backwards):\n"
         "        arrows move the selection (Shift = 10 px steps),\n"
         "        e edits it - shapes cycle a resize corner/endpoint\n"
