@@ -36,7 +36,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -1145,7 +1145,7 @@ class Viewer(object):
         self.pump_warm()   # resume any cache warming the browser paused
 
     def populate_browser(self, folder, select=None):
-        """One os.listdir deep: subfolders first, then this folder's
+        """One os.scandir deep: subfolders first, then this folder's
         images.  Thumbnails stream in from an idle handler."""
         folder = os.path.abspath(folder)
         self.browser_folder = folder
@@ -1155,15 +1155,33 @@ class Viewer(object):
         # is dropped so the workers belong to the visible screen.
         del self.warm_queue[:]
         self.warm_folder = folder
+        # A single scandir pass: entry.is_dir() reads the directory
+        # entry's type instead of stat()ing every file, which froze the
+        # UI for minutes on large folders of non-images (each stat is a
+        # round trip on NFS).
         try:
-            names = [n for n in os.listdir(folder) if not n.startswith(".")]
+            entries = list(os.scandir(folder))
         except OSError as exc:
-            names = []
+            entries = []
             self.browser_status.set_text("cannot read folder: %s" % exc)
-        dirs = sorted((n for n in names
-                       if os.path.isdir(os.path.join(folder, n))),
-                      key=natural_key)
-        images = self.folder_images(folder)
+        exts = image_extensions()
+        dirs = []
+        image_names = []
+        for entry in entries:
+            name = entry.name
+            if name.startswith("."):
+                continue
+            try:
+                is_dir = entry.is_dir()
+            except OSError:
+                is_dir = False
+            if is_dir:
+                dirs.append(name)
+            elif os.path.splitext(name)[1].lstrip(".").lower() in exts:
+                image_names.append(name)
+        dirs.sort(key=natural_key)
+        image_names.sort(key=natural_key)
+        images = [os.path.join(folder, name) for name in image_names]
         parent = os.path.dirname(folder)
         if parent and parent != folder:
             self.browser_store.append(
