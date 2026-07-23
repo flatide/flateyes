@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -567,7 +567,7 @@ class Viewer(object):
     THUMB_CACHE = 128            # freedesktop "normal" thumbnail size
     THUMB_PARALLEL = 4           # async thumbnail decodes in flight
     ANNO_CASING = 0x000000A0     # shape annotation outline
-    HIGHLIGHT_CASING = 0x39FF14FF  # "a" highlight: neon-green halo
+    HIGHLIGHT_CASING = 0x39FF14FF  # "h" highlight: neon-green halo
     # One palette for the line and background pickers ("c" dialog).
     # English labels only: X servers without Hangul fonts (e.g. XQuartz)
     # render Korean UI text as boxes.
@@ -615,7 +615,7 @@ class Viewer(object):
         self.info_visible = True    # "i"
         self.draw_visible = True    # Tab
         self.hint_enabled = True    # "o"
-        self.anno_highlight = False  # "a": emphasize the drawn shapes
+        self.anno_highlight = False  # "h": emphasize the drawn shapes
 
         self.window = Gtk.Window(title=APP)
         self.window.connect("destroy", lambda *a: Gtk.main_quit())
@@ -2918,7 +2918,7 @@ class Viewer(object):
         return self.avoid_label_overlap(x, y, w, h, placed, view)
 
     def stamp_annotation(self, buf, shape, highlight=False):
-        """highlight ("a"): thicker stroke under a neon-green halo, so
+        """highlight ("h"): thicker stroke under a neon-green halo, so
         the drawn shapes pop on a busy image.  Rulers keep their own
         colors (the branch below returns first) and texts are labels."""
         if shape["kind"] == "path":
@@ -4776,7 +4776,7 @@ class Viewer(object):
                 target = min(max(self.level_index + step, 0),
                              len(self.levels) - 1)
                 self.set_view_scale(self.levels[target]["ppu"])
-        elif key in ("a", "A"):  # emphasize the drawn shapes
+        elif key in ("h", "H"):  # emphasize the drawn shapes
             self.anno_highlight = not self.anno_highlight
             if self.anno_highlight and not self.draw_visible:
                 self.draw_visible = True  # highlighting hidden shapes
@@ -5211,7 +5211,7 @@ def usage(stream):
         "      n note: one free text per image, no position or style,\n"
         "        shown at the top-left with the info overlays and\n"
         "        saved with the annotations (empty text removes it),\n"
-        "      a highlight the drawn shapes on/off: thicker strokes\n"
+        "      h highlight the drawn shapes on/off: thicker strokes\n"
         "        under a neon-green halo, to spot them on a busy\n"
         "        image (texts and rulers stay as they are),\n"
         "      s select annotations, newest first (Shift+s backwards):\n"
