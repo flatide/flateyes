@@ -1,0 +1,6 @@
+box  green   none   pwell
+box  green   hatch  oxide
+box  sky     solid  contact
+box  white   cross  metal1
+box  #FFFF66 dots   via
+line red     dashed metal route

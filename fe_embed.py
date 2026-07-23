@@ -11,8 +11,11 @@ file, same as flateyes.py itself.
 The annotation metadata lives inside the PNG as an iTXt chunk (UTF-8,
 keyword "flateyes") inserted before IEND.  Decoders must skip unknown
 ancillary chunks, so the file stays a plain PNG for every other tool;
-pixels are never touched.  Coordinates are image pixels (origin top
-left), so they are independent of any viewer zoom.
+pixels are never touched.  Coordinates are image pixels with the
+origin at the image CENTER (x right, y down) — the same world frame
+the viewer uses for multi-magnification stacks — so they are
+independent of any viewer zoom.  A box over the top-left quadrant has
+negative coordinates.
 
 Library use:
 
@@ -23,7 +26,12 @@ Library use:
     ], ppu=8.0, unit="um", note="capture rig #3")
 
     blob = fe.embed_bytes(png_bytes, annos)   # in-memory pipelines
-    annos, ppu, unit, note = fe.read("shot_0001.png")
+    annos, ppu, unit, note, legend = fe.read("shot_0001.png")
+
+    fe.embed("shot_0001.png", [], legend=[    # legend swatch table
+        "box #3DDC55 hatch oxide",            # (definition lines; flateyes
+        "line red dashed metal route",        #  shows it bottom-right)
+    ])
 
 CLI use (same option syntax as flateyes itself):
 
@@ -63,6 +71,13 @@ DEFAULT_LINE = "#FF5040"
 DEFAULT_BG = "#000000"
 TRANSLUCENT_ALPHA = 89   # flateyes' 0.35 backdrop/fill alpha
 DASHES = {"solid": 0, "dashed": 1, "dotted": 2}
+
+# Legend swatch styles (mirrors the flateyes tables, synonyms included).
+LEGEND_BOX_STYLES = {"solid": "solid", "none": "none", "outline": "none",
+                     "empty": "none", "hatch": "hatch", "cross": "cross",
+                     "crosshatch": "cross", "dots": "dots", "dotted": "dots"}
+LEGEND_LINE_STYLES = {"solid": "solid", "dash": "dashed", "dashed": "dashed",
+                      "dot": "dotted", "dotted": "dotted"}
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +135,7 @@ def _shape(kind, x1, y1, x2, y2, color, fill, fill_opaque, outline,
 
 def box(x1, y1, x2, y2, color=DEFAULT_LINE, fill=None, fill_opaque=False,
         outline=True, width=1, dash="solid", casing=True):
-    """Rectangle from (x1,y1) to (x2,y2) in image pixels."""
+    """Rectangle from (x1,y1) to (x2,y2) in center-origin image px."""
     return _shape("box", x1, y1, x2, y2, color, fill, fill_opaque,
                   outline, width, dash, casing)
 
@@ -200,6 +215,61 @@ def unescape_meta(value):
     return "".join(out)
 
 
+def parse_legend_line(value):
+    """One "kind COLOR [STYLE] LABEL..." legend definition line into an
+    entry dict (port of the flateyes parser, color case preserved).
+    The legend= metadata value uses the same grammar."""
+    parts = value.split()
+    kind = parts[0].lower() if parts else ""
+    if kind not in ("box", "line"):
+        raise ValueError("expected box or line, got: %s"
+                         % (parts[0] if parts else "nothing"))
+    if len(parts) < 2:
+        raise ValueError("missing color")
+    color = None
+    for name, hex_ in PALETTE:
+        if parts[1].lower() == name:
+            color = hex_
+    if color is None:
+        if parts[1].startswith("#") and len(parts[1]) == 7:
+            try:
+                int(parts[1][1:], 16)
+                color = parts[1]
+            except ValueError:
+                pass
+    if color is None:
+        raise ValueError("bad color: %s (use %s or #RRGGBB)"
+                         % (parts[1], "/".join(n for n, _ in PALETTE)))
+    styles = LEGEND_BOX_STYLES if kind == "box" else LEGEND_LINE_STYLES
+    style = "solid"
+    rest = parts[2:]
+    if rest and rest[0].lower() in styles:
+        style = styles[rest[0].lower()]
+        rest = rest[1:]
+    if not rest:
+        raise ValueError("missing label")
+    return {"kind": kind, "color": color, "style": style,
+            "label": " ".join(rest)}
+
+
+def serialize_legend(entry):
+    """Canonical definition line (explicit style), the legend= value."""
+    return "%s %s %s %s" % (entry["kind"], entry["color"],
+                            entry["style"], entry["label"])
+
+
+def legend_lines(legend):
+    """Validate an iterable of legend definition lines into their
+    canonical form; raises ValueError naming the offending line."""
+    lines = []
+    for index, line in enumerate(legend):
+        try:
+            lines.append(serialize_legend(parse_legend_line(str(line))))
+        except ValueError as exc:
+            raise ValueError("legend[%d]: %s" % (index, exc))
+    return lines
+
+
 def serialize_anno(anno):
     """One annotation dict as its key=value metadata line."""
     if anno["kind"] == "ruler":
@@ -240,10 +310,12 @@ def serialize_anno(anno):
                anno["b"][0], anno["b"][1], color, fill, extra))
 
 
-def serialize(annos, ppu=None, unit="um", note=None):
+def serialize(annos, ppu=None, unit="um", note=None, legend=None):
     """The full chunk text, or None when there is nothing to store.
     note is one free text for the whole image (no position or style);
-    flateyes shows it at the top-left with the info overlays."""
+    flateyes shows it at the top-left with the info overlays.  legend
+    is an iterable of definition lines ("box COLOR [STYLE] LABEL...");
+    flateyes draws them as a swatch table at the bottom-right."""
     lines = []
     if ppu:
         if float(ppu) <= 0:
@@ -252,6 +324,7 @@ def serialize(annos, ppu=None, unit="um", note=None):
         lines.append("unit=%s" % unit)
     if note and str(note).strip():
         lines.append("note=%s" % escape_meta(str(note).strip()))
+    lines.extend("legend=%s" % line for line in legend_lines(legend or []))
     lines.extend(serialize_anno(anno) for anno in annos)
     if not lines:
         return None
@@ -352,9 +425,10 @@ def parse_anno_line(key, value):
 
 
 def parse_metadata(text):
-    """Chunk text -> (annotations, ppu, unit, note); malformed lines
-    skipped like flateyes does."""
-    annos, ppu, unit, note = [], None, None, None
+    """Chunk text -> (annotations, ppu, unit, note, legend); malformed
+    lines skipped like flateyes does.  legend is a list of canonical
+    definition lines (None when the chunk has none)."""
+    annos, ppu, unit, note, legend = [], None, None, None, None
     for raw in (text or "").splitlines():
         stripped = raw.strip()
         if not stripped or stripped.startswith("#"):
@@ -372,12 +446,15 @@ def parse_metadata(text):
             elif key == "note":
                 if unescape_meta(value).strip():
                     note = unescape_meta(value).strip()
+            elif key == "legend":
+                line = serialize_legend(parse_legend_line(value))
+                legend = (legend or []) + [line]
             elif key in ("box", "ellipse", "line", "path", "ruler",
                          "text"):
                 annos.append(parse_anno_line(key, value))
         except ValueError:
             continue
-    return annos, ppu, unit, note
+    return annos, ppu, unit, note, legend
 
 
 # ---------------------------------------------------------------------------
@@ -454,10 +531,10 @@ def insert_text(blob, text):
     raise ValueError("no IEND chunk")
 
 
-def _combine(existing, annos, ppu, unit, note):
+def _combine(existing, annos, ppu, unit, note, legend):
     """Chunk text for append mode: keep the lines already embedded, but
-    a newly given ppu replaces the stored ppu/unit pair and a newly
-    given note replaces the stored note."""
+    a newly given ppu replaces the stored ppu/unit pair, and a newly
+    given note/legend replaces the stored one."""
     kept = []
     for raw in (existing or "").splitlines():
         stripped = raw.strip()
@@ -468,9 +545,12 @@ def _combine(existing, annos, ppu, unit, note):
             continue
         if note and stripped.startswith("note="):
             continue
+        if legend and stripped.startswith("legend="):
+            continue
         kept.append(stripped)
-    fresh = (serialize(annos, ppu, unit, note) or "").splitlines()[1:]
-    head = (2 if ppu else 0) + (1 if note and str(note).strip() else 0)
+    fresh = (serialize(annos, ppu, unit, note, legend) or "").splitlines()[1:]
+    head = (2 if ppu else 0) + (1 if note and str(note).strip() else 0) \
+        + len(legend or [])
     lines = fresh[:head] + kept + fresh[head:]
     if not lines:
         return None
@@ -481,23 +561,25 @@ def _combine(existing, annos, ppu, unit, note):
 # public entry points
 # ---------------------------------------------------------------------------
 
-def embed_bytes(blob, annos, ppu=None, unit="um", append=False, note=None):
+def embed_bytes(blob, annos, ppu=None, unit="um", append=False, note=None,
+                legend=None):
     """PNG bytes with the given annotations embedded.  With append=True
     they are added after any already-embedded ones; otherwise the chunk
     is replaced.  Empty input (and not appending) removes the chunk."""
     if append:
-        text = _combine(extract_text(blob), annos, ppu, unit, note)
+        text = _combine(extract_text(blob), annos, ppu, unit, note, legend)
     else:
-        text = serialize(annos, ppu, unit, note)
+        text = serialize(annos, ppu, unit, note, legend)
     return insert_text(blob, text)
 
 
-def embed(path, annos, ppu=None, unit="um", append=False, note=None):
+def embed(path, annos, ppu=None, unit="um", append=False, note=None,
+          legend=None):
     """Embed annotations into the PNG at path (atomic tmp + os.replace,
     so an interrupted write never corrupts the capture)."""
     with open(path, "rb") as handle:
         blob = handle.read()
-    out = embed_bytes(blob, annos, ppu, unit, append, note)
+    out = embed_bytes(blob, annos, ppu, unit, append, note, legend)
     folder = os.path.dirname(os.path.abspath(path))
     fd, tmp = tempfile.mkstemp(prefix=".fe-embed-", dir=folder)
     try:
@@ -514,12 +596,13 @@ def embed(path, annos, ppu=None, unit="um", append=False, note=None):
 
 
 def read_bytes(blob):
-    """(annotations, ppu, unit, note) embedded in PNG bytes."""
+    """(annotations, ppu, unit, note, legend) embedded in PNG bytes."""
     return parse_metadata(extract_text(blob))
 
 
 def read(path):
-    """(annotations, ppu, unit, note) embedded in the PNG at path."""
+    """(annotations, ppu, unit, note, legend) embedded in the PNG at
+    path."""
     with open(path, "rb") as handle:
         return read_bytes(handle.read())
 
@@ -674,11 +757,13 @@ def from_json(obj):
 
 def parse_json_document(data):
     """A --json payload: either a plain array of annotation objects, or
-    an object {"ppu": N, "unit": U, "note": TEXT, "annotations": [...]}
-    (every key optional) so one file carries everything.  Returns
-    (annos, ppu, unit, note); raises ValueError on malformed input."""
+    an object {"ppu": N, "unit": U, "note": TEXT, "legend": [LINE, ...],
+    "annotations": [...]} (every key optional) so one file carries
+    everything.  Each legend LINE is one definition line ("box COLOR
+    [STYLE] LABEL...").  Returns (annos, ppu, unit, note, legend);
+    raises ValueError on malformed input."""
     if isinstance(data, list):
-        return [from_json(obj) for obj in data], None, None, None
+        return [from_json(obj) for obj in data], None, None, None, None
     if not isinstance(data, dict):
         raise ValueError("expected a JSON array or object")
     data = dict(data)
@@ -700,12 +785,18 @@ def parse_json_document(data):
         note = str(note)
         if not note.strip():
             raise ValueError("empty note")
+    legend = data.pop("legend", None)
+    if legend is not None:
+        if not isinstance(legend, list) or not legend:
+            raise ValueError("\"legend\" must be a non-empty array of "
+                             "definition lines")
+        legend = legend_lines(legend)
     annos = data.pop("annotations", [])
     if not isinstance(annos, list):
         raise ValueError("\"annotations\" must be an array")
     if data:
         raise ValueError("unknown fields: %s" % ", ".join(sorted(data)))
-    return [from_json(obj) for obj in annos], ppu, unit, note
+    return [from_json(obj) for obj in annos], ppu, unit, note, legend
 
 
 class _AnnoOption(argparse.Action):
@@ -740,9 +831,18 @@ def build_parser():
     parser.add_argument("--json", metavar="FILE",
                         help="annotations from a JSON array (\"-\" = "
                              "stdin), appended after the option ones; "
-                             "an object {ppu, unit, note, annotations} "
-                             "also carries the metadata (explicit "
-                             "--ppu/--unit/--note win)")
+                             "an object {ppu, unit, note, legend, "
+                             "annotations} also carries the metadata "
+                             "(explicit --ppu/--unit/--note/--legend "
+                             "win)")
+    parser.add_argument("--legend", metavar="FILE",
+                        help="legend definition text file, one entry "
+                             "per line (\"#\" comments): \"box COLOR "
+                             "[solid|none|hatch|cross|dots] LABEL\" or "
+                             "\"line COLOR [solid|dashed|dotted] "
+                             "LABEL\"; flateyes draws it as a swatch "
+                             "table at the bottom-right (with --append "
+                             "it replaces a stored legend)")
     parser.add_argument("--note", metavar="TEXT",
                         help="one free text for the whole image, no "
                              "position or style (flateyes shows it at "
@@ -790,7 +890,7 @@ def main(argv=None):
                              else "(no embedded metadata)\n")
         return 0
     if args.strip:
-        if args.annos or args.json or args.ppu or args.note:
+        if args.annos or args.json or args.ppu or args.note or args.legend:
             parser.error("--strip takes no annotations")
         for path in args.png:
             try:
@@ -801,7 +901,7 @@ def main(argv=None):
                 return 1
         return 0
     annos = list(args.annos)
-    json_ppu = json_unit = json_note = None
+    json_ppu = json_unit = json_note = json_legend = None
     if args.json:
         try:
             if args.json == "-":
@@ -809,21 +909,35 @@ def main(argv=None):
             else:
                 with open(args.json, "r", encoding="utf-8") as handle:
                     data = json.load(handle)
-            extra, json_ppu, json_unit, json_note = \
+            extra, json_ppu, json_unit, json_note, json_legend = \
                 parse_json_document(data)
             annos.extend(extra)
         except (OSError, ValueError) as exc:
             sys.stderr.write("--json %s: %s\n" % (args.json, exc))
             return 1
+    file_legend = None
+    if args.legend:
+        try:
+            with open(args.legend, "r", encoding="utf-8") as handle:
+                raw = [l.strip() for l in handle.read().splitlines()]
+            file_legend = legend_lines(l for l in raw
+                                       if l and not l.startswith("#"))
+            if not file_legend:
+                raise ValueError("empty legend")
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            sys.stderr.write("--legend %s: %s\n" % (args.legend, exc))
+            return 1
     # explicit command-line values win over the JSON document's
     ppu = args.ppu if args.ppu is not None else json_ppu
     unit = args.unit or json_unit or "um"
     note = unescape_meta(args.note) if args.note else json_note
-    if not annos and not ppu and not note and not args.append:
+    legend = file_legend or json_legend
+    if not annos and not ppu and not note and not legend \
+            and not args.append:
         parser.error("no annotations given (use --strip to remove)")
     for path in args.png:
         try:
-            embed(path, annos, ppu, unit, args.append, note)
+            embed(path, annos, ppu, unit, args.append, note, legend)
         except (OSError, ValueError) as exc:
             sys.stderr.write("%s: %s\n" % (path, exc))
             return 1
@@ -879,22 +993,33 @@ def selftest():
 
     annos = _sample_annos()
     sample_note = "capture rig #3\n확인 요망"
+    sample_legend = ["box #3DDC55 none pwell",
+                     "box green hatch 산화막 layer",
+                     "box #FFFF66 dots via",
+                     "box sky solid dots",   # label = a style word
+                     "line red dashed metal route",
+                     "line #35C5FF boundary"]
     blob = _sample_png()
     stamped = embed_bytes(blob, annos, ppu=8.5, unit="um",
-                          note=sample_note)
-    got, ppu, unit, note = read_bytes(stamped)
+                          note=sample_note, legend=sample_legend)
+    got, ppu, unit, note, legend = read_bytes(stamped)
     check("round-trip count", len(got) == len(annos))
     check("round-trip ppu/unit/note",
           ppu == 8.5 and unit == "um" and note == sample_note)
     check("round-trip lines",
           [serialize_anno(a) for a in got]
           == [serialize_anno(a) for a in annos])
+    check("round-trip legend (canonical form)",
+          legend == legend_lines(sample_legend)
+          and legend == legend_lines(legend))
     appended = embed_bytes(stamped, [text(1, 1, "late")], append=True,
-                           note="replaced")
-    got2, ppu2, _, note2 = read_bytes(appended)
-    check("append keeps old + ppu, replaces note",
+                           note="replaced",
+                           legend=["box red solid rework"])
+    got2, ppu2, _, note2, legend2 = read_bytes(appended)
+    check("append keeps old + ppu, replaces note + legend",
           len(got2) == len(annos) + 1 and ppu2 == 8.5
-          and got2[-1]["text"] == "late" and note2 == "replaced")
+          and got2[-1]["text"] == "late" and note2 == "replaced"
+          and legend2 == ["box #FF5040 solid rework"])
     check("strip restores original bytes",
           insert_text(stamped, None) == blob)
 
@@ -919,13 +1044,22 @@ def selftest():
             stub.ppu, stub.unit, stub.stack_mode = 8.5, "um", False
             stub.note = sample_note
             stub.annotations = annos
+            stub.legend_entries = [flateyes.parse_legend_entry(l)[0]
+                                   for l in legend]
             check("flateyes serializes the same chunk",
                   "# flateyes annotations\n"
                   + "\n".join(stub.serialize_annotations()) + "\n"
                   == extract_text(stamped))
+            check("legend lines parse identically in flateyes",
+                  [flateyes.serialize_legend_entry(
+                      flateyes.parse_legend_entry(l)[0]) for l in legend]
+                  == legend
+                  and [flateyes.parse_legend_entry(l)[0] for l in legend]
+                  == [parse_legend_line(l) for l in legend])
             lines = [l for l in (theirs or "").splitlines()
                      if l and not l.startswith("#")
-                     and not l.startswith(("ppu=", "unit=", "note="))]
+                     and not l.startswith(("ppu=", "unit=", "note=",
+                                           "legend="))]
             mirrored = []
             for entry in lines:
                 key, _, value = entry.partition("=")
@@ -980,14 +1114,17 @@ def selftest():
                       flateyes.Viewer.parse_anno_json(dict(o)))
                       for o in jsons])
             doc = {"ppu": 8.5, "unit": "um", "note": "문서 노트",
-                   "annotations": jsons}
+                   "legend": sample_legend, "annotations": jsons}
             ours = parse_json_document(dict(doc))
             theirs = flateyes.Viewer.parse_json_document(dict(doc))
             check("JSON document parses identically",
-                  ours[1:] == theirs[1:] == (8.5, "um", "문서 노트")
+                  ours[1:4] == theirs[1:4] == (8.5, "um", "문서 노트")
                   and [serialize_anno(a) for a in ours[0]]
                   == [flateyes.Viewer.serialize_anno(a)
-                      for a in theirs[0]])
+                      for a in theirs[0]]
+                  and ours[4]
+                  == [flateyes.serialize_legend_entry(e)
+                      for e in theirs[4]])
             flateyes.write_png_metadata(target, "# flateyes annotations\n"
                                         + "\n".join(lines) + "\n")
             with open(target, "rb") as handle:

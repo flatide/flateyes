@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.8.1"
+VERSION = "1.9.0"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -213,6 +213,84 @@ def parse_stack_file(path):
             return None, None, "ERR no such file: %s" % level["path"]
     levels.sort(key=lambda level: level["ppu"])
     return levels, unit, None
+
+
+LEGEND_BOX_STYLES = {"solid": "solid", "none": "none", "outline": "none",
+                     "empty": "none", "hatch": "hatch", "cross": "cross",
+                     "crosshatch": "cross", "dots": "dots", "dotted": "dots"}
+LEGEND_LINE_STYLES = {"solid": "solid", "dash": "dashed", "dashed": "dashed",
+                      "dot": "dotted", "dotted": "dotted"}
+
+
+def parse_legend_entry(line):
+    """One "kind COLOR [STYLE] LABEL..." legend definition line — the
+    text legend file format and the legend= metadata value alike.
+    Returns (entry, error); whitespace-splitting keeps labels free of
+    tabs/newlines, which the request protocol and chunk format need.
+    """
+    parts = line.split()
+    kind = parts[0].lower() if parts else ""
+    if kind not in ("box", "line"):
+        return None, "expected box or line, got: %s" % (parts[0] if parts
+                                                        else "nothing")
+    if len(parts) < 2:
+        return None, "missing color"
+    try:
+        color = Viewer.option_color(parts[1])
+    except ValueError as exc:
+        return None, str(exc)
+    styles = LEGEND_BOX_STYLES if kind == "box" else LEGEND_LINE_STYLES
+    style = "solid"
+    rest = parts[2:]
+    if rest and rest[0].lower() in styles:
+        style = styles[rest[0].lower()]
+        rest = rest[1:]
+    if not rest:
+        return None, "missing label"
+    return {"kind": kind, "color": color, "style": style,
+            "label": " ".join(rest)}, None
+
+
+def serialize_legend_entry(entry):
+    """Canonical definition line: the style always explicit, so a label
+    that starts with a style word survives the round trip."""
+    return "%s %s %s %s" % (entry["kind"], entry["color"],
+                            entry["style"], entry["label"])
+
+
+def parse_legend_text(text, origin):
+    """Parse a text legend definition: one entry per line, "#" comments.
+
+      box COLOR [STYLE] LABEL...     STYLE: solid (default), none
+                                     (outline only), hatch, cross, dots
+      line COLOR [STYLE] LABEL...    STYLE: solid (default), dashed,
+                                     dotted
+
+    COLOR is a palette name or #RRGGBB.  The label runs to the end of
+    the line (spaces allowed); a label starting with a style word needs
+    an explicit STYLE before it.  Returns (entries, error); origin
+    names the source in error messages.
+    """
+    entries = []
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        entry, error = parse_legend_entry(line)
+        if error:
+            return None, "ERR %s:%d: %s" % (origin, number, error)
+        entries.append(entry)
+    if not entries:
+        return None, "ERR %s: empty legend" % origin
+    return entries, None
+
+
+def parse_legend_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return parse_legend_text(handle.read(), path)
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, "ERR %s: %s" % (path, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -589,7 +667,7 @@ class Viewer(object):
 
     def __init__(self, server_sock, first_path, first_legend=None,
                  ppu=None, unit=None, stack=False, levels=None,
-                 annos=None, note=None):
+                 annos=None, note=None, legend_entries=None):
         self.server_sock = server_sock
         self.path = None
         self.capture_pending = False  # a Ctrl+C grab is waiting to run
@@ -796,7 +874,8 @@ class Viewer(object):
             b" color: #ffffff; padding: 4px 12px; border-radius: 4px; }"
             b"#flateyes-status { background-color: rgba(0,0,0,0.6);"
             b" color: #f0f0f0; padding: 2px 9px; border-radius: 4px;"
-            b" font-size: 11px; }")
+            b" font-size: 11px; }"
+            b"#flateyes-legend { background-color: rgba(0,0,0,0.78); }")
         for widget in (self.ruler_label, self.help_label, self.toast_label,
                        self.status_label, self.path_label, self.note_label):
             widget.get_style_context().add_provider(
@@ -850,12 +929,31 @@ class Viewer(object):
             adj.connect("value-changed",
                         lambda *a: self.update_view_overlays())
 
-        # Legend: optional second image overlaid at the bottom-right corner.
+        # Legend: optional second image, or a text-defined swatch table,
+        # overlaid at the bottom-right corner.
         self.legend_pixbuf = None
+        self.legend_entries = None
         self.legend_rendered = None
         self.legend_image = Gtk.Image()
+        # Text legend rows: pixbuf swatch + Gtk.Label (no cairo, so the
+        # text cannot be stamped into a pixbuf; widgets do the type).
+        self.legend_grid = Gtk.Grid()
+        self.legend_grid.set_column_spacing(7)
+        self.legend_grid.set_row_spacing(4)
+        for setter in (self.legend_grid.set_margin_start,
+                       self.legend_grid.set_margin_end,
+                       self.legend_grid.set_margin_top,
+                       self.legend_grid.set_margin_bottom):
+            setter(7)
+        legend_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        legend_box.add(self.legend_image)
+        legend_box.add(self.legend_grid)
+        legend_box.show()
         self.legend_frame = Gtk.Frame()
-        self.legend_frame.add(self.legend_image)
+        self.legend_frame.set_name("flateyes-legend")
+        self.legend_frame.get_style_context().add_provider(
+            css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self.legend_frame.add(legend_box)
         self.legend_frame.set_halign(Gtk.Align.END)
         self.legend_frame.set_valign(Gtk.Align.END)
         self.legend_frame.set_margin_end(12)
@@ -864,9 +962,12 @@ class Viewer(object):
 
         self.overlay = Gtk.Overlay()
         self.overlay.add(self.scroll)
-        self.overlay.add_overlay(self.legend_frame)
         self.overlay.add_overlay(self.hint_image)
         self.overlay.add_overlay(self.anno_image)
+        # The legend is an info overlay: it sits above the drawn
+        # annotations, but below the live ruler so a measurement into
+        # its corner stays readable.
+        self.overlay.add_overlay(self.legend_frame)
         self.overlay.add_overlay(self.ruler_line)
         self.overlay.add_overlay(self.ruler_label)
         self.overlay.add_overlay(self.snap_marker)
@@ -899,7 +1000,7 @@ class Viewer(object):
             start_folder = os.path.abspath(first_path)
         if start_folder is None:
             error = self.load(first_path, first_legend, stack=stack,
-                              levels=levels)
+                              levels=levels, legend_entries=legend_entries)
             if error != "OK":
                 sys.stderr.write("%s\n" % error)
                 sys.exit(1)
@@ -918,26 +1019,33 @@ class Viewer(object):
         if server_sock is not None:  # None with --multi: no request socket
             GLib.io_add_watch(server_sock.fileno(), GLib.IO_IN,
                               self.on_incoming)
+        try:    # GLib >= 2.80 moved the unix API into its own namespace;
+                # the GLib.unix_signal_add shim warns on every start
+            from gi.repository import GLibUnix
+            signal_add = GLibUnix.signal_add
+        except ImportError:  # older PyGObject: no GLibUnix typelib
+            signal_add = getattr(GLib, "unix_signal_add", None)
         for signum in (signal.SIGINT, signal.SIGTERM):
-            try:
-                GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signum,
-                                     lambda *a: (Gtk.main_quit(), False)[1])
-            except AttributeError:
-                pass
+            if signal_add is None:  # ancient PyGObject: terminal ^C only
+                break
+            signal_add(GLib.PRIORITY_DEFAULT, signum,
+                       lambda *a: (Gtk.main_quit(), False)[1])
 
     # -- image loading -----------------------------------------------------
 
     def open_request(self, path, legend=None, ppu=None, unit=None,
-                     stack=False, levels=None, annos=None, note=None):
+                     stack=False, levels=None, annos=None, note=None,
+                     legend_entries=None):
         """An incoming open: folders switch to the thumbnail browser,
         anything else loads as an image/stack."""
         if levels is None and not stack and os.path.isdir(path):
-            if annos or note:
+            if annos or note or legend_entries:
                 return "ERR annotations need an image, not a folder: %s" \
                     % path
             self.enter_browser(os.path.abspath(path))
             return "OK"
-        result = self.load(path, legend, ppu, unit, stack, levels)
+        result = self.load(path, legend, ppu, unit, stack, levels,
+                           legend_entries)
         if result == "OK":
             self.apply_request_annotations(annos or [])
             self.apply_request_note(note)
@@ -946,7 +1054,7 @@ class Viewer(object):
         return result
 
     def load(self, path, legend_path=None, ppu=None, unit=None, stack=False,
-             levels=None):
+             levels=None, legend_entries=None):
         stack = stack or levels is not None
         if not stack and os.path.isdir(path):
             # folders open in the thumbnail browser, never here
@@ -954,16 +1062,27 @@ class Viewer(object):
         if not os.path.isfile(path):
             return "ERR no such file: %s" % path
         # Decode the legend first so a bad legend leaves the window untouched.
+        # An image file overlays as-is; anything else is a text definition.
+        # legend_entries may also arrive pre-parsed (a --json legend); a
+        # text -l file wins over it, matching the other json fields.
         legend_pixbuf = None
         if legend_path:
             if not os.path.isfile(legend_path):
                 return "ERR no such file: %s" % legend_path
-            try:
-                legend_pixbuf = GdkPixbuf.Pixbuf.new_from_file(legend_path)
-                legend_pixbuf = legend_pixbuf.apply_embedded_orientation() \
-                    or legend_pixbuf
-            except GLib.Error as exc:
-                return "ERR %s: %s" % (legend_path, exc.message)
+            info = GdkPixbuf.Pixbuf.get_file_info(legend_path)
+            legend_fmt = info[0] if isinstance(info, tuple) else info
+            if legend_fmt is None:
+                legend_entries, error = parse_legend_file(legend_path)
+                if error:
+                    return error
+            else:
+                try:
+                    legend_pixbuf = GdkPixbuf.Pixbuf.new_from_file(
+                        legend_path)
+                    legend_pixbuf = legend_pixbuf.apply_embedded_orientation() \
+                        or legend_pixbuf
+                except GLib.Error as exc:
+                    return "ERR %s: %s" % (legend_path, exc.message)
         animation = None
         stack_unit = None
         if stack:
@@ -1025,8 +1144,13 @@ class Viewer(object):
             self.ppu = ppu
         if unit is not None:
             self.unit = unit
-        # The as-loaded state (request ppu included) is the clean baseline
-        # for the title's unsaved marker.
+        # A request text legend replaces the embedded one (Ctrl+S then
+        # persists it); without one the embedded legend restored above
+        # stays.  An image legend is a display-only overlay on top.
+        if legend_entries is not None:
+            self.legend_entries = legend_entries
+        # The as-loaded state (request ppu/legend included) is the clean
+        # baseline for the title's unsaved marker.
         self.saved_meta = self.serialize_annotations()
         self.anno_dirty = self.anno_notable = False
         self.legend_pixbuf = legend_pixbuf
@@ -1035,6 +1159,7 @@ class Viewer(object):
             self.render_legend()
         else:
             self.legend_image.clear()
+        self.build_text_legend()
         self.apply_legend_visibility()
         if self.pixbuf is not None:
             self.rescale()
@@ -1751,6 +1876,63 @@ class Viewer(object):
 
     # -- legend overlay ------------------------------------------------------
 
+    LEGEND_SWATCH = (36, 14)  # swatch pixbuf size in the text legend
+
+    def build_text_legend(self):
+        """Rebuild the swatch/label rows from self.legend_entries."""
+        for child in self.legend_grid.get_children():
+            child.destroy()
+        if not self.legend_entries:
+            return
+        for row, entry in enumerate(self.legend_entries):
+            swatch = Gtk.Image.new_from_pixbuf(self.legend_swatch(entry))
+            swatch.set_halign(Gtk.Align.START)
+            swatch.set_valign(Gtk.Align.CENTER)
+            label = Gtk.Label()
+            label.set_markup(
+                '<span foreground="#f0f0f0" size="small">%s</span>'
+                % GLib.markup_escape_text(entry["label"]))
+            label.set_halign(Gtk.Align.START)
+            self.legend_grid.attach(swatch, 0, row, 1, 1)
+            self.legend_grid.attach(label, 1, row, 1, 1)
+        self.legend_grid.show_all()
+
+    def legend_swatch(self, entry):
+        """One swatch pixbuf; the interior stays transparent so the
+        frame's dark backdrop reads as the pattern background."""
+        w, h = self.LEGEND_SWATCH
+        buf = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, w, h)
+        buf.fill(0x00000000)
+        rgba = self.color_rgba(entry["color"])
+        style = entry["style"]
+        if entry["kind"] == "line":
+            y = h // 2 - 1
+            if style == "solid":
+                self.fill_rect(buf, 0, y, w, 2, rgba)
+            else:
+                on, period = (5, 9) if style == "dashed" else (2, 5)
+                for x in range(0, w, period):
+                    self.fill_rect(buf, x, y, min(on, w - x), 2, rgba)
+            return buf
+        if style == "solid":
+            buf.fill(rgba)
+            return buf
+        if style in ("hatch", "cross"):
+            for x in range(w):
+                for y in range(h):
+                    if (x + y) % 5 == 0 or \
+                            (style == "cross" and (x - y) % 5 == 0):
+                        self.fill_rect(buf, x, y, 1, 1, rgba)
+        elif style == "dots":
+            for x in range(3, w - 2, 5):
+                for y in range(3, h - 2, 5):
+                    self.fill_rect(buf, x, y, 2, 2, rgba)
+        self.fill_rect(buf, 0, 0, w, 1, rgba)          # outline on top
+        self.fill_rect(buf, 0, h - 1, w, 1, rgba)
+        self.fill_rect(buf, 0, 0, 1, h, rgba)
+        self.fill_rect(buf, w - 1, 0, 1, h, rgba)
+        return buf
+
     def render_legend(self, alloc=None):
         """Scale the legend down (never up) to a corner-sized inset."""
         if self.legend_pixbuf is None:
@@ -1983,8 +2165,12 @@ class Viewer(object):
             self.note_label.hide()
 
     def apply_legend_visibility(self):
-        if self.legend_pixbuf is not None and self.info_visible:
-            self.legend_image.show()
+        if self.info_visible and (self.legend_pixbuf is not None
+                                  or self.legend_entries):
+            # A request image legend covers the (still saved) entries.
+            self.legend_image.set_visible(self.legend_pixbuf is not None)
+            self.legend_grid.set_visible(self.legend_pixbuf is None
+                                         and bool(self.legend_entries))
             self.legend_frame.show()
         else:
             self.legend_frame.hide()
@@ -2617,7 +2803,8 @@ class Viewer(object):
         selected = self.valid_selection()
         texts = [x for x in self.annotations if x["kind"] == "text"]
         rulers = [x for x in self.annotations if x["kind"] == "ruler"]
-        shapes = [x for x in self.annotations if x["kind"] != "text"]
+        shapes = [x for x in self.annotations
+                  if x["kind"] not in ("text", "ruler")]
         preview = None
         if self.anno_tool in ("box", "ellipse", "line") \
                 and self.anno_start is not None \
@@ -2646,7 +2833,7 @@ class Viewer(object):
                 if not self.anno_casing:
                     preview["casing"] = False
         if not self.draw_visible or self.rendered_size is None \
-                or not (shapes or preview or texts):
+                or not (shapes or rulers or preview or texts):
             self.anno_drawn = None
             self.anno_image.hide()
             for anno in self.annotations:
@@ -2681,6 +2868,12 @@ class Viewer(object):
             self.stamp_annotation(buf, shape, self.anno_highlight)
         if preview is not None:
             self.stamp_annotation(buf, preview, self.anno_highlight)
+        # Rulers stamp last: fills replace pixels (no blending), so a
+        # box drawn later would erase an earlier measurement line.
+        # Measurements stay readable above any shape, like the live
+        # ruler widget does.
+        for anno in rulers:
+            self.stamp_annotation(buf, anno)
         if selected is not None and selected["kind"] != "text":
             if selected["kind"] == "path":
                 corners = tuple(
@@ -3815,6 +4008,7 @@ class Viewer(object):
                 self.overlay.remove(anno["label"])
         self.annotations = []
         self.note = ""
+        self.legend_entries = None  # like the note: metadata, not request
         self.update_note_overlay()
         self.anno_undo = []
         self.anno_redo = []
@@ -3895,6 +4089,8 @@ class Viewer(object):
             lines.append("unit=%s" % self.unit)
         if self.note:
             lines.append("note=%s" % self.escape_meta(self.note))
+        lines.extend("legend=%s" % serialize_legend_entry(entry)
+                     for entry in self.legend_entries or [])
         lines.extend(self.serialize_anno(anno) for anno in self.annotations)
         return lines
 
@@ -3987,6 +4183,7 @@ class Viewer(object):
                 except OSError:
                     continue
         ppu_restored = False
+        legend_restored = []
         for raw in lines or []:
             line = raw.strip()
             if not line or line.startswith("#"):
@@ -4006,18 +4203,24 @@ class Viewer(object):
                     text = self.unescape_meta(value)
                     if text.strip():
                         self.note = text.strip()
+                elif key == "legend":
+                    entry, error = parse_legend_entry(value)
+                    if entry is not None:
+                        legend_restored.append(entry)
                 elif key in ("box", "ellipse", "line", "path", "ruler",
                              "text"):
                     self.attach_annotation(self.parse_anno_line(key, value))
             except ValueError:
                 continue  # skip malformed lines
+        if legend_restored:
+            self.legend_entries = legend_restored
         # Restored annotations enter the undo stack as adds, so "u"
         # deletes newest-first across restored and freshly drawn ones
         # alike (delete-last is folded into undo/redo).
         self.anno_undo.extend(("add", anno, None)
                               for anno in self.annotations)
         self.update_note_overlay()
-        if self.annotations or ppu_restored or self.note:
+        if self.annotations or ppu_restored or self.note or legend_restored:
             parts = []
             if self.annotations:
                 parts.append("%d annotation%s"
@@ -4028,6 +4231,8 @@ class Viewer(object):
                              % (self.trim_decimal(self.ppu, 4), self.unit))
             if self.note:
                 parts.append("note")
+            if legend_restored:
+                parts.append("legend")
             self.anno_rev += 1
             self.update_anno_overlay()
             self.show_toast(", ".join(parts) + " restored")
@@ -4426,12 +4631,14 @@ class Viewer(object):
     def parse_json_document(data):
         """A --json payload: either a plain array of annotation
         objects, or an object {"ppu": N, "unit": U, "note": TEXT,
-        "annotations": [...]} (every key optional) so one file carries
-        everything — the same document format fe_embed.py takes.
-        Returns (annos, ppu, unit, note); raises ValueError."""
+        "legend": [LINE, ...], "annotations": [...]} (every key
+        optional) so one file carries everything — the same document
+        format fe_embed.py takes.  Each legend LINE is one text legend
+        definition line ("box COLOR [STYLE] LABEL...").  Returns
+        (annos, ppu, unit, note, legend_entries); raises ValueError."""
         if isinstance(data, list):
             return ([Viewer.parse_anno_json(obj) for obj in data],
-                    None, None, None)
+                    None, None, None, None)
         if not isinstance(data, dict):
             raise ValueError("expected a JSON array or object")
         data = dict(data)
@@ -4453,6 +4660,18 @@ class Viewer(object):
             note = str(note)
             if not note.strip():
                 raise ValueError("empty note")
+        legend = data.pop("legend", None)
+        if legend is not None:
+            if not isinstance(legend, list) or not legend:
+                raise ValueError("\"legend\" must be a non-empty array "
+                                 "of definition lines")
+            parsed = []
+            for index, line in enumerate(legend):
+                entry, error = parse_legend_entry(str(line))
+                if error:
+                    raise ValueError("legend[%d]: %s" % (index, error))
+                parsed.append(entry)
+            legend = parsed
         annos = data.pop("annotations", [])
         if not isinstance(annos, list):
             raise ValueError("\"annotations\" must be an array")
@@ -4460,7 +4679,7 @@ class Viewer(object):
             raise ValueError("unknown fields: %s"
                              % ", ".join(sorted(data)))
         return ([Viewer.parse_anno_json(obj) for obj in annos],
-                ppu, unit, note)
+                ppu, unit, note, legend)
 
     def attach_annotation(self, anno):
         """Append one parsed annotation dict; texts and rulers get the
@@ -5042,6 +5261,7 @@ class Viewer(object):
             fields = line.split("\t")
             path = fields[0].strip()
             legend = ppu = unit = note = None
+            legend_entries = None
             stack = False
             inline = []   # ppu=/center= after a level= bind to that level
             annos = []    # annotations to draw once the image is open
@@ -5051,6 +5271,13 @@ class Viewer(object):
                 key, value = key.strip(), value.strip()
                 if key == "legend":
                     legend = value or None
+                elif key == "legendtext":
+                    # a --json legend: the definition lines themselves,
+                    # newline-escaped to fit one request field
+                    legend_entries, error = parse_legend_text(
+                        self.unescape_meta(value), "legend")
+                    if error:
+                        bad = error
                 elif key == "level":
                     inline.append({"path": value, "ppu": None,
                                    "center": (0.0, 0.0)})
@@ -5091,10 +5318,12 @@ class Viewer(object):
                 reply = bad
             elif inline:
                 reply = self.open_request(inline[0]["path"], legend, None,
-                                          unit, True, inline, annos, note)
+                                          unit, True, inline, annos, note,
+                                          legend_entries)
             elif path:
                 reply = self.open_request(path, legend, ppu, unit, stack,
-                                          annos=annos, note=note)
+                                          annos=annos, note=note,
+                                          legend_entries=legend_entries)
             else:
                 reply = "ERR empty request"
             try:
@@ -5132,7 +5361,21 @@ def usage(stream):
         "                            later runs without it still go to the\n"
         "                            primary instance, never to this window\n"
         "  -l, --legend LEGEND_FILE  overlay LEGEND_FILE at the bottom-right\n"
-        "                            corner; a request without -l removes it\n"
+        "                            corner.  An image file shows as-is\n"
+        "                            for this request only; any other\n"
+        "                            file is a text legend definition\n"
+        "                            drawn as swatch + label rows, one\n"
+        "                            entry per line (\"#\" comments):\n"
+        "                              box COLOR [STYLE] LABEL...\n"
+        "                              line COLOR [STYLE] LABEL...\n"
+        "                            COLOR as in the DRAW options; box\n"
+        "                            STYLE: solid (default), none (outline\n"
+        "                            only), hatch, cross, dots; line STYLE:\n"
+        "                            solid (default), dashed, dotted.\n"
+        "                            A text legend joins the metadata like\n"
+        "                            the drawn shapes: Ctrl+S embeds it\n"
+        "                            (legend= lines), and a file opened\n"
+        "                            without -l shows its embedded legend\n"
         "  -p, --ppu PPU             pixels per unit: the ruler converts\n"
         "                            distances with it (sticky per window);\n"
         "                            after --level it binds to that level\n"
@@ -5149,7 +5392,8 @@ def usage(stream):
         "DRAW options add annotations onto the opened image, on top of\n"
         "its saved ones; they behave like hand-drawn shapes (select,\n"
         "undo, ...) and stay unsaved until Ctrl+S.  Each may be repeated.\n"
-        "Coordinates are image pixels (stacks: world units, like the\n"
+        "Coordinates are image pixels with the origin at the image\n"
+        "CENTER, x right / y down (stacks: world units, like the\n"
         "ruler).  COLOR is a palette name (%s)\n"
         "or #RRGGBB; 0 = no outline (needs FILL).  FILL is a color, or\n"
         "#RRGGBBAA with AA >= 80 for an opaque fill (default none).\n"
@@ -5180,10 +5424,12 @@ def usage(stream):
         "                            objects (\"-\" = stdin), the same\n"
         "                            format fe_embed.py takes; added in\n"
         "                            option order like the DRAW options.\n"
-        "                            An object {ppu, unit, note,\n"
+        "                            An object {ppu, unit, note, legend,\n"
         "                            annotations} also carries the\n"
-        "                            metadata (explicit -p/-u/--note\n"
-        "                            win over the document's values)\n"
+        "                            metadata (explicit -p/-u/--note/-l\n"
+        "                            win over the document's values);\n"
+        "                            legend is an array of the definition\n"
+        "                            lines -l takes\n"
         "\n"
         "keys: +/- zoom, 0 actual size, f fit, Enter/F11 fullscreen,\n"
         "      ,/. next/prev image in the folder,\n"
@@ -5224,7 +5470,7 @@ def usage(stream):
         "      Ctrl+C copy the visible view (info hidden) to the clipboard,\n"
         "      Ctrl+Shift+C copy the image file path as text (stacks:\n"
         "             the level shown),\n"
-        "      Ctrl+S save the annotations and PPU (no autosave):\n"
+        "      Ctrl+S save the annotations, PPU and legend (no autosave):\n"
         "             embedded into a PNG image itself, to a .fe\n"
         "             sidecar file for other formats; browsing to\n"
         "             another image with unsaved changes asks first,\n"
@@ -5237,12 +5483,12 @@ def usage(stream):
 
 def parse_args(args):
     """Returns (path, legend, ppu, unit, is_stack, levels, annos, note,
-    multi) or an exit code.
+    legend_entries, multi) or an exit code.
 
     path is None when inline levels are given; is_stack marks a manifest.
     """
     legend = ppu = unit = stack_file = note = None
-    json_ppu = json_unit = json_note = None
+    json_ppu = json_unit = json_note = json_legend = None
     multi = False
     levels = []
     annos = []
@@ -5333,12 +5579,13 @@ def parse_args(args):
                         with open(took_value, "r",
                                   encoding="utf-8") as handle:
                             data = json.load(handle)
-                    extra, doc_ppu, doc_unit, doc_note = \
+                    extra, doc_ppu, doc_unit, doc_note, doc_legend = \
                         Viewer.parse_json_document(data)
                     annos.extend(extra)
                     json_ppu = doc_ppu if doc_ppu is not None else json_ppu
                     json_unit = doc_unit or json_unit
                     json_note = doc_note or json_note
+                    json_legend = doc_legend or json_legend
                 except (OSError, ValueError) as exc:
                     sys.stderr.write("%s: --json %s: %s\n"
                                      % (APP, took_value, exc))
@@ -5371,17 +5618,21 @@ def parse_args(args):
                 sys.stderr.write("%s: --level %s needs a --ppu\n"
                                  % (APP, meta["path"]))
                 return 2
-        return None, legend, None, unit, False, levels, annos, note, multi
+        return (None, legend, None, unit, False, levels, annos, note,
+                json_legend, multi)
     if stack_file is not None:
-        return stack_file, legend, ppu, unit, True, None, annos, note, multi
-    return paths[0], legend, ppu, unit, False, None, annos, note, multi
+        return (stack_file, legend, ppu, unit, True, None, annos, note,
+                json_legend, multi)
+    return (paths[0], legend, ppu, unit, False, None, annos, note,
+            json_legend, multi)
 
 
 def main(argv):
     parsed = parse_args(argv[1:])
     if isinstance(parsed, int):
         return parsed
-    path, legend, ppu, unit, stack, levels, annos, note, multi = parsed
+    path, legend, ppu, unit, stack, levels, annos, note, legend_entries, \
+        multi = parsed
 
     if levels is not None:
         for meta in levels:
@@ -5400,7 +5651,7 @@ def main(argv):
             sys.stderr.write("%s: no such file or folder: %s\n"
                              % (APP, path))
             return 1
-        if (annos or note) and os.path.isdir(path):
+        if (annos or note or legend_entries) and os.path.isdir(path):
             sys.stderr.write("%s: annotations need an image, not a "
                              "folder: %s\n" % (APP, path))
             return 2
@@ -5421,6 +5672,10 @@ def main(argv):
         fields = [path if levels is None else ""]
         if legend is not None:
             fields.append("legend=%s" % legend)
+        if legend_entries:
+            fields.append("legendtext=%s" % Viewer.escape_meta(
+                "\n".join(serialize_legend_entry(entry)
+                          for entry in legend_entries)))
         if ppu is not None:
             fields.append("ppu=%.10g" % ppu)
         if unit is not None:
@@ -5457,7 +5712,7 @@ def main(argv):
 
     import_gtk()
     Viewer(server, path if levels is None else levels[0]["path"],
-           legend, ppu, unit, stack, levels, annos, note)
+           legend, ppu, unit, stack, levels, annos, note, legend_entries)
     Gtk.main()
     return 0
 
