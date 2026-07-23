@@ -36,7 +36,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.6.2"
+VERSION = "1.6.3"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -630,6 +630,7 @@ class Viewer(object):
         self.thumb_source = None    # idle handler feeding them
         self.thumb_pending = 0      # decode jobs in flight
         self.thumb_generation = 0   # bumped whenever the queue is replaced
+        self.scan_generation = 0    # bumped whenever another scan starts
         self.thumb_pool = None      # worker threads, created on first browse
         # Cache warming: while an image is on screen its folder's
         # thumbnails are pre-generated in the background, so a later "b"
@@ -1146,7 +1147,11 @@ class Viewer(object):
 
     def populate_browser(self, folder, select=None):
         """One os.scandir deep: subfolders first, then this folder's
-        images.  Thumbnails stream in from an idle handler."""
+        images.  The scan runs on a worker thread and the rows land via
+        idle_add: enumerating a huge folder must not freeze the UI, and
+        NFS dirents often carry no d_type, degrading is_dir() to one
+        stat round trip per file.  Thumbnails then stream in the same
+        way."""
         folder = os.path.abspath(folder)
         self.browser_folder = folder
         self.browser_store.clear()
@@ -1155,32 +1160,59 @@ class Viewer(object):
         # is dropped so the workers belong to the visible screen.
         del self.warm_queue[:]
         self.warm_folder = folder
-        # A single scandir pass: entry.is_dir() reads the directory
-        # entry's type instead of stat()ing every file, which froze the
-        # UI for minutes on large folders of non-images (each stat is a
-        # round trip on NFS).
-        try:
-            entries = list(os.scandir(folder))
-        except OSError as exc:
-            entries = []
-            self.browser_status.set_text("cannot read folder: %s" % exc)
-        exts = image_extensions()
+        self.scan_generation += 1
+        self.window.set_title("%s - %s" % (folder, APP_TITLE))
+        self.browser_status.set_text("%s   reading..." % folder)
+        threading.Thread(
+            target=self.scan_folder_job, name="fe-scan", daemon=True,
+            args=(self.scan_generation, folder, select,
+                  image_extensions())).start()
+
+    def scan_folder_job(self, gen, folder, select, exts):
+        """Worker thread: enumerate and classify one folder, plus the
+        cloud-placeholder flags for the decode order (one stat per
+        image).  Touches only the filesystem; the store is left to the
+        main loop."""
+        error = None
         dirs = []
         image_names = []
-        for entry in entries:
-            name = entry.name
-            if name.startswith("."):
-                continue
-            try:
-                is_dir = entry.is_dir()
-            except OSError:
-                is_dir = False
-            if is_dir:
-                dirs.append(name)
-            elif os.path.splitext(name)[1].lstrip(".").lower() in exts:
-                image_names.append(name)
+        try:
+            for entry in os.scandir(folder):
+                if gen != self.scan_generation:
+                    return          # superseded: drop the walk half-way
+                name = entry.name
+                if name.startswith("."):
+                    continue
+                try:
+                    is_dir = entry.is_dir()
+                except OSError:
+                    is_dir = False
+                if is_dir:
+                    dirs.append(name)
+                elif os.path.splitext(name)[1].lstrip(".").lower() in exts:
+                    image_names.append(name)
+        except OSError as exc:
+            error = "cannot read folder: %s" % exc
         dirs.sort(key=natural_key)
         image_names.sort(key=natural_key)
+        dataless = set()
+        for name in image_names:
+            if gen != self.scan_generation:
+                return
+            if self.file_is_dataless(os.path.join(folder, name)):
+                dataless.add(name)
+        GLib.idle_add(self.deliver_folder_scan, gen, folder, select,
+                      dirs, image_names, dataless, error)
+
+    def deliver_folder_scan(self, gen, folder, select, dirs, image_names,
+                            dataless, error):
+        """Main loop: fill the browser rows from a finished scan; a
+        stale scan (folder changed again, browser left) is dropped."""
+        if gen != self.scan_generation or not self.browser_active \
+                or folder != self.browser_folder:
+            return False
+        if error:
+            self.browser_status.set_text(error)
         images = [os.path.join(folder, name) for name in image_names]
         parent = os.path.dirname(folder)
         if parent and parent != folder:
@@ -1202,7 +1234,8 @@ class Viewer(object):
         # Cloud placeholders decode last (each blocks a worker on an
         # on-demand download), so the locally-present thumbnails are not
         # stuck queued behind them.  Stable: natural order within groups.
-        self.thumb_queue.sort(key=lambda rp: self.file_is_dataless(rp[1]))
+        self.thumb_queue.sort(
+            key=lambda rp: os.path.basename(rp[1]) in dataless)
         self.pump_thumbs()
         if cursor is not None:
             tree_path = Gtk.TreePath(cursor)
@@ -1210,12 +1243,13 @@ class Viewer(object):
             self.browser_view.set_cursor(tree_path, None, False)
             GLib.idle_add(self.browser_view.scroll_to_path,
                           tree_path, True, 0.5, 0.5)
-        self.window.set_title("%s - %s" % (folder, APP_TITLE))
-        self.browser_status.set_text(
-            "%s   %d folder%s, %d image%s   "
-            "(Enter opens, BackSpace up, Esc back, q quits)"
-            % (folder, len(dirs), "" if len(dirs) == 1 else "s",
-               len(images), "" if len(images) == 1 else "s"))
+        if not error:
+            self.browser_status.set_text(
+                "%s   %d folder%s, %d image%s   "
+                "(Enter opens, BackSpace up, Esc back, q quits)"
+                % (folder, len(dirs), "" if len(dirs) == 1 else "s",
+                   len(images), "" if len(images) == 1 else "s"))
+        return False
 
     def reset_thumb_work(self):
         """Drop queued thumbnails and orphan the in-flight decodes: the
