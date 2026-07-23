@@ -1,0 +1,21 @@
+{
+  "ppu": 8.5,
+  "unit": "um",
+  "note": "캡처 장비 3호기\n조도 재확인",
+  "annotations": [
+    {"kind": "box", "x1": 120, "y1": 80, "x2": 420, "y2": 300,
+     "color": "red", "width": 2, "dash": "dashed"},
+    {"kind": "box", "x1": 40, "y1": 40, "x2": 90, "y2": 90,
+     "outline": false, "fill": "orange", "fill_opaque": true},
+    {"kind": "ellipse", "a": [500, 100], "b": [640, 200],
+     "color": "#35C5FF", "fill": "sky", "casing": false},
+    {"kind": "line", "x1": 0, "y1": 0, "x2": 300, "y2": 200,
+     "color": "green", "width": 4, "dash": "dotted"},
+    {"kind": "path", "points": [[30, 300], [120, 260], [120, 380], [260, 380]],
+     "color": "pink", "width": 2},
+    {"kind": "ruler", "x1": 100, "y1": 500, "x2": 400, "y2": 500},
+    {"kind": "text", "x": 120, "y": 50, "text": "DEFECT #17",
+     "size": 20, "color": "white", "bg_color": "black", "bg_opaque": true},
+    {"kind": "text", "at": [500, 220], "text": "배경 없는 라벨", "bg": false}
+  ]
+}

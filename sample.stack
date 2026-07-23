@@ -1,0 +1,7 @@
+unit=um
+level=level1_5x.png
+ppu=0.8
+level=level2_20x.png
+ppu=3.2
+level=level3_50x.png
+ppu=8
