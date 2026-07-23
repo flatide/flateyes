@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -1019,17 +1019,32 @@ class Viewer(object):
         if server_sock is not None:  # None with --multi: no request socket
             GLib.io_add_watch(server_sock.fileno(), GLib.IO_IN,
                               self.on_incoming)
-        try:    # GLib >= 2.80 moved the unix API into its own namespace;
-                # the GLib.unix_signal_add shim warns on every start
+        # SIGINT/SIGTERM end Gtk.main cleanly.  GLib >= 2.80 moved the
+        # unix API into its own GLibUnix namespace (the GLib shim then
+        # warns on every start), but which names the typelib exports
+        # varies by GLib version (signal_add vs signal_add_full only) -
+        # probe the candidates in order, deprecated shim last.
+        candidates = []
+        try:
+            import gi
+            gi.require_version("GLibUnix", "2.0")
             from gi.repository import GLibUnix
-            signal_add = GLibUnix.signal_add
-        except ImportError:  # older PyGObject: no GLibUnix typelib
-            signal_add = getattr(GLib, "unix_signal_add", None)
+        except (ImportError, ValueError):
+            pass  # no GLibUnix typelib: older PyGObject
+        else:
+            for name in ("signal_add", "signal_add_full"):
+                if hasattr(GLibUnix, name):
+                    candidates.append(getattr(GLibUnix, name))
+        if hasattr(GLib, "unix_signal_add"):
+            candidates.append(GLib.unix_signal_add)
+        quit_main = lambda *a: (Gtk.main_quit(), False)[1]  # noqa: E731
         for signum in (signal.SIGINT, signal.SIGTERM):
-            if signal_add is None:  # ancient PyGObject: terminal ^C only
-                break
-            signal_add(GLib.PRIORITY_DEFAULT, signum,
-                       lambda *a: (Gtk.main_quit(), False)[1])
+            for func in candidates:  # empty: terminal ^C only
+                try:
+                    func(GLib.PRIORITY_DEFAULT, signum, quit_main)
+                    break
+                except TypeError:   # unexpected introspected signature
+                    continue
 
     # -- image loading -----------------------------------------------------
 
