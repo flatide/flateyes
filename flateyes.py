@@ -18,6 +18,7 @@ Usage:
   DISPLAY=:1 flateyes.py /path/to/image.jpg
 """
 
+import bisect
 import errno
 import hashlib
 import json
@@ -36,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.6.3"
+VERSION = "1.6.4"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -631,6 +632,7 @@ class Viewer(object):
         self.thumb_pending = 0      # decode jobs in flight
         self.thumb_generation = 0   # bumped whenever the queue is replaced
         self.scan_generation = 0    # bumped whenever another scan starts
+        self.browser_dir_keys = []  # natural_key of each shown subfolder
         self.thumb_pool = None      # worker threads, created on first browse
         # Cache warming: while an image is on screen its folder's
         # thumbnails are pre-generated in the background, so a later "b"
@@ -1150,11 +1152,15 @@ class Viewer(object):
         images.  The scan runs on a worker thread and the rows land via
         idle_add: enumerating a huge folder must not freeze the UI, and
         NFS dirents often carry no d_type, degrading is_dir() to one
-        stat round trip per file.  Thumbnails then stream in the same
-        way."""
+        stat round trip per file.  The ".." row goes up at once and
+        subfolders stream in as the walk finds them, so a slow folder
+        can be left or descended while it still reads; the images land
+        together at the end, and their thumbnails then stream in the
+        same way."""
         folder = os.path.abspath(folder)
         self.browser_folder = folder
         self.browser_store.clear()
+        self.browser_dir_keys = []  # natural_key of each shown subfolder
         self.reset_thumb_work()
         # The browser itself fills this folder's cache; pending warm work
         # is dropped so the workers belong to the visible screen.
@@ -1163,6 +1169,10 @@ class Viewer(object):
         self.scan_generation += 1
         self.window.set_title("%s - %s" % (folder, APP_TITLE))
         self.browser_status.set_text("%s   reading..." % folder)
+        parent = os.path.dirname(folder)
+        if parent and parent != folder:
+            self.browser_store.append(
+                [self.browser_icon("up"), "..", parent, True])
         threading.Thread(
             target=self.scan_folder_job, name="fe-scan", daemon=True,
             args=(self.scan_generation, folder, select,
@@ -1172,9 +1182,9 @@ class Viewer(object):
         """Worker thread: enumerate and classify one folder, plus the
         cloud-placeholder flags for the decode order (one stat per
         image).  Touches only the filesystem; the store is left to the
-        main loop."""
+        main loop.  Subfolders are handed over one by one as they turn
+        up, everything else once the walk is done."""
         error = None
-        dirs = []
         image_names = []
         try:
             for entry in os.scandir(folder):
@@ -1188,12 +1198,12 @@ class Viewer(object):
                 except OSError:
                     is_dir = False
                 if is_dir:
-                    dirs.append(name)
+                    GLib.idle_add(self.deliver_folder_dir, gen, folder,
+                                  name)
                 elif os.path.splitext(name)[1].lstrip(".").lower() in exts:
                     image_names.append(name)
         except OSError as exc:
             error = "cannot read folder: %s" % exc
-        dirs.sort(key=natural_key)
         image_names.sort(key=natural_key)
         dataless = set()
         for name in image_names:
@@ -1202,11 +1212,28 @@ class Viewer(object):
             if self.file_is_dataless(os.path.join(folder, name)):
                 dataless.add(name)
         GLib.idle_add(self.deliver_folder_scan, gen, folder, select,
-                      dirs, image_names, dataless, error)
+                      image_names, dataless, error)
 
-    def deliver_folder_scan(self, gen, folder, select, dirs, image_names,
+    def deliver_folder_dir(self, gen, folder, name):
+        """Main loop: one subfolder found mid-scan, inserted at its
+        sorted slot right away.  The images only land after the last of
+        these (idle callbacks fire in post order), so the row indices
+        the thumbnail queue keeps stay stable."""
+        if gen != self.scan_generation or not self.browser_active \
+                or folder != self.browser_folder:
+            return False
+        key = natural_key(name)
+        index = bisect.bisect_left(self.browser_dir_keys, key)
+        self.browser_dir_keys.insert(index, key)
+        offset = len(self.browser_store) - len(self.browser_dir_keys) + 1
+        self.browser_store.insert(
+            offset + index, [self.browser_icon("folder"), name,
+                             os.path.join(folder, name), True])
+        return False
+
+    def deliver_folder_scan(self, gen, folder, select, image_names,
                             dataless, error):
-        """Main loop: fill the browser rows from a finished scan; a
+        """Main loop: finish the browser rows from a completed scan; a
         stale scan (folder changed again, browser left) is dropped."""
         if gen != self.scan_generation or not self.browser_active \
                 or folder != self.browser_folder:
@@ -1214,14 +1241,6 @@ class Viewer(object):
         if error:
             self.browser_status.set_text(error)
         images = [os.path.join(folder, name) for name in image_names]
-        parent = os.path.dirname(folder)
-        if parent and parent != folder:
-            self.browser_store.append(
-                [self.browser_icon("up"), "..", parent, True])
-        for name in dirs:
-            self.browser_store.append(
-                [self.browser_icon("folder"), name,
-                 os.path.join(folder, name), True])
         cursor = None
         for path in images:
             row = len(self.browser_store)
@@ -1244,10 +1263,11 @@ class Viewer(object):
             GLib.idle_add(self.browser_view.scroll_to_path,
                           tree_path, True, 0.5, 0.5)
         if not error:
+            ndirs = len(self.browser_dir_keys)
             self.browser_status.set_text(
                 "%s   %d folder%s, %d image%s   "
                 "(Enter opens, BackSpace up, Esc back, q quits)"
-                % (folder, len(dirs), "" if len(dirs) == 1 else "s",
+                % (folder, ndirs, "" if ndirs == 1 else "s",
                    len(images), "" if len(images) == 1 else "s"))
         return False
 
