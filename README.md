@@ -195,19 +195,20 @@ line red    dashed metal route
 이미지 위에 표시용 주석을 얹을 수 있다. 주석은 이미지 좌표(스택은 um 좌표)에
 고정되어 확대/스크롤/레벨 전환을 그대로 따라간다.
 
-- `d`(도형 그리기): 대화상자에서 도형 종류(box·ellipse·line·path)와 스타일을
-  함께 고르고 확인하면 그리기 모드가 시작된다. 스타일은 outline 색(윤곽선 —
-  line/path 도형을 고르면 행 라벨이 "line"으로 바뀌어 선 색이 된다)과 fill
-  색(박스·타원 내부)을 공통 팔레트(black·white·red·orange·green·sky·pink,
-  색 견본 표시)에서 고르고, 각 행의 "use" 체크로 윤곽선/채우기 사용 여부를,
+- `d`(도형 그리기): 대화상자에서 도형 종류(box·ellipse·line·path·polygon)와
+  스타일을 함께 고르고 확인하면 그리기 모드가 시작된다. 스타일은 outline
+  색(윤곽선 — line/path 도형을 고르면 행 라벨이 "line"으로 바뀌어 선 색이
+  된다)과 fill 색(박스·타원·폴리곤 내부)을 공통
+  팔레트(black·white·red·orange·green·sky·pink, 색 견본 표시)에서 고르고,
+  각 행의 "use" 체크로 윤곽선/채우기 사용 여부를,
   "% opacity" 스핀(1~100%, 기본 35%)으로 채우기의 불투명도를 정한다 —
   100%면 완전 불투명, 낮을수록 이미지가 더 비쳐 보인다. "black halo" 체크는
   윤곽선·라인을 둘러싸는 검은 테두리 여부다 (색이 배경에 묻히지 않게 하는
   용도, 기본 켜짐). 도형이 안 보이는 조합을 막기 위해 윤곽선과 채우기 중
   마지막 남은 하나는 끌 수 없고, 선(line·path)은 항상 라인 색으로 그려진다.
-  굵기("width" 1~8px)와 선 종류(solid/dashed/dotted)는 라인·패쓰와 박스·타원
-  윤곽선에 공통으로 적용된다. 선택은 이후 그리는 도형에 적용된다 (기존 주석은
-  유지, 마지막 설정 기억).
+  굵기("width" 1~8px)와 선 종류(solid/dashed/dotted)는 라인·패쓰와
+  박스·타원·폴리곤 윤곽선에 공통으로 적용된다. 선택은 이후 그리는 도형에
+  적용된다 (기존 주석은 유지, 마지막 설정 기억).
   그리기는 클릭 두 번으로 두 모서리(라인은 양 끝점)를 지정한다 (포인트는
   버튼을 뗄 때 찍히고, 드래그는 패닝). 첫 클릭 후 미리보기가 표시되며,
   `Shift`를 누르면 박스·타원은 정사각형/정원, 라인은 수평/수직/45°로 고정된다.
@@ -219,6 +220,11 @@ line red    dashed metal route
   누르면 모드가 끝난다. `Shift` 클릭은 직전 꼭짓점 기준 수평/수직/45° 고정.
   드래그 패닝은 그리는 중에도 그대로 동작한다. 선택(`s`) 후 `e`를 누르면
   꼭짓점을 최신 것부터 하나씩 순회하며 방향키로 개별 이동할 수 있다.
+- **polygon(다각형)**: path와 같은 방식으로 꼭짓점을 찍고 더블클릭/`Enter`로
+  확정하면(3개 이상) 첫 점으로 닫힌 다각형이 된다. 박스·타원처럼 내부
+  채우기(색·불투명도)를 쓸 수 있고 오목(concave) 다각형도 지원한다 —
+  채움은 even-odd 규칙. 윤곽선/채우기·선 스타일·선택/편집 동작은 다른
+  도형과 동일하다.
 - `t`(텍스트): 클릭한 위치에 대화상자로 텍스트와 폰트 크기(6~96pt)를 입력한다.
   여러 줄 입력 가능 — `Enter`는 줄바꿈, `Ctrl+Enter`가 확인. 글자 색("text")과
   배경("background" 사용 여부·색·"opaque" 불투명 여부)을 대화상자 안의 콤보로
@@ -255,7 +261,7 @@ line red    dashed metal route
 - `u`/`y`: 실행 취소/다시 실행 — `u`가 최신 주석부터 하나씩 지우고 `y`가 되살린다.
   파일에서 복원된 주석도 똑같이 지울 수 있다. 모드 종료는 `Esc`
   (`t`/`r`은 재입력으로도 종료).
-- `h`: **도형 강조** 토글 — 그려진 도형(box·ellipse·line·path)의 선이
+- `h`: **도형 강조** 토글 — 그려진 도형(box·ellipse·line·path·polygon)의 선이
   2px 굵어지고 halo가 형광 녹색으로 바뀌어 복잡한 이미지 위에서도 한눈에
   띈다. 텍스트와 측정(ruler)은 그대로 둔다. 표시 효과일 뿐 저장되는 주석
   데이터는 바뀌지 않으며, 드로잉이 숨겨진 상태(`Tab`)에서 켜면 드로잉도
@@ -314,6 +320,7 @@ flateyes --box X1,Y1,X2,Y2[,COLOR[,FILL[,WIDTH[,DASH]]]] image.png
 flateyes --ellipse X1,Y1,X2,Y2[,COLOR[,FILL[,WIDTH[,DASH]]]] image.png
 flateyes --line X1,Y1,X2,Y2[,COLOR[,WIDTH[,DASH]]] image.png
 flateyes --path X1,Y1,X2,Y2[,X3,Y3...][,COLOR[,WIDTH[,DASH]]] image.png
+flateyes --polygon X1,Y1,X2,Y2,X3,Y3[,X4,Y4...][,COLOR[,FILL[,WIDTH[,DASH]]]] image.png
 flateyes --ruler X1,Y1,X2,Y2 image.png
 flateyes --text X,Y[,STYLE...],TEXT image.png
 flateyes --note TEXT image.png
@@ -332,6 +339,9 @@ flateyes --json annos.json image.png
   (또는 0/1/2, 기본 solid).
 - `--path`는 나열한 좌표를 순서대로 잇는 연속 선분(꼭짓점 2개 이상)이다 —
   숫자가 아닌 첫 필드부터 COLOR·WIDTH·DASH 스타일로 읽는다.
+- `--polygon`은 나열한 좌표(꼭짓점 3개 이상)를 첫 점으로 닫은 다각형이다 —
+  COLOR 뒤에 박스처럼 FILL을 받는다 (COLOR `0`이면 윤곽선 없음, FILL 필수).
+  오목 다각형 가능.
 - `--ruler`는 확정된 측정으로 추가되어 현재 PPU/단위로 환산 표시된다
   (`--ppu`와 조합 가능).
 - `--text`의 STYLE 자리에는 `size=`(6~96), `color=`(COLOR와 동일 규칙),
@@ -434,6 +444,7 @@ black·white·red·orange·green·sky·pink 또는 `#RRGGBB`):
 | `box` / `ellipse` | 좌표 | *color*(기본 red), *width*(1~8, 기본 1), *dash*(`solid`/`dashed`/`dotted`, 기본 solid), *casing*(검은 테두리, 기본 true), *fill*(채움 색, 기본 없음), *fill_alpha*(내부 알파 0~255, 기본 89=35%), *outline*(false면 윤곽선 없음 — fill 필수) |
 | `line` | 좌표 | *color*, *width*, *dash*, *casing* (box와 동일) |
 | `path` | `points`(`[[x, y], ...]` 2개 이상, 순서대로 잇는 연속 선분) | *color*, *width*, *dash*, *casing* (line과 동일) |
+| `polygon` | `points`(`[[x, y], ...]` 3개 이상, 첫 점으로 닫힘) | *color*, *width*, *dash*, *casing* (line과 동일) + *fill*, *fill_alpha*, *outline* (box와 동일) |
 | `ruler` | 좌표 | 없음 (ppu/unit로 환산 표시) |
 | `text` | `text`, 위치 | *size*(6~96, 기본 16), *color*(기본 red), *bg*(배경 사용, 기본 true), *bg_color*(기본 black), *bg_opaque*(기본 false=반투명 0.35) |
 
@@ -560,12 +571,12 @@ sudo -u tduser DISPLAY=:1 XAUTHORITY=/home/tduser/.Xauthority \
 | `o` | 다음 레벨 영역 외곽선 표시/숨김 |
 | `r` | ruler 측정 모드 시작/종료 (`Shift` 자유 방향, `Ctrl` 진행 중인 방향 고정 — 스냅 축 또는 자유 각도). `m`으로 엣지 스냅을 켜면 측정점이 주변의 가장 뚜렷한 밝기 경계로 서브픽셀 정밀도로 붙으며, 첫 점은 십자 마커로 스냅 위치를 미리 보여준다 (평탄한 영역에서는 동작 안 함) |
 | `m` | ruler 엣지 스냅 켜기/끄기 (기본 꺼짐) — 켠 상태는 뷰어를 닫을 때까지 유지된다 |
-| `d` | 도형 그리기 — 대화상자에서 도형 종류(box/ellipse/line/path)와 외곽선(use·색)·검은 테두리(black halo)·박스/타원 채우기(use·색·opaque)·선 스타일(굵기 1~8px, solid/dashed/dotted — 라인·윤곽선 공통)을 고르면 그리기 모드가 시작된다 (`Shift` 클릭은 정사각형·정원·수평/수직/45°, 종료는 `Esc`). path는 클릭마다 꼭짓점을 추가하고 더블클릭/`Enter`로 확정, 그리던 중 `Esc`는 취소. 윤곽선·채우기 중 하나는 항상 켜져 있으며 텍스트 스타일은 `t` 대화상자에서 별도 선택 |
+| `d` | 도형 그리기 — 대화상자에서 도형 종류(box/ellipse/line/path/polygon)와 외곽선(use·색)·검은 테두리(black halo)·박스/타원/폴리곤 채우기(use·색·% opacity)·선 스타일(굵기 1~8px, solid/dashed/dotted — 라인·윤곽선 공통)을 고르면 그리기 모드가 시작된다 (`Shift` 클릭은 정사각형·정원·수평/수직/45°, 종료는 `Esc`). path/polygon은 클릭마다 꼭짓점을 추가하고 더블클릭/`Enter`로 확정(폴리곤은 3점 이상, 첫 점으로 닫힘), 그리던 중 `Esc`는 취소. 윤곽선·채우기 중 하나는 항상 켜져 있으며 텍스트 스타일은 `t` 대화상자에서 별도 선택 |
 | `t` | 텍스트 주석 — 클릭 위치에 입력, 폰트 크기·글자 색·배경(사용/색/불투명)을 대화상자에서 직접 선택 (실시간 미리보기, 도형 설정과 별개) |
 | `n` | 노트 — 이미지 전체에 대한 메모 입력/수정. 위치·크기·색상이 없고 좌상단(키 안내 아래)에 정보 칩으로 고정 표시된다. 내용을 비우고 OK 하면 제거, `Ctrl+S`로 주석과 함께 저장 |
 | `s` / `Shift+s` | 주석 선택 순회 (최신부터 / 반대 방향) — 선택 중에는 방향키가 주석을 이동(`Shift`+방향키는 10px)하고 `e`가 수정(도형은 크기 조절 앵커 순회, 텍스트는 입력 대화상자 재열기), `Delete`/`BackSpace`가 삭제, `Esc`가 해제한다. 이동·수정·삭제도 `u`/`y`로 되돌릴 수 있다 |
 | `u` / `y` | 주석 실행 취소 / 다시 실행 — `u`가 최신 주석부터 하나씩 지우고(파일에서 복원된 주석 포함) `y`가 되살린다. 새 주석을 그리면 다시 실행 이력은 사라진다 |
-| `h` | 도형 강조 토글 — box/ellipse/line/path의 선을 2px 굵게, halo를 형광 녹색으로 표시해 눈에 띄게 한다 (텍스트·ruler 제외, 표시 효과일 뿐 저장 데이터는 그대로) |
+| `h` | 도형 강조 토글 — box/ellipse/line/path/polygon의 선을 2px 굵게, halo를 형광 녹색으로 표시해 눈에 띄게 한다 (텍스트·ruler 제외, 표시 효과일 뿐 저장 데이터는 그대로) |
 | `Ctrl+C` | 보이는 화면을 클립보드에 복사 — 정보 표시(키 안내·상태·경로·legend·외곽선·노트)는 자동으로 빼고 주석·측정선은 화면 그대로(`Tab` 토글 반영) 캡처. 뷰어가 selection을 직접 서비스하므로(클립보드 매니저에 이관하면 원격 X 환경에서 이미지 타깃이 유실될 수 있음) 복사본은 뷰어가 떠 있는 동안 유효하다 |
 | `Ctrl+Shift+C` | 현재 보고 있는 이미지의 전체 경로를 텍스트로 클립보드에 복사 (스택은 화면에 표시 중인 레벨 이미지의 경로). 이미지 복사와 마찬가지로 뷰어가 떠 있는 동안 유효하다 |
 | `Ctrl+S` | 주석·PPU·텍스트 범례 메타데이터 저장 — 자동 저장이 없으므로 이 명시적 저장이 유일한 보존 수단이다. PNG는 원본 파일 안에 `iTXt` 청크로 내장하고(픽셀은 그대로, 다른 뷰어에서도 평범한 PNG로 열리며 파일을 복사하면 주석이 함께 이동), 그 외 포맷은 `<이미지경로>.fe` 사이드카에 저장한다(읽기 전용이면 `~/.cache/flateyes/`). 주석이 없는 상태에서 누르면 저장된 메타데이터를 제거한다 |

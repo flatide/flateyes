@@ -3,7 +3,8 @@
 
 Standalone companion to flateyes.py for services that produce PNGs in
 bulk (e.g. automated capture) and want each file to carry its markers
-(boxes, ellipses, lines, texts, rulers) the moment it is written.
+(boxes, ellipses, lines, paths, polygons, texts, rulers) the moment it
+is written.
 flateyes then shows them on open, and Ctrl+S keeps editing the same
 chunk.  Python standard library only — deployment is copying this one
 file, same as flateyes.py itself.
@@ -177,6 +178,36 @@ def path(points, color=DEFAULT_LINE, width=1, dash="solid", casing=True):
     return anno
 
 
+def polygon(points, color=DEFAULT_LINE, fill=None, outline=True, width=1,
+            dash="solid", casing=True, fill_alpha=None):
+    """Closed shape through 3+ (x, y) points, filled like a box."""
+    pts = [(float(p[0]), float(p[1])) for p in points]
+    if len(pts) < 3:
+        raise ValueError("polygon needs 3+ points")
+    if not 1 <= int(width) <= 8:
+        raise ValueError("width must be 1-8, got: %r" % (width,))
+    anno = {"kind": "polygon", "points": pts, "color": _color(color),
+            "width": int(width), "dash": _dash(dash)}
+    if not casing:
+        anno["casing"] = False
+    if fill_alpha is not None:
+        try:
+            fill_alpha = int(fill_alpha)
+        except (TypeError, ValueError):
+            fill_alpha = -1
+        if not 0 <= fill_alpha <= 255:
+            raise ValueError("fill_alpha must be 0-255")
+    if fill is not None:
+        anno["fill"] = _color(fill, "fill")
+        anno["fill_alpha"] = fill_alpha if fill_alpha is not None \
+            else TRANSLUCENT_ALPHA
+    if not outline:
+        if fill is None:
+            raise ValueError("outline=False needs a fill")
+        anno["outline"] = False
+    return anno
+
+
 def text(x, y, content, size=16, color=DEFAULT_LINE, bg=True,
          bg_color=DEFAULT_BG, bg_opaque=False):
     """Text note anchored at (x,y); "\\n" in content starts a new line."""
@@ -284,15 +315,24 @@ def serialize_anno(anno):
         return ("ruler=%.10g,%.10g,%.10g,%.10g"
                 % (anno["a"][0], anno["a"][1], anno["b"][0], anno["b"][1]))
     color = anno.get("color", DEFAULT_LINE)
-    if anno["kind"] == "path":
+    if anno["kind"] in ("path", "polygon"):
         # variable-length coordinate list, then the same style tail as
-        # the fixed shapes ("0" = the reserved fill slot)
+        # the fixed shapes (a path's fill slot stays a reserved "0";
+        # a polygon fills like a box)
+        if anno["kind"] == "polygon" and anno.get("fill"):
+            fill = "%s%02X" % (anno["fill"],
+                               anno.get("fill_alpha", TRANSLUCENT_ALPHA))
+        else:
+            fill = "0"
+        if not anno.get("outline", True):
+            color = "0"
         extra = ",%d,%d" % (anno.get("width", 1), anno.get("dash", 0))
         if not anno.get("casing", True):
             extra += ",0"
-        return ("path=%s,%s,0%s"
-                % (",".join("%.10g,%.10g" % (p[0], p[1])
-                            for p in anno["points"]), color, extra))
+        return ("%s=%s,%s,%s%s"
+                % (anno["kind"],
+                   ",".join("%.10g,%.10g" % (p[0], p[1])
+                            for p in anno["points"]), color, fill, extra))
     if anno["kind"] == "text":
         if anno.get("bg", True):
             backdrop = "%s%02X" % (anno.get("bg_color", DEFAULT_BG),
@@ -359,7 +399,7 @@ def parse_anno_line(key, value):
         ax, ay, bx, by = value.split(",")[:4]
         return {"kind": "ruler", "a": (float(ax), float(ay)),
                 "b": (float(bx), float(by))}
-    if key == "path":
+    if key in ("path", "polygon"):
         # the coordinate list runs until the first non-number (the
         # color); the style fields after it match the fixed shapes
         parts = value.split(",")
@@ -371,13 +411,30 @@ def parse_anno_line(key, value):
             except ValueError:
                 break
             index += 1
-        if len(coords) < 4 or len(coords) % 2 or index >= len(parts):
-            raise ValueError("bad path: %s" % value)
-        anno = {"kind": "path",
+        if len(coords) % 2 and coords and parts[index - 1].strip() == "0":
+            # the numeric "0" no-outline sentinel in the color slot was
+            # scanned as a coordinate; give it back
+            coords.pop()
+            index -= 1
+        if len(coords) < (6 if key == "polygon" else 4) \
+                or len(coords) % 2 or index >= len(parts):
+            raise ValueError("bad %s: %s" % (key, value))
+        anno = {"kind": key,
                 "points": [(coords[i], coords[i + 1])
                            for i in range(0, len(coords), 2)],
                 "color": _parse_color(parts[index])}
-        tail = parts[index + 1:]   # fill (reserved), width, dash, halo
+        if key == "polygon" and parts[index].strip() == "0":
+            anno["outline"] = False
+        tail = parts[index + 1:]   # fill, width, dash, halo (the fill
+        if tail and key == "polygon":  # slot is "0" for paths)
+            fill = tail[0].strip()
+            if fill.startswith("#") and len(fill) == 9:
+                try:
+                    int(fill[1:9], 16)
+                    anno["fill"] = fill[:7]
+                    anno["fill_alpha"] = int(fill[7:9], 16)
+                except ValueError:
+                    pass
         if len(tail) > 1:
             try:
                 anno["width"] = max(1, min(int(float(tail[1])), 8))
@@ -459,8 +516,8 @@ def parse_metadata(text):
             elif key == "legend":
                 line = serialize_legend(parse_legend_line(value))
                 legend = (legend or []) + [line]
-            elif key in ("box", "ellipse", "line", "path", "ruler",
-                         "text"):
+            elif key in ("box", "ellipse", "line", "path", "polygon",
+                         "ruler", "text"):
                 annos.append(parse_anno_line(key, value))
         except ValueError:
             continue
@@ -675,7 +732,7 @@ def parse_anno_option(kind, value):
                 kwargs["bg_opaque"] = False
             rest = tail
         return text(parts[0], parts[1], unescape_meta(rest), **kwargs)
-    if kind == "path":
+    if kind in ("path", "polygon"):
         parts = [part.strip() for part in value.split(",")]
         coords = []
         while parts:
@@ -684,18 +741,41 @@ def parse_anno_option(kind, value):
             except ValueError:
                 break
             parts.pop(0)
-        if len(coords) < 4 or len(coords) % 2:
-            raise ValueError("expects X1,Y1,X2,Y2[,X3,Y3...]")
+        if len(coords) % 2 and coords and coords[-1] == 0:
+            # the "0" no-outline sentinel scanned as a coordinate
+            coords.pop()
+            parts.insert(0, "0")
+        if len(coords) < (6 if kind == "polygon" else 4) \
+                or len(coords) % 2:
+            raise ValueError("expects X1,Y1,X2,Y2,X3,Y3[,X4,Y4...]"
+                             if kind == "polygon" else
+                             "expects X1,Y1,X2,Y2[,X3,Y3...]")
         kwargs = {}
         if parts:
-            kwargs["color"] = parts.pop(0)
+            color = parts.pop(0)
+            if kind == "polygon" and color == "0":
+                kwargs["outline"] = False
+            elif color:
+                kwargs["color"] = color
+        if kind == "polygon" and parts:  # FILL, like a box
+            fill = parts.pop(0)
+            if fill.startswith("#") and len(fill) == 9:
+                try:
+                    int(fill[1:9], 16)
+                except ValueError:
+                    raise ValueError("bad fill: %s" % fill)
+                kwargs["fill"] = fill[:7]
+                kwargs["fill_alpha"] = int(fill[7:9], 16)
+            elif fill not in ("", "0"):
+                kwargs["fill"] = fill
         if parts:
             kwargs["width"] = int(parts.pop(0))
         if parts:
             kwargs["dash"] = parts.pop(0)
         if parts:
             raise ValueError("too many fields: %s" % ",".join(parts))
-        return path(list(zip(coords[0::2], coords[1::2])), **kwargs)
+        maker = polygon if kind == "polygon" else path
+        return maker(list(zip(coords[0::2], coords[1::2])), **kwargs)
     parts = [part.strip() for part in value.split(",")]
     if len(parts) < 4:
         raise ValueError("expects X1,Y1,X2,Y2")
@@ -746,11 +826,11 @@ def from_json(obj):
         if kind == "text":
             at = obj.pop("at", None) or (obj.pop("x"), obj.pop("y"))
             return text(at[0], at[1], obj.pop("text"), **obj)
-        if kind == "path":
+        if kind in ("path", "polygon"):
             points = obj.pop("points")
             if not isinstance(points, list):
-                raise ValueError("path needs a \"points\" array")
-            return path(points, **obj)
+                raise ValueError("%s needs a \"points\" array" % kind)
+            return (polygon if kind == "polygon" else path)(points, **obj)
         a = obj.pop("a", None) or (obj.pop("x1"), obj.pop("y1"))
         b = obj.pop("b", None) or (obj.pop("x2"), obj.pop("y2"))
         if kind == "ruler":
@@ -832,6 +912,8 @@ def build_parser():
             ("ellipse", "X1,Y1,X2,Y2[,COLOR[,FILL[,WIDTH[,DASH]]]]"),
             ("line", "X1,Y1,X2,Y2[,COLOR[,WIDTH[,DASH]]]"),
             ("path", "X1,Y1,X2,Y2[,X3,Y3...][,COLOR[,WIDTH[,DASH]]]"),
+            ("polygon", "X1,Y1,X2,Y2,X3,Y3[,X4,Y4...]"
+                        "[,COLOR[,FILL[,WIDTH[,DASH]]]]"),
             ("ruler", "X1,Y1,X2,Y2"),
             ("text", "X,Y[,STYLE...],TEXT")):
         parser.add_argument("--" + kind, action=_AnnoOption, const=kind,
@@ -987,6 +1069,10 @@ def _sample_annos():
         path([(5, 5), (60, 40.5), (60, 90), (110.25, 90)],
              color="pink", width=3, dash="dashed"),
         path([(0, 0), (10, 10)], casing=False),
+        polygon([(100, 10), (150, 60), (125.5, 90), (75, 60)],
+                color="sky", fill="sky", fill_alpha=0x30, width=2),
+        polygon([(10, 100), (40, 100), (25, 130)], fill="orange",
+                outline=False),
         ruler(5, 5, 105, 5),
         text(12, 14, "DEFECT #17\n불량 위치\\메모", size=20,
              color="white", bg_color="black", bg_opaque=True),
@@ -1091,6 +1177,9 @@ def selftest():
                 ("line", "0,0,199,99,green,8,dotted"),
                 ("path", "5,5,60,40.5,60,90,110.25,90,pink,3,dashed"),
                 ("path", "0,0,10,10,20,0"),
+                ("polygon", "100,10,150,60,125.5,90,75,60,sky,"
+                            "#35C5FF30,2"),
+                ("polygon", "10,100,40,100,25,130,0,orange"),
                 ("ruler", "5,5,105,5"),
                 ("text", "12,14,DEFECT #17"),
                 ("text", "12,14,size=20,color=white,bg=#000000FF,A"),
@@ -1116,6 +1205,13 @@ def selftest():
                  "dash": "dotted", "casing": False},
                 {"kind": "path", "points": [[1, 2], [30, 2], [30, 44]],
                  "color": "orange", "width": 2, "dash": "dashed"},
+                {"kind": "polygon",
+                 "points": [[100, 10], [150, 60], [125.5, 90], [75, 60]],
+                 "color": "sky", "fill": "sky", "fill_alpha": 48,
+                 "width": 2},
+                {"kind": "polygon",
+                 "points": [[10, 100], [40, 100], [25, 130]],
+                 "fill": "orange", "outline": False},
                 {"kind": "ruler", "x1": 1, "y1": 1, "x2": 8, "y2": 1},
                 {"kind": "text", "x": 5, "y": 32, "text": "불량 A",
                  "size": 12, "color": "white", "bg_opaque": True},

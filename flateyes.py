@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.11.0"
+VERSION = "1.12.0"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -893,7 +893,7 @@ class Viewer(object):
         # overlay pixbuf, texts as Pango labels; all anchored in world
         # coordinates like the ruler.
         self.anno_tool = None       # "box" | "ellipse" | "line" | "path"
-                                    # | "text"
+                                    # | "polygon" | "text"
         self.anno_start = None      # first corner (world); for the path
                                     # tool: the last vertex placed
         self.anno_cursor = None     # preview corner (world)
@@ -2104,7 +2104,7 @@ class Viewer(object):
         selected = self.valid_selection()
         if selected is not None:
             if self.anno_edit_anchor is not None:
-                if selected["kind"] == "path":
+                if selected["kind"] in ("path", "polygon"):
                     label = ("point %d/%d"
                              % (self.anno_edit_anchor + 1,
                                 len(selected["points"])))
@@ -2127,7 +2127,7 @@ class Viewer(object):
                 "Esc ends)" % ("on" if self.snap_enabled else "off")
         elif self.anno_tool == "text":
             text = "text: click to place  (Esc ends)"
-        elif self.anno_tool == "path":
+        elif self.anno_tool in ("path", "polygon"):
             text = self.draw_mode_desc() \
                 + "  (click adds a point, double-click/Enter finishes, " \
                 "Esc cancels)"
@@ -2793,6 +2793,25 @@ class Viewer(object):
         return ((a[0] + t0 * dx, a[1] + t0 * dy),
                 (a[0] + t1 * dx, a[1] + t1 * dy))
 
+    @classmethod
+    def fill_polygon(cls, buf, pts, rgba):
+        """Even-odd scanline fill of a polygon in view coordinates: one
+        span per row between successive edge crossings.  fill()
+        replaces pixels, so the alpha shows the image through, matching
+        the box/ellipse interiors."""
+        top = max(int(min(p[1] for p in pts)), 0)
+        bottom = min(int(max(p[1] for p in pts)) + 1, buf.get_height())
+        edges = list(zip(pts, pts[1:] + pts[:1]))
+        for row in range(top, bottom):
+            yc = row + 0.5  # half-open rule: vertices count once
+            xs = []
+            for (x1, y1), (x2, y2) in edges:
+                if (y1 <= yc < y2) or (y2 <= yc < y1):
+                    xs.append(x1 + (yc - y1) * (x2 - x1) / (y2 - y1))
+            xs.sort()
+            for i in range(0, len(xs) - 1, 2):
+                cls.fill_rect(buf, xs[i], row, xs[i + 1] - xs[i], 1, rgba)
+
     @staticmethod
     def fill_rect(buf, x, y, w, h, rgba):
         x, y, w, h = int(round(x)), int(round(y)), int(round(w)), int(round(h))
@@ -2845,18 +2864,25 @@ class Viewer(object):
         return (int(hex_color[1:], 16) << 8) | alpha
 
     def finish_path(self):
-        """Commit the in-progress path (double-click or Enter); fewer
-        than two vertices is just a cancel.  The tool stays active for
-        the next path."""
+        """Commit the in-progress path/polygon (double-click or Enter);
+        too few vertices (2 for a path, 3 for a polygon) is just a
+        cancel.  The tool stays active for the next one."""
+        kind = self.anno_tool
         points = list(self.anno_path)
         del self.anno_path[:]
         self.anno_start = self.anno_cursor = None
         self.anno_rev += 1
-        if len(points) >= 2:
-            anno = {"kind": "path", "points": points,
+        if len(points) >= (3 if kind == "polygon" else 2):
+            anno = {"kind": kind, "points": points,
                     "color": self.anno_color(),
                     "width": self.anno_line_width,
                     "dash": self.anno_line_dash}
+            if kind == "polygon":
+                if self.anno_fill:
+                    anno["fill"] = self.anno_fill_color
+                    anno["fill_alpha"] = self.anno_fill_alpha
+                if not self.anno_outline:
+                    anno["outline"] = False
             if not self.anno_casing:
                 anno["casing"] = False
             self.annotations.append(anno)
@@ -2872,7 +2898,7 @@ class Viewer(object):
             return point
         ax, ay = self.anno_start
         dx, dy = point[0] - ax, point[1] - ay
-        if self.anno_tool in ("line", "path"):
+        if self.anno_tool in ("line", "path", "polygon"):
             if abs(dx) > 2 * abs(dy):
                 return (point[0], ay)        # horizontal
             if abs(dy) > 2 * abs(dx):
@@ -2903,15 +2929,21 @@ class Viewer(object):
                     preview["outline"] = False
             if not self.anno_casing:
                 preview["casing"] = False
-        elif self.anno_tool == "path" and self.anno_path:
+        elif self.anno_tool in ("path", "polygon") and self.anno_path:
             pts = list(self.anno_path)
             if self.anno_cursor is not None:
                 pts.append(self.anno_cursor)  # rubber band to the mouse
             if len(pts) >= 2:
-                preview = {"kind": "path", "points": pts,
+                preview = {"kind": self.anno_tool, "points": pts,
                            "color": self.anno_color(),
                            "width": self.anno_line_width,
                            "dash": self.anno_line_dash}
+                if self.anno_tool == "polygon":
+                    if self.anno_fill:
+                        preview["fill"] = self.anno_fill_color
+                        preview["fill_alpha"] = self.anno_fill_alpha
+                    if not self.anno_outline:
+                        preview["outline"] = False
                 if not self.anno_casing:
                     preview["casing"] = False
         if not self.draw_visible or self.rendered_size is None \
@@ -2957,7 +2989,7 @@ class Viewer(object):
         for anno in rulers:
             self.stamp_annotation(buf, anno)
         if selected is not None and selected["kind"] != "text":
-            if selected["kind"] == "path":
+            if selected["kind"] in ("path", "polygon"):
                 corners = tuple(
                     self.image_px_to_view(self.px_from_world(p))
                     for p in selected["points"])
@@ -3196,7 +3228,7 @@ class Viewer(object):
         """highlight ("h"): thicker stroke under a neon-green halo, so
         the drawn shapes pop on a busy image.  Rulers keep their own
         colors (the branch below returns first) and texts are labels."""
-        if shape["kind"] == "path":
+        if shape["kind"] in ("path", "polygon"):
             pts = [self.image_px_to_view(self.px_from_world(p))
                    for p in shape["points"]]
             core = self.color_rgba(shape["color"])
@@ -3207,7 +3239,17 @@ class Viewer(object):
             if highlight:
                 casing = self.HIGHLIGHT_CASING
                 width = min(width + 2, 12)
-            segments = list(zip(pts, pts[1:]))
+            if shape["kind"] == "polygon":
+                # interior first so the outline stays on top (like the
+                # box/ellipse fills)
+                if shape.get("fill") and len(pts) >= 3:
+                    self.fill_polygon(buf, pts, self.color_rgba(
+                        shape["fill"], shape.get("fill_alpha", 0x59)))
+                if not shape.get("outline", True):
+                    return
+                segments = list(zip(pts, pts[1:] + pts[:1]))  # closed
+            else:
+                segments = list(zip(pts, pts[1:]))
             # all casing first, then all core, so a later segment cannot
             # cut into a finished corner's core
             if casing is not None:
@@ -3656,13 +3698,14 @@ class Viewer(object):
         dialog.add_button("OK", Gtk.ResponseType.OK)
         dialog.set_default_response(Gtk.ResponseType.OK)
         current = self.anno_tool \
-            if self.anno_tool in ("box", "ellipse", "line", "path") \
+            if self.anno_tool in ("box", "ellipse", "line", "path",
+                                  "polygon") \
             else self.anno_shape
         shape_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
                             spacing=10)
         radios = {}
         group = None
-        for kind in ("box", "ellipse", "line", "path"):
+        for kind in ("box", "ellipse", "line", "path", "polygon"):
             radio = Gtk.RadioButton.new_with_label_from_widget(group, kind)
             group = group if group is not None else radio
             radio.set_active(kind == current)
@@ -3898,7 +3941,7 @@ class Viewer(object):
     def anchor_points(anno):
         if anno["kind"] == "text":
             return (anno["at"],)
-        if anno["kind"] == "path":
+        if anno["kind"] in ("path", "polygon"):
             return tuple(anno["points"])
         return (anno["a"], anno["b"])
 
@@ -4015,7 +4058,7 @@ class Viewer(object):
         if anno["kind"] == "text":
             self.ask_annotation_text(anno["at"], edit=anno)
             return
-        if anno["kind"] == "path":   # newest vertex first, like "b"
+        if anno["kind"] in ("path", "polygon"):  # newest vertex first
             order = (None,) + tuple(range(len(anno["points"]) - 1, -1, -1))
         else:
             order = (None, "b", "a")
@@ -4127,15 +4170,25 @@ class Viewer(object):
                     % (anno["a"][0], anno["a"][1],
                        anno["b"][0], anno["b"][1]))
         color = anno.get("color", Viewer.DEFAULT_LINE)
-        if anno["kind"] == "path":
+        if anno["kind"] in ("path", "polygon"):
             # variable-length coordinate list, then the same style tail
-            # as the fixed shapes ("0" = the reserved fill slot)
+            # as the fixed shapes (a path's fill slot stays a reserved
+            # "0"; a polygon fills like a box)
+            if anno["kind"] == "polygon" and anno.get("fill"):
+                fill = "%s%02X" % (anno["fill"],
+                                   anno.get("fill_alpha", 89))
+            else:
+                fill = "0"
+            if not anno.get("outline", True):
+                color = "0"  # polygon without border (needs the fill)
             extra = ",%d,%d" % (anno.get("width", 1), anno.get("dash", 0))
             if not anno.get("casing", True):
                 extra += ",0"
-            return ("path=%s,%s,0%s"
-                    % (",".join("%.10g,%.10g" % (p[0], p[1])
-                                for p in anno["points"]), color, extra))
+            return ("%s=%s,%s,%s%s"
+                    % (anno["kind"],
+                       ",".join("%.10g,%.10g" % (p[0], p[1])
+                                for p in anno["points"]), color, fill,
+                       extra))
         if anno["kind"] == "text":
             if anno.get("bg", True):
                 # backdrop as #RRGGBBAA (0x59 = the translucent 0.35);
@@ -4295,8 +4348,8 @@ class Viewer(object):
                     entry, error = parse_legend_entry(value)
                     if entry is not None:
                         legend_restored.append(entry)
-                elif key in ("box", "ellipse", "line", "path", "ruler",
-                             "text"):
+                elif key in ("box", "ellipse", "line", "path", "polygon",
+                             "ruler", "text"):
                     self.attach_annotation(self.parse_anno_line(key, value))
             except ValueError:
                 continue  # skip malformed lines
@@ -4367,7 +4420,7 @@ class Viewer(object):
             ax, ay, bx, by = value.split(",")[:4]
             return {"kind": "ruler", "a": (float(ax), float(ay)),
                     "b": (float(bx), float(by))}
-        if key == "path":
+        if key in ("path", "polygon"):
             # the coordinate list runs until the first non-number (the
             # color); the style fields after it match the fixed shapes
             parts = value.split(",")
@@ -4379,13 +4432,31 @@ class Viewer(object):
                 except ValueError:
                     break
                 index += 1
-            if len(coords) < 4 or len(coords) % 2 or index >= len(parts):
-                raise ValueError("bad path: %s" % value)
-            anno = {"kind": "path",
+            if len(coords) % 2 and coords \
+                    and parts[index - 1].strip() == "0":
+                # the numeric "0" no-outline sentinel in the color slot
+                # was scanned as a coordinate; give it back
+                coords.pop()
+                index -= 1
+            if len(coords) < (6 if key == "polygon" else 4) \
+                    or len(coords) % 2 or index >= len(parts):
+                raise ValueError("bad %s: %s" % (key, value))
+            anno = {"kind": key,
                     "points": [(coords[i], coords[i + 1])
                                for i in range(0, len(coords), 2)],
                     "color": Viewer.parse_color(parts[index])}
-            tail = parts[index + 1:]   # fill (reserved), width, dash, halo
+            if key == "polygon" and parts[index].strip() == "0":
+                anno["outline"] = False  # border off, like a box
+            tail = parts[index + 1:]   # fill, width, dash, halo (the
+            if tail and key == "polygon":  # fill slot is "0" for paths)
+                fill = tail[0].strip()
+                if fill.startswith("#") and len(fill) == 9:
+                    try:
+                        int(fill[1:9], 16)
+                        anno["fill"] = fill[:7]
+                        anno["fill_alpha"] = int(fill[7:9], 16)
+                    except ValueError:
+                        pass
             if len(tail) > 1:
                 try:
                     anno["width"] = max(1, min(int(float(tail[1])), 8))
@@ -4393,7 +4464,7 @@ class Viewer(object):
                         code = int(float(tail[2]))
                         anno["dash"] = code if code in (1, 2) else 0
                 except ValueError:
-                    pass  # keep the path, default 1px solid
+                    pass  # keep the shape, default 1px solid
             if len(tail) > 3 and tail[3].strip() == "0":
                 anno["casing"] = False
             return anno
@@ -4526,7 +4597,7 @@ class Viewer(object):
                 raise ValueError("empty text")
             anno["text"] = text
             return anno
-        if kind == "path":
+        if kind in ("path", "polygon"):
             parts = [part.strip() for part in value.split(",")]
             coords = []
             while parts:
@@ -4535,14 +4606,40 @@ class Viewer(object):
                 except ValueError:
                     break
                 parts.pop(0)
-            if len(coords) < 4 or len(coords) % 2:
-                raise ValueError("expects X1,Y1,X2,Y2[,X3,Y3...]")
-            anno = {"kind": "path",
+            if len(coords) % 2 and coords and coords[-1] == 0:
+                # the "0" no-outline sentinel scanned as a coordinate
+                coords.pop()
+                parts.insert(0, "0")
+            if len(coords) < (6 if kind == "polygon" else 4) \
+                    or len(coords) % 2:
+                raise ValueError(
+                    "expects X1,Y1,X2,Y2,X3,Y3[,X4,Y4...]"
+                    if kind == "polygon" else
+                    "expects X1,Y1,X2,Y2[,X3,Y3...]")
+            anno = {"kind": kind,
                     "points": [(coords[i], coords[i + 1])
                                for i in range(0, len(coords), 2)],
                     "color": Viewer.DEFAULT_LINE}
             if parts:
-                anno["color"] = Viewer.option_color(parts.pop(0))
+                color = parts.pop(0)
+                if kind == "polygon" and color == "0":
+                    anno["outline"] = False
+                elif color:
+                    anno["color"] = Viewer.option_color(color)
+            if kind == "polygon" and parts:  # FILL, like a box
+                fill = parts.pop(0)
+                if fill.startswith("#") and len(fill) == 9:
+                    try:
+                        int(fill[1:9], 16)
+                    except ValueError:
+                        raise ValueError("bad fill: %s" % fill)
+                    anno["fill"] = fill[:7]
+                    anno["fill_alpha"] = int(fill[7:9], 16)
+                elif fill not in ("", "0"):
+                    anno["fill"] = Viewer.option_color(fill)
+                    anno["fill_alpha"] = 89
+            if not anno.get("outline", True) and "fill" not in anno:
+                raise ValueError("0 (no outline) needs a FILL")
             if parts:
                 width = parts.pop(0)
                 try:
@@ -4646,12 +4743,13 @@ class Viewer(object):
                 anno["bg_color"] = Viewer.option_color(
                     str(obj.pop("bg_color", Viewer.DEFAULT_BG)))
                 anno["bg_opaque"] = bool(obj.pop("bg_opaque", False))
-            elif kind == "path":
+            elif kind in ("path", "polygon"):
+                need = 3 if kind == "polygon" else 2
                 points = obj.pop("points")
-                if not isinstance(points, list) or len(points) < 2:
-                    raise ValueError("path needs a \"points\" array "
-                                     "of 2+ [x, y] pairs")
-                anno = {"kind": "path",
+                if not isinstance(points, list) or len(points) < need:
+                    raise ValueError("%s needs a \"points\" array "
+                                     "of %d+ [x, y] pairs" % (kind, need))
+                anno = {"kind": kind,
                         "points": [(float(p[0]), float(p[1]))
                                    for p in points],
                         "color": Viewer.option_color(
@@ -4671,6 +4769,24 @@ class Viewer(object):
                                      "dotted, got: %r" % (dash,))
                 if not obj.pop("casing", True):
                     anno["casing"] = False
+                if kind == "polygon":
+                    fill = obj.pop("fill", None)
+                    fill_alpha = obj.pop("fill_alpha", None)
+                    if fill_alpha is not None:
+                        try:
+                            fill_alpha = int(fill_alpha)
+                        except (TypeError, ValueError):
+                            fill_alpha = -1
+                        if not 0 <= fill_alpha <= 255:
+                            raise ValueError("fill_alpha must be 0-255")
+                    if fill is not None:
+                        anno["fill"] = Viewer.option_color(str(fill))
+                        anno["fill_alpha"] = fill_alpha \
+                            if fill_alpha is not None else 89
+                    if not obj.pop("outline", True):
+                        if fill is None:
+                            raise ValueError("outline=false needs a fill")
+                        anno["outline"] = False
             elif kind in ("box", "ellipse", "line", "ruler"):
                 a = obj.pop("a", None) or (obj.pop("x1"), obj.pop("y1"))
                 b = obj.pop("b", None) or (obj.pop("x2"), obj.pop("y2"))
@@ -5010,8 +5126,8 @@ class Viewer(object):
                 self.update_mode_toast()
             elif self.ruler_active:
                 self.set_ruler_active(False)
-            elif self.anno_tool == "path" and self.anno_path:
-                # drop the unfinished path; the tool stays for a retry
+            elif self.anno_tool in ("path", "polygon") and self.anno_path:
+                # drop the unfinished shape; the tool stays for a retry
                 del self.anno_path[:]
                 self.anno_start = self.anno_cursor = None
                 self.anno_rev += 1
@@ -5123,7 +5239,8 @@ class Viewer(object):
             self.update_mode_toast()
         elif key == "F1":
             self.show_about()
-        elif key in ("Return", "KP_Enter") and self.anno_tool == "path" \
+        elif key in ("Return", "KP_Enter") \
+                and self.anno_tool in ("path", "polygon") \
                 and self.anno_path:
             self.finish_path()  # commit with the points placed so far
         elif key in ("F11", "Return", "KP_Enter"):
@@ -5167,8 +5284,8 @@ class Viewer(object):
 
     def on_button_press(self, widget, event):
         if event.type == Gdk.EventType.DOUBLE_BUTTON_PRESS \
-                and self.anno_tool == "path" and self.anno_path \
-                and self.tool_click(event):
+                and self.anno_tool in ("path", "polygon") \
+                and self.anno_path and self.tool_click(event):
             # the pair's first click already placed this vertex
             self.finish_path()
             self.drag_origin = None  # swallow the pair's second release
@@ -5270,7 +5387,7 @@ class Viewer(object):
                 self.update_dirty()
         elif self.anno_tool == "text":
             self.ask_annotation_text(point)
-        elif self.anno_tool == "path":
+        elif self.anno_tool in ("path", "polygon"):
             if self.anno_path:  # Shift constrains against the last vertex
                 point = self.constrain_corner(point, event.state)
             self.anno_path.append(point)
@@ -5309,7 +5426,8 @@ class Viewer(object):
         if self.ruler_active:
             return "crosshair"
         return {"box": "cell", "ellipse": "cell", "line": "cell",
-                "path": "cell", "text": "text"}.get(self.anno_tool)
+                "path": "cell", "polygon": "cell",
+                "text": "text"}.get(self.anno_tool)
 
     def set_viewport_cursor(self, name):
         win = self.scroll.get_window()
@@ -5409,8 +5527,8 @@ class Viewer(object):
                     stack = value not in ("", "0")
                 elif key == "note":
                     note = self.unescape_meta(value)
-                elif key in ("box", "ellipse", "line", "path", "ruler",
-                             "text"):
+                elif key in ("box", "ellipse", "line", "path", "polygon",
+                             "ruler", "text"):
                     try:
                         annos.append(self.parse_anno_line(key, value))
                     except ValueError:
@@ -5508,6 +5626,11 @@ def usage(stream):
         "  --path X1,Y1,X2,Y2[,X3,Y3...][,COLOR[,WIDTH[,DASH]]]\n"
         "                            connected line segments through\n"
         "                            every X,Y in order (2+ points)\n"
+        "  --polygon X1,Y1,X2,Y2,X3,Y3[,X4,Y4...][,COLOR[,FILL[,WIDTH\n"
+        "                            [,DASH]]]]\n"
+        "                            closed shape through every X,Y in\n"
+        "                            order (3+ points), filled like a\n"
+        "                            box (COLOR 0 = no outline)\n"
         "  --ruler X1,Y1,X2,Y2       finished ruler measurement (uses\n"
         "                            the PPU/unit in effect)\n"
         "  --text X,Y[,STYLE...],TEXT\n"
@@ -5549,15 +5672,16 @@ def usage(stream):
         "        snap to the nearest image edge - a crosshair previews\n"
         "        the first point, the end snaps only along the\n"
         "        measuring direction,\n"
-        "      d draw shapes: a dialog picks box/ellipse/line/path and\n"
-        "        the style - outline (use, color), stroke width (1-8 px)\n"
-        "        and type (solid/dashed/dotted) for lines and outlines\n"
-        "        alike, the black halo around strokes (on/off) and the\n"
-        "        box/ellipse fill (use, color, opacity 1-100%%); one\n"
-        "        of outline/fill always stays on and texts style\n"
-        "        themselves; Shift while clicking = square/circle/\n"
-        "        45-degree line; a path adds a vertex per click and\n"
-        "        double-click/Enter finishes it (Esc drops it),\n"
+        "      d draw shapes: a dialog picks box/ellipse/line/path/\n"
+        "        polygon and the style - outline (use, color), stroke\n"
+        "        width (1-8 px) and type (solid/dashed/dotted) for\n"
+        "        lines and outlines alike, the black halo around\n"
+        "        strokes (on/off) and the box/ellipse/polygon fill\n"
+        "        (use, color, opacity 1-100%%); one of outline/fill\n"
+        "        always stays on and texts style themselves; Shift\n"
+        "        while clicking = square/circle/45-degree line; a path\n"
+        "        or polygon adds a vertex per click and double-click/\n"
+        "        Enter finishes it (Esc drops it),\n"
         "      t text,\n"
         "      n note: one free text per image, no position or style,\n"
         "        shown at the top-left with the info overlays and\n"
@@ -5609,8 +5733,8 @@ def parse_args(args):
             multi = True
         elif arg in ("-l", "--legend", "-p", "--ppu", "-u", "--unit",
                      "-s", "--stack", "--level", "--center",
-                     "--box", "--ellipse", "--line", "--path", "--ruler",
-                     "--text", "--note", "--json"):
+                     "--box", "--ellipse", "--line", "--path", "--polygon",
+                     "--ruler", "--text", "--note", "--json"):
             i += 1
             if i == len(args):
                 sys.stderr.write("%s: %s requires an argument\n" % (APP, arg))
@@ -5619,8 +5743,8 @@ def parse_args(args):
         elif arg.startswith(("--legend=", "--ppu=", "--unit=", "--stack=",
                              "--level=", "--center=", "--box=",
                              "--ellipse=", "--line=", "--path=",
-                             "--ruler=", "--text=", "--note=",
-                             "--json=")):
+                             "--polygon=", "--ruler=", "--text=",
+                             "--note=", "--json=")):
             arg, took_value = arg.split("=", 1)
         elif arg.startswith("-") and arg != "-":
             sys.stderr.write("%s: unknown option: %s\n" % (APP, arg))
@@ -5662,7 +5786,7 @@ def parse_args(args):
                     return 2
                 levels[-1]["center"] = (x, y)
             elif arg in ("--box", "--ellipse", "--line", "--path",
-                         "--ruler", "--text"):
+                         "--polygon", "--ruler", "--text"):
                 try:
                     annos.append(Viewer.parse_anno_option(arg[2:],
                                                           took_value))
