@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.10.1"
+VERSION = "1.11.0"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -662,7 +662,8 @@ class Viewer(object):
                  ("n", "note"), ("s", "select"), ("u/y", "undo/redo"),
                  ("Ctrl+C", "copy"), ("Ctrl+Shift+C", "path"),
                  ("Ctrl+S", "save"), ("p", "PPU"),
-                 ("o", "outline"), ("[/]", "level"), ("i", "info"),
+                 ("o", "outline"), ("[/]", "level"),
+                 ("i", "legend/note"), ("?", "help"),
                  ("Tab", "overlays"), ("q", "quit"))
 
     def __init__(self, server_sock, first_path, first_legend=None,
@@ -690,7 +691,8 @@ class Viewer(object):
         # Overlay visibility, two groups: "i" toggles the info overlays
         # (help strip, legend, next-level outline), Tab the drawing
         # overlays (ruler, annotations).  "o" keeps its own switch.
-        self.info_visible = True    # "i"
+        self.info_visible = True    # "?": help strip, readouts, outline
+        self.meta_visible = True    # "i": legend + note
         self.draw_visible = True    # Tab
         self.hint_enabled = True    # "o"
         self.anno_highlight = False  # "h": emphasize the drawn shapes
@@ -841,14 +843,20 @@ class Viewer(object):
         self.note = ""
         self.note_label = Gtk.Label()
         self.note_label.set_name("flateyes-status")
-        self.note_label.set_halign(Gtk.Align.START)
-        self.note_label.set_valign(Gtk.Align.START)
-        self.note_label.set_margin_top(48)
-        self.note_label.set_margin_start(8)
         self.note_label.set_line_wrap(True)
         self.note_label.set_max_width_chars(44)
         self.note_label.set_xalign(0)   # multi-line notes read flush left
-        self.note_label.set_no_show_all(True)
+        self.note_label.show()  # visibility lives on the scroller
+        # A long note scrolls instead of running off the window; the
+        # scroller is invisible while the note fits (fit_info_overlays).
+        self.note_scroll = self.transparent_scroller()
+        self.note_scroll.add(self.note_label)
+        self.note_scroll.set_halign(Gtk.Align.START)
+        self.note_scroll.set_valign(Gtk.Align.START)
+        self.note_scroll.set_margin_top(48)
+        self.note_scroll.set_margin_start(8)
+        self.note_scroll.set_no_show_all(True)
+        self.fit_requested = {}  # last size_request per info scroller
 
         # Transient feedback message (e.g. after copying to the clipboard).
         # While a drawing mode is active, mode_toast holds a persistent
@@ -945,9 +953,13 @@ class Viewer(object):
                        self.legend_grid.set_margin_top,
                        self.legend_grid.set_margin_bottom):
             setter(7)
+        # Like the note, a long swatch table scrolls inside a capped,
+        # transparent scroller (the frame keeps the dark backdrop).
+        self.legend_scroll = self.transparent_scroller()
+        self.legend_scroll.add(self.legend_grid)
         legend_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         legend_box.add(self.legend_image)
-        legend_box.add(self.legend_grid)
+        legend_box.add(self.legend_scroll)
         legend_box.show()
         self.legend_frame = Gtk.Frame()
         self.legend_frame.set_name("flateyes-legend")
@@ -974,12 +986,12 @@ class Viewer(object):
         self.overlay.add_overlay(self.help_label)
         self.overlay.add_overlay(self.status_label)
         self.overlay.add_overlay(self.path_label)
-        self.overlay.add_overlay(self.note_label)
+        self.overlay.add_overlay(self.note_scroll)
         self.overlay.add_overlay(self.toast_label)
         for child in (self.legend_frame, self.hint_image, self.anno_image,
                       self.ruler_line, self.ruler_label, self.snap_marker,
                       self.help_label, self.status_label, self.path_label,
-                      self.note_label, self.toast_label):
+                      self.note_scroll, self.toast_label):
             try:
                 # Let clicks/wheel over the overlays fall through to the image.
                 self.overlay.set_overlay_pass_through(child, True)
@@ -1984,7 +1996,7 @@ class Viewer(object):
         self.toast_label.hide()
         hidden = []
         for widget in (self.help_label, self.status_label, self.path_label,
-                       self.note_label, self.legend_frame, self.hint_image,
+                       self.note_scroll, self.legend_frame, self.hint_image,
                        self.snap_marker):
             if widget.get_visible():
                 widget.hide()
@@ -2172,25 +2184,81 @@ class Viewer(object):
     def update_note_overlay(self):
         """The note chip at the top-left: follows the info overlays,
         and only exists while the image has a note."""
-        if self.note and self.info_visible:
+        if self.note and self.meta_visible:
             self.note_label.set_text(self.note)
-            self.note_label.show()
+            self.note_scroll.show()
         else:
-            self.note_label.hide()
+            self.note_scroll.hide()
+        self.fit_info_overlays()
 
     def apply_legend_visibility(self):
-        if self.info_visible and (self.legend_pixbuf is not None
+        if self.meta_visible and (self.legend_pixbuf is not None
                                   or self.legend_entries):
             # A request image legend covers the (still saved) entries.
             self.legend_image.set_visible(self.legend_pixbuf is not None)
-            self.legend_grid.set_visible(self.legend_pixbuf is None
-                                         and bool(self.legend_entries))
+            self.legend_scroll.set_visible(self.legend_pixbuf is None
+                                           and bool(self.legend_entries))
             self.legend_frame.show()
         else:
             self.legend_frame.hide()
+        self.fit_info_overlays()
+
+    @staticmethod
+    def transparent_scroller():
+        """A vertical-only ScrolledWindow whose auto-viewport stays
+        transparent, so the content's chip/backdrop styling shows
+        through instead of the theme background."""
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_shadow_type(Gtk.ShadowType.NONE)
+        css = Gtk.CssProvider()
+        css.load_from_data(b"* { background-color: transparent; }")
+        scroll.get_style_context().add_provider(
+            css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        scroll.connect("add", lambda sw, child:
+                       child.get_style_context().add_provider(
+                           css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION))
+        return scroll
+
+    def fit_info_overlays(self, alloc=None):
+        """Size the note and the text legend to their content, capped
+        at a share of the window height: short content looks exactly
+        as before, longer content gets a scrollbar."""
+        if alloc is None:
+            alloc = self.overlay.get_allocation()
+        if alloc.height < 2:
+            return  # not laid out yet; size-allocate calls back in
+        self.fit_overlay_scroll(self.note_scroll, self.note_label,
+                                max(int(alloc.height * 0.5), 60))
+        self.fit_overlay_scroll(self.legend_scroll, self.legend_grid,
+                                max(int(alloc.height * 0.6), 80),
+                                self.legend_frame)
+
+    def fit_overlay_scroll(self, scroll, content, max_h, wrapper=None):
+        """Give one overlay scroller its content's natural size up to
+        max_h.  While capped, the overlay stops passing events through,
+        so the wheel scrolls the content there instead of the image."""
+        if scroll.get_visible():
+            w_nat = content.get_preferred_width()[1]
+            h_nat = content.get_preferred_height_for_width(w_nat)[1]
+            overflow = h_nat > max_h
+            # room for the scrollbar next to the content when it shows
+            request = (w_nat + (14 if overflow else 0),
+                       min(h_nat, max_h))
+            if self.fit_requested.get(scroll) != request:
+                self.fit_requested[scroll] = request
+                scroll.set_size_request(*request)
+        else:
+            overflow = False  # hidden (or image legend): pass through
+        try:
+            self.overlay.set_overlay_pass_through(wrapper or scroll,
+                                                  not overflow)
+        except AttributeError:  # GTK < 3.18: overlays take events anyway
+            pass
 
     def on_overlay_allocate(self, widget, allocation):
         self.render_legend(allocation)
+        self.fit_info_overlays(allocation)
 
     def on_overlay_query_tooltip(self, widget, x, y, keyboard_mode, tooltip):
         if self.path_tooltip is None or not self.path_label.get_visible():
@@ -4921,10 +4989,14 @@ class Viewer(object):
             return True
         if key in ("q", "Q"):
             self.request_quit()
-        elif key in ("i", "I"):  # info overlays: help, legend, level outline
+        elif key in ("i", "I"):  # image metadata overlays: legend + note
+            self.meta_visible = not self.meta_visible
+            self.update_note_overlay()
+            self.apply_legend_visibility()
+            self.update_mode_toast()
+        elif key == "question":  # "?": help strip, readouts, level outline
             self.info_visible = not self.info_visible
             self.apply_help_visibility()
-            self.apply_legend_visibility()
             self.update_hint_overlay()
             self.update_mode_toast()
         elif key == "Escape":  # leaves selection/tool modes; quitting is "q"
@@ -5041,8 +5113,10 @@ class Viewer(object):
                 self.hint_enabled = not self.hint_enabled
                 self.update_hint_overlay()
         elif key == "Tab":  # every overlay: drawings, info and the toast
-            visible = self.draw_visible or self.info_visible
-            self.draw_visible = self.info_visible = not visible
+            visible = self.draw_visible or self.info_visible \
+                or self.meta_visible
+            self.draw_visible = self.info_visible = self.meta_visible \
+                = not visible
             self.apply_help_visibility()
             self.apply_legend_visibility()
             self.update_view_overlays()
@@ -5465,7 +5539,9 @@ def usage(stream):
         "      b thumbnail browser: one folder's subfolders and images\n"
         "        (Enter opens, BackSpace goes up, Esc returns),\n"
         "      Ctrl+wheel zoom, drag to pan, o next-level outline,\n"
-        "      i info overlays (help/legend/outline) on/off,\n"
+        "      i legend and note overlays on/off,\n"
+        "      ? key help, status/path readouts and the level outline\n"
+        "        on/off,\n"
         "      Tab all overlays (drawings and info) on/off,\n"
         "      [/] stack level, p set PPU,\n"
         "      r ruler (Shift = free angle, Esc ends),\n"
