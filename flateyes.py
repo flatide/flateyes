@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.13.0"
+VERSION = "1.13.1"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -450,6 +450,14 @@ def import_gtk():
     global Gtk, Gdk, GdkPixbuf, GLib, Pango
     try:
         import gi
+        import warnings
+        # The viewer's stderr is not a dev console: PyGObject's
+        # deprecation nags (which names they cover varies wildly by
+        # GLib/PyGObject version, and some fire inside PyGObject's own
+        # import) stay silent.  Real errors and other warnings still
+        # show.
+        warnings.simplefilter("ignore", getattr(
+            gi, "PyGIDeprecationWarning", DeprecationWarning))
         gi.require_version("Gtk", "3.0")
         gi.require_version("GdkPixbuf", "2.0")
         from gi.repository import Gtk as _Gtk, Gdk as _Gdk, \
@@ -1033,10 +1041,11 @@ class Viewer(object):
             GLib.io_add_watch(server_sock.fileno(), GLib.IO_IN,
                               self.on_incoming)
         # SIGINT/SIGTERM end Gtk.main cleanly.  GLib >= 2.80 moved the
-        # unix API into its own GLibUnix namespace (the GLib shim then
-        # warns on every start), but which names the typelib exports
-        # varies by GLib version (signal_add vs signal_add_full only) -
-        # probe the candidates in order, deprecated shim last.
+        # unix API into its own GLibUnix namespace, but which names the
+        # typelib exports (signal_add vs signal_add_full only) varies by
+        # GLib version - probe the candidates in order, deprecated shim
+        # last.  Merely looking up a deprecated name would warn, but
+        # import_gtk() already silenced PyGObject's deprecation nags.
         candidates = []
         try:
             import gi
