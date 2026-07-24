@@ -111,8 +111,8 @@ def _dash(value):
                      % (value,))
 
 
-def _shape(kind, x1, y1, x2, y2, color, fill, fill_opaque, outline,
-           width, dash, casing, fill_alpha=None):
+def _shape(kind, x1, y1, x2, y2, color, fill, outline, width, dash,
+           casing, fill_alpha=None):
     anno = {"kind": kind,
             "a": (float(x1), float(y1)), "b": (float(x2), float(y2)),
             "color": _color(color)}
@@ -133,10 +133,8 @@ def _shape(kind, x1, y1, x2, y2, color, fill, fill_opaque, outline,
             raise ValueError("fill_alpha must be 0-255")
     if fill is not None:
         anno["fill"] = _color(fill, "fill")
-        # fill_alpha (exact interior alpha) wins over the legacy
-        # fill_opaque switch (255 vs the translucent 89)
         anno["fill_alpha"] = fill_alpha if fill_alpha is not None \
-            else (255 if fill_opaque else TRANSLUCENT_ALPHA)
+            else TRANSLUCENT_ALPHA
     if not outline:
         if fill is None:
             raise ValueError("outline=False needs a fill")
@@ -144,26 +142,24 @@ def _shape(kind, x1, y1, x2, y2, color, fill, fill_opaque, outline,
     return anno
 
 
-def box(x1, y1, x2, y2, color=DEFAULT_LINE, fill=None, fill_opaque=False,
-        outline=True, width=1, dash="solid", casing=True,
-        fill_alpha=None):
+def box(x1, y1, x2, y2, color=DEFAULT_LINE, fill=None, outline=True,
+        width=1, dash="solid", casing=True, fill_alpha=None):
     """Rectangle from (x1,y1) to (x2,y2) in center-origin image px."""
-    return _shape("box", x1, y1, x2, y2, color, fill, fill_opaque,
-                  outline, width, dash, casing, fill_alpha)
+    return _shape("box", x1, y1, x2, y2, color, fill, outline,
+                  width, dash, casing, fill_alpha)
 
 
-def ellipse(x1, y1, x2, y2, color=DEFAULT_LINE, fill=None,
-            fill_opaque=False, outline=True, width=1, dash="solid",
-            casing=True, fill_alpha=None):
+def ellipse(x1, y1, x2, y2, color=DEFAULT_LINE, fill=None, outline=True,
+            width=1, dash="solid", casing=True, fill_alpha=None):
     """Ellipse inscribed in the (x1,y1)-(x2,y2) rectangle."""
-    return _shape("ellipse", x1, y1, x2, y2, color, fill, fill_opaque,
-                  outline, width, dash, casing, fill_alpha)
+    return _shape("ellipse", x1, y1, x2, y2, color, fill, outline,
+                  width, dash, casing, fill_alpha)
 
 
 def line(x1, y1, x2, y2, color=DEFAULT_LINE, width=1, dash="solid",
          casing=True):
     """Straight line segment."""
-    return _shape("line", x1, y1, x2, y2, color, None, False, True,
+    return _shape("line", x1, y1, x2, y2, color, None, True,
                   width, dash, casing)
 
 
@@ -311,9 +307,7 @@ def serialize_anno(anno):
         # AA is the interior alpha verbatim (older builds read >= 80
         # as their opaque, anything else as their translucent 0.35)
         fill = "%s%02X" % (anno["fill"],
-                           anno.get("fill_alpha",
-                                    255 if anno.get("fill_opaque")
-                                    else TRANSLUCENT_ALPHA))
+                           anno.get("fill_alpha", TRANSLUCENT_ALPHA))
     else:
         fill = "0"
     if not anno.get("outline", True):
@@ -984,7 +978,7 @@ def _sample_png(width=4, height=4):
 def _sample_annos():
     return [
         box(10, 20, 200, 120, color="red", width=2),
-        box(30, 40, 90, 80, fill="orange", fill_opaque=True,
+        box(30, 40, 90, 80, fill="orange", fill_alpha=255,
             outline=False),
         box(-60, -50, -10, -5, fill="sky", fill_alpha=0x30),
         ellipse(50.5, 60.25, 150, 160, color="#123ABC", fill="sky",
@@ -1114,7 +1108,7 @@ def selftest():
                 {"kind": "box", "x1": 5, "y1": 5, "x2": 40, "y2": 30,
                  "color": "sky", "fill": "sky", "width": 2},
                 {"kind": "ellipse", "a": [1, 2], "b": [30, 40],
-                 "fill": "#FF9F1A", "fill_opaque": True,
+                 "fill": "#FF9F1A", "fill_alpha": 255,
                  "outline": False},
                 {"kind": "box", "x1": -60, "y1": -50, "x2": -10,
                  "y2": -5, "fill": "sky", "fill_alpha": 48},

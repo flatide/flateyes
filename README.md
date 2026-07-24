@@ -405,7 +405,7 @@ note·legend까지 파일 하나에 담을 수 있다 (모든 키 선택,
     {"kind": "box", "x1": 120, "y1": 80, "x2": 420, "y2": 300,
      "color": "red", "width": 2, "dash": "dashed"},
     {"kind": "box", "x1": 40, "y1": 40, "x2": 90, "y2": 90,
-     "outline": false, "fill": "orange", "fill_opaque": true},
+     "outline": false, "fill": "orange", "fill_alpha": 255},
     {"kind": "ellipse", "a": [500, 100], "b": [640, 200],
      "color": "#35C5FF", "fill": "sky", "fill_alpha": 128,
      "casing": false},
@@ -427,7 +427,7 @@ black·white·red·orange·green·sky·pink 또는 `#RRGGBB`):
 | kind | 필수 | 선택 |
 |---|---|---|
 | 최상위 객체 | — | *ppu*(>0, ruler 환산 배율), *unit*(기본 um), *note*(이미지 메모, `\n` 줄바꿈), *legend*(범례 정의 줄의 배열 — "Legend 오버레이" 절의 문법), *annotations*(배열) |
-| `box` / `ellipse` | 좌표 | *color*(기본 red), *width*(1~8, 기본 1), *dash*(`solid`/`dashed`/`dotted`, 기본 solid), *casing*(검은 테두리, 기본 true), *fill*(채움 색, 기본 없음), *fill_alpha*(내부 알파 0~255, 기본 89=35%), *fill_opaque*(구형 스위치, true=255 — fill_alpha가 우선), *outline*(false면 윤곽선 없음 — fill 필수) |
+| `box` / `ellipse` | 좌표 | *color*(기본 red), *width*(1~8, 기본 1), *dash*(`solid`/`dashed`/`dotted`, 기본 solid), *casing*(검은 테두리, 기본 true), *fill*(채움 색, 기본 없음), *fill_alpha*(내부 알파 0~255, 기본 89=35%), *outline*(false면 윤곽선 없음 — fill 필수) |
 | `line` | 좌표 | *color*, *width*, *dash*, *casing* (box와 동일) |
 | `path` | `points`(`[[x, y], ...]` 2개 이상, 순서대로 잇는 연속 선분) | *color*, *width*, *dash*, *casing* (line과 동일) |
 | `ruler` | 좌표 | 없음 (ppu/unit로 환산 표시) |

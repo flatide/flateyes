@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.10.0"
+VERSION = "1.10.1"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -3176,9 +3176,7 @@ class Viewer(object):
         fill_rgba = None
         if shape.get("fill"):
             fill_rgba = self.color_rgba(
-                shape["fill"], shape.get("fill_alpha",
-                                         0xFF if shape.get("fill_opaque")
-                                         else 0x59))
+                shape["fill"], shape.get("fill_alpha", 0x59))
         outline = shape.get("outline", True)
         stroke_dash = shape.get("dash", 0)
         if shape["kind"] == "box":
@@ -4087,10 +4085,7 @@ class Viewer(object):
             # same #RRGGBBAA form as the text backdrop field; AA is the
             # interior alpha verbatim (older builds read >= 80 as their
             # opaque, anything else as their translucent 0.35)
-            fill = "%s%02X" % (anno["fill"],
-                               anno.get("fill_alpha",
-                                        255 if anno.get("fill_opaque")
-                                        else 89))
+            fill = "%s%02X" % (anno["fill"], anno.get("fill_alpha", 89))
         else:
             fill = "0"
         if not anno.get("outline", True):
@@ -4633,7 +4628,6 @@ class Viewer(object):
                         anno["casing"] = False
                 if kind in ("box", "ellipse"):
                     fill = obj.pop("fill", None)
-                    fill_opaque = bool(obj.pop("fill_opaque", False))
                     fill_alpha = obj.pop("fill_alpha", None)
                     if fill_alpha is not None:
                         try:
@@ -4645,8 +4639,7 @@ class Viewer(object):
                     if fill is not None:
                         anno["fill"] = Viewer.option_color(str(fill))
                         anno["fill_alpha"] = fill_alpha \
-                            if fill_alpha is not None \
-                            else (255 if fill_opaque else 89)
+                            if fill_alpha is not None else 89
                     if not obj.pop("outline", True):
                         if fill is None:
                             raise ValueError("outline=false needs a fill")
