@@ -103,6 +103,20 @@ def _color(value, what="color"):
                      % (what, value, "/".join(n for n, _ in PALETTE)))
 
 
+def _fill_color(value):
+    """A fill value: like _color, but "#RRGGBBAA" also works — the AA
+    byte is the interior alpha.  Returns (color, alpha), alpha None
+    when the value does not carry one."""
+    text = str(value).strip()
+    if text.startswith("#") and len(text) == 9:
+        try:
+            int(text[1:], 16)
+            return text[:7], int(text[7:9], 16)
+        except ValueError:
+            pass
+    return _color(text, "fill"), None
+
+
 def _dash(value):
     if isinstance(value, str) and value.lower() in DASHES:
         return DASHES[value.lower()]
@@ -133,9 +147,11 @@ def _shape(kind, x1, y1, x2, y2, color, fill, outline, width, dash,
         if not 0 <= fill_alpha <= 255:
             raise ValueError("fill_alpha must be 0-255")
     if fill is not None:
-        anno["fill"] = _color(fill, "fill")
+        # "#RRGGBBAA" carries the alpha in the value; an explicit
+        # fill_alpha wins over it
+        anno["fill"], embedded = _fill_color(fill)
         anno["fill_alpha"] = fill_alpha if fill_alpha is not None \
-            else TRANSLUCENT_ALPHA
+            else (TRANSLUCENT_ALPHA if embedded is None else embedded)
     if not outline:
         if fill is None:
             raise ValueError("outline=False needs a fill")
@@ -198,9 +214,9 @@ def polygon(points, color=DEFAULT_LINE, fill=None, outline=True, width=1,
         if not 0 <= fill_alpha <= 255:
             raise ValueError("fill_alpha must be 0-255")
     if fill is not None:
-        anno["fill"] = _color(fill, "fill")
+        anno["fill"], embedded = _fill_color(fill)
         anno["fill_alpha"] = fill_alpha if fill_alpha is not None \
-            else TRANSLUCENT_ALPHA
+            else (TRANSLUCENT_ALPHA if embedded is None else embedded)
     if not outline:
         if fill is None:
             raise ValueError("outline=False needs a fill")
@@ -759,15 +775,8 @@ def parse_anno_option(kind, value):
                 kwargs["color"] = color
         if kind == "polygon" and parts:  # FILL, like a box
             fill = parts.pop(0)
-            if fill.startswith("#") and len(fill) == 9:
-                try:
-                    int(fill[1:9], 16)
-                except ValueError:
-                    raise ValueError("bad fill: %s" % fill)
-                kwargs["fill"] = fill[:7]
-                kwargs["fill_alpha"] = int(fill[7:9], 16)
-            elif fill not in ("", "0"):
-                kwargs["fill"] = fill
+            if fill not in ("", "0"):
+                kwargs["fill"] = fill  # the constructor splits #RRGGBBAA
         if parts:
             kwargs["width"] = int(parts.pop(0))
         if parts:
@@ -796,15 +805,8 @@ def parse_anno_option(kind, value):
             kwargs["color"] = color
     if rest and kind != "line":  # 6th: fill, AA of #RRGGBBAA = alpha
         fill = rest.pop(0)
-        if fill.startswith("#") and len(fill) == 9:
-            try:
-                int(fill[1:9], 16)
-            except ValueError:
-                raise ValueError("bad fill: %s" % fill)
-            kwargs["fill"] = fill[:7]
-            kwargs["fill_alpha"] = int(fill[7:9], 16)
-        elif fill not in ("", "0"):
-            kwargs["fill"] = fill
+        if fill not in ("", "0"):
+            kwargs["fill"] = fill  # the constructor splits #RRGGBBAA
     if rest:  # then WIDTH 1-8 and DASH solid/dashed/dotted
         kwargs["width"] = int(rest.pop(0))
     if rest:
@@ -1063,6 +1065,8 @@ def _sample_annos():
         box(30, 40, 90, 80, fill="orange", fill_alpha=255,
             outline=False),
         box(-60, -50, -10, -5, fill="sky", fill_alpha=0x30),
+        box(-60, 0, -10, 45, fill="#80808080"),   # AA inside the value
+        box(-60, 50, -10, 95, fill="#80808040", fill_alpha=200),
         ellipse(50.5, 60.25, 150, 160, color="#123ABC", fill="sky",
                 dash="dashed", casing=False),
         line(0, 0, 199, 99, color="green", width=8, dash="dotted"),
@@ -1173,6 +1177,7 @@ def selftest():
                 ("box", "10,20,200,120,red,0,2"),
                 ("box", "30,40,90,80,0,orange"),
                 ("box", "-60,-50,-10,-5,sky,#35C5FF30"),
+                ("box", "-60,0,-10,45,red,#80808080"),
                 ("ellipse", "50.5,60.25,150,160,#123ABC,sky,1,dashed"),
                 ("line", "0,0,199,99,green,8,dotted"),
                 ("path", "5,5,60,40.5,60,90,110.25,90,pink,3,dashed"),
@@ -1201,6 +1206,11 @@ def selftest():
                  "outline": False},
                 {"kind": "box", "x1": -60, "y1": -50, "x2": -10,
                  "y2": -5, "fill": "sky", "fill_alpha": 48},
+                {"kind": "box", "x1": -60, "y1": 0, "x2": -10,
+                 "y2": 45, "fill": "#80808080"},
+                {"kind": "polygon",
+                 "points": [[0, 0], [40, 0], [20, 30]],
+                 "fill": "#80808040", "fill_alpha": 200},
                 {"kind": "line", "x1": 0, "y1": 0, "x2": 9, "y2": 9,
                  "dash": "dotted", "casing": False},
                 {"kind": "path", "points": [[1, 2], [30, 2], [30, 44]],

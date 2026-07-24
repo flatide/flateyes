@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.12.0"
+VERSION = "1.12.1"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -4531,6 +4531,19 @@ class Viewer(object):
                          % (text, "/".join(n for n, _ in Viewer.PALETTE)))
 
     @staticmethod
+    def option_fill(text):
+        """A fill value: like option_color, but #RRGGBBAA also works —
+        the AA byte is the interior alpha.  Returns (color, alpha),
+        alpha None when the value does not carry one."""
+        if text.startswith("#") and len(text) == 9:
+            try:
+                int(text[1:], 16)
+                return text[:7], int(text[7:9], 16)
+            except ValueError:
+                pass
+        return Viewer.option_color(text), None
+
+    @staticmethod
     def parse_anno_option(kind, value):
         """One --box/--ellipse/--line/--ruler/--text command-line value as
         a full annotation dict (same fields as parse_anno_line yields).
@@ -4628,16 +4641,10 @@ class Viewer(object):
                     anno["color"] = Viewer.option_color(color)
             if kind == "polygon" and parts:  # FILL, like a box
                 fill = parts.pop(0)
-                if fill.startswith("#") and len(fill) == 9:
-                    try:
-                        int(fill[1:9], 16)
-                    except ValueError:
-                        raise ValueError("bad fill: %s" % fill)
-                    anno["fill"] = fill[:7]
-                    anno["fill_alpha"] = int(fill[7:9], 16)
-                elif fill not in ("", "0"):
-                    anno["fill"] = Viewer.option_color(fill)
-                    anno["fill_alpha"] = 89
+                if fill not in ("", "0"):
+                    anno["fill"], embedded = Viewer.option_fill(fill)
+                    anno["fill_alpha"] = 89 if embedded is None \
+                        else embedded
             if not anno.get("outline", True) and "fill" not in anno:
                 raise ValueError("0 (no outline) needs a FILL")
             if parts:
@@ -4684,16 +4691,9 @@ class Viewer(object):
                 anno["color"] = Viewer.option_color(color)
         if rest and kind != "line":  # 6th: fill, AA of #RRGGBBAA = alpha
             fill = rest.pop(0)
-            if fill.startswith("#") and len(fill) == 9:
-                try:
-                    int(fill[1:9], 16)
-                except ValueError:
-                    raise ValueError("bad fill: %s" % fill)
-                anno["fill"] = fill[:7]
-                anno["fill_alpha"] = int(fill[7:9], 16)
-            elif fill not in ("", "0"):
-                anno["fill"] = Viewer.option_color(fill)
-                anno["fill_alpha"] = 89
+            if fill not in ("", "0"):
+                anno["fill"], embedded = Viewer.option_fill(fill)
+                anno["fill_alpha"] = 89 if embedded is None else embedded
         if not anno.get("outline", True) and "fill" not in anno:
             raise ValueError("0 (no outline) needs a FILL")
         if rest:  # then WIDTH 1-8 and DASH solid/dashed/dotted
@@ -4780,9 +4780,13 @@ class Viewer(object):
                         if not 0 <= fill_alpha <= 255:
                             raise ValueError("fill_alpha must be 0-255")
                     if fill is not None:
-                        anno["fill"] = Viewer.option_color(str(fill))
+                        # "#RRGGBBAA" carries the alpha in the value;
+                        # an explicit fill_alpha wins over it
+                        anno["fill"], embedded = Viewer.option_fill(
+                            str(fill))
                         anno["fill_alpha"] = fill_alpha \
-                            if fill_alpha is not None else 89
+                            if fill_alpha is not None \
+                            else (89 if embedded is None else embedded)
                     if not obj.pop("outline", True):
                         if fill is None:
                             raise ValueError("outline=false needs a fill")
@@ -4821,9 +4825,13 @@ class Viewer(object):
                         if not 0 <= fill_alpha <= 255:
                             raise ValueError("fill_alpha must be 0-255")
                     if fill is not None:
-                        anno["fill"] = Viewer.option_color(str(fill))
+                        # "#RRGGBBAA" carries the alpha in the value;
+                        # an explicit fill_alpha wins over it
+                        anno["fill"], embedded = Viewer.option_fill(
+                            str(fill))
                         anno["fill_alpha"] = fill_alpha \
-                            if fill_alpha is not None else 89
+                            if fill_alpha is not None \
+                            else (89 if embedded is None else embedded)
                     if not obj.pop("outline", True):
                         if fill is None:
                             raise ValueError("outline=false needs a fill")

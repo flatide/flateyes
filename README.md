@@ -445,7 +445,7 @@ black·white·red·orange·green·sky·pink 또는 `#RRGGBB`):
 | kind | 필수 | 선택 |
 |---|---|---|
 | 최상위 객체 | — | *ppu*(>0, ruler 환산 배율), *unit*(기본 um), *note*(이미지 메모, `\n` 줄바꿈), *legend*(범례 정의 줄의 배열 — "Legend 오버레이" 절의 문법), *annotations*(배열) |
-| `box` / `ellipse` | 좌표 | *color*(기본 red), *width*(1~8, 기본 1), *dash*(`solid`/`dashed`/`dotted`, 기본 solid), *casing*(검은 테두리, 기본 true), *fill*(채움 색, 기본 없음), *fill_alpha*(내부 알파 0~255, 기본 89=35%), *outline*(false면 윤곽선 없음 — fill 필수) |
+| `box` / `ellipse` | 좌표 | *color*(기본 red), *width*(1~8, 기본 1), *dash*(`solid`/`dashed`/`dotted`, 기본 solid), *casing*(검은 테두리, 기본 true), *fill*(채움 색, 기본 없음 — `#RRGGBBAA`로 주면 AA가 내부 알파), *fill_alpha*(내부 알파 0~255, 기본 89=35% — fill의 AA보다 우선), *outline*(false면 윤곽선 없음 — fill 필수) |
 | `line` | 좌표 | *color*, *width*, *dash*, *casing* (box와 동일) |
 | `path` | `points`(`[[x, y], ...]` 2개 이상, 순서대로 잇는 연속 선분) | *color*, *width*, *dash*, *casing* (line과 동일) |
 | `polygon` | `points`(`[[x, y], ...]` 3개 이상, 첫 점으로 닫힘) | *color*, *width*, *dash*, *casing* (line과 동일) + *fill*, *fill_alpha*, *outline* (box와 동일) |
