@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.9.1"
+VERSION = "1.10.0"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -913,7 +913,7 @@ class Viewer(object):
         self.anno_outline = True                # draw the box/ellipse border
         self.anno_fill = True                   # fill the box/ellipse
         self.anno_fill_color = self.DEFAULT_BG
-        self.anno_fill_opaque = False           # off = translucent 0.35
+        self.anno_fill_alpha = 89               # interior alpha, 89 = 0.35
         # Text style (text dialog), sticky but separate from the shapes.
         self.anno_text_color = self.DEFAULT_LINE
         self.anno_text_bg = True                # backdrop on/off
@@ -2151,10 +2151,9 @@ class Viewer(object):
             parts.append('<span foreground="%s">■■</span> %s outline'
                          % (self.anno_line_color, stroke))
         if self.anno_fill:
-            parts.append('<span foreground="%s">■■</span> %s fill'
+            parts.append('<span foreground="%s">■■</span> %d%% fill'
                          % (self.anno_fill_color,
-                            "opaque" if self.anno_fill_opaque
-                            else "translucent"))
+                            round(self.anno_fill_alpha * 100 / 255)))
         if self.anno_outline and not self.anno_casing:
             parts.append("no halo")
         return "  ".join(parts)
@@ -2831,7 +2830,7 @@ class Viewer(object):
             if self.anno_tool in ("box", "ellipse"):
                 if self.anno_fill:
                     preview["fill"] = self.anno_fill_color
-                    preview["fill_opaque"] = self.anno_fill_opaque
+                    preview["fill_alpha"] = self.anno_fill_alpha
                 if not self.anno_outline:
                     preview["outline"] = False
             if not self.anno_casing:
@@ -2863,7 +2862,7 @@ class Viewer(object):
         img_alloc = self.image.get_allocation()
         key = (self.anno_rev, self.anno_line_color, self.anno_line_width,
                self.anno_line_dash, self.anno_casing, self.anno_outline,
-               self.anno_fill, self.anno_fill_color, self.anno_fill_opaque,
+               self.anno_fill, self.anno_fill_color, self.anno_fill_alpha,
                self.anno_highlight,
                preview and (preview.get("a"), preview.get("b"),
                             tuple(preview.get("points", ()))),
@@ -3177,7 +3176,9 @@ class Viewer(object):
         fill_rgba = None
         if shape.get("fill"):
             fill_rgba = self.color_rgba(
-                shape["fill"], 0xFF if shape.get("fill_opaque") else 0x59)
+                shape["fill"], shape.get("fill_alpha",
+                                         0xFF if shape.get("fill_opaque")
+                                         else 0x59))
         outline = shape.get("outline", True)
         stroke_dash = shape.get("dash", 0)
         if shape["kind"] == "box":
@@ -3607,8 +3608,12 @@ class Viewer(object):
         use_outline.set_active(self.anno_outline)
         use_fill = Gtk.CheckButton(label="use")
         use_fill.set_active(self.anno_fill)
-        fill_opaque = Gtk.CheckButton(label="opaque")
-        fill_opaque.set_active(self.anno_fill_opaque)
+        alpha_spin = Gtk.SpinButton.new_with_range(1, 100, 5)
+        alpha_spin.set_value(round(self.anno_fill_alpha * 100 / 255))
+        alpha_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
+                            spacing=4)
+        alpha_box.pack_start(alpha_spin, False, False, 0)
+        alpha_box.pack_start(Gtk.Label(label="% opacity"), False, False, 0)
         # The color row doubles up: the box/ellipse outline, or the line
         # color itself while the line shape is chosen — retitled live.
         outline_label = Gtk.Label(label="outline")
@@ -3632,7 +3637,7 @@ class Viewer(object):
             stroked = is_line or use_outline.get_active()
             outline_label.set_text("line" if is_line else "outline")
             line_combo.set_sensitive(stroked)
-            for widget in (fill_combo, fill_opaque):
+            for widget in (fill_combo, alpha_box):
                 widget.set_sensitive(not is_line and use_fill.get_active())
             for widget in (halo_check, width_label, width_spin,
                            type_combo):
@@ -3661,7 +3666,7 @@ class Viewer(object):
         grid.attach(use_outline, 2, 0, 1, 1)
         grid.attach(halo_check, 3, 0, 1, 1)
         grid.attach(use_fill, 2, 1, 1, 1)
-        grid.attach(fill_opaque, 3, 1, 1, 1)
+        grid.attach(alpha_box, 3, 1, 1, 1)
         width_label.set_halign(Gtk.Align.START)
         grid.attach(width_label, 0, 2, 1, 1)
         grid.attach(width_spin, 1, 2, 1, 1)
@@ -3680,7 +3685,8 @@ class Viewer(object):
         fill_color = hexes[max(fill_combo.get_active(), 0)]
         outline_on = use_outline.get_active()
         fill_on = use_fill.get_active()
-        fill_op = fill_opaque.get_active()
+        fill_alpha = max(1, min(int(round(
+            alpha_spin.get_value() * 255 / 100)), 255))
         line_width = int(width_spin.get_value())
         line_dash = max(type_combo.get_active(), 0)
         halo_on = halo_check.get_active()
@@ -3696,7 +3702,7 @@ class Viewer(object):
         self.anno_outline = outline_on
         self.anno_fill_color = fill_color
         self.anno_fill = fill_on
-        self.anno_fill_opaque = fill_op
+        self.anno_fill_alpha = fill_alpha
         # set_anno_tool shows the mode+style as a persistent toast
         self.set_anno_tool(shape)
 
@@ -4078,9 +4084,13 @@ class Viewer(object):
                        anno["size"], color, backdrop,
                        Viewer.escape_meta(anno["text"])))
         if anno.get("fill"):
-            # same #RRGGBBAA form as the text backdrop field
+            # same #RRGGBBAA form as the text backdrop field; AA is the
+            # interior alpha verbatim (older builds read >= 80 as their
+            # opaque, anything else as their translucent 0.35)
             fill = "%s%02X" % (anno["fill"],
-                               255 if anno.get("fill_opaque") else 89)
+                               anno.get("fill_alpha",
+                                        255 if anno.get("fill_opaque")
+                                        else 89))
         else:
             fill = "0"
         if not anno.get("outline", True):
@@ -4356,7 +4366,7 @@ class Viewer(object):
             try:
                 int(fill[1:9], 16)
                 anno["fill"] = fill[:7]
-                anno["fill_opaque"] = int(fill[7:9], 16) >= 0x80
+                anno["fill_alpha"] = int(fill[7:9], 16)
             except ValueError:
                 pass
         if len(parts) > 6:
@@ -4512,7 +4522,7 @@ class Viewer(object):
                 anno["outline"] = False
             elif color:
                 anno["color"] = Viewer.option_color(color)
-        if rest and kind != "line":  # 6th: fill, #RRGGBBAA makes it opaque
+        if rest and kind != "line":  # 6th: fill, AA of #RRGGBBAA = alpha
             fill = rest.pop(0)
             if fill.startswith("#") and len(fill) == 9:
                 try:
@@ -4520,10 +4530,10 @@ class Viewer(object):
                 except ValueError:
                     raise ValueError("bad fill: %s" % fill)
                 anno["fill"] = fill[:7]
-                anno["fill_opaque"] = int(fill[7:9], 16) >= 0x80
+                anno["fill_alpha"] = int(fill[7:9], 16)
             elif fill not in ("", "0"):
                 anno["fill"] = Viewer.option_color(fill)
-                anno["fill_opaque"] = False
+                anno["fill_alpha"] = 89
         if not anno.get("outline", True) and "fill" not in anno:
             raise ValueError("0 (no outline) needs a FILL")
         if rest:  # then WIDTH 1-8 and DASH solid/dashed/dotted
@@ -4624,9 +4634,19 @@ class Viewer(object):
                 if kind in ("box", "ellipse"):
                     fill = obj.pop("fill", None)
                     fill_opaque = bool(obj.pop("fill_opaque", False))
+                    fill_alpha = obj.pop("fill_alpha", None)
+                    if fill_alpha is not None:
+                        try:
+                            fill_alpha = int(fill_alpha)
+                        except (TypeError, ValueError):
+                            fill_alpha = -1
+                        if not 0 <= fill_alpha <= 255:
+                            raise ValueError("fill_alpha must be 0-255")
                     if fill is not None:
                         anno["fill"] = Viewer.option_color(str(fill))
-                        anno["fill_opaque"] = fill_opaque
+                        anno["fill_alpha"] = fill_alpha \
+                            if fill_alpha is not None \
+                            else (255 if fill_opaque else 89)
                     if not obj.pop("outline", True):
                         if fill is None:
                             raise ValueError("outline=false needs a fill")
@@ -5203,7 +5223,7 @@ class Viewer(object):
             if self.anno_tool in ("box", "ellipse"):
                 if self.anno_fill:
                     anno["fill"] = self.anno_fill_color
-                    anno["fill_opaque"] = self.anno_fill_opaque
+                    anno["fill_alpha"] = self.anno_fill_alpha
                 if not self.anno_outline:
                     anno["outline"] = False
             if not self.anno_casing:
@@ -5410,8 +5430,9 @@ def usage(stream):
         "Coordinates are image pixels with the origin at the image\n"
         "CENTER, x right / y down (stacks: world units, like the\n"
         "ruler).  COLOR is a palette name (%s)\n"
-        "or #RRGGBB; 0 = no outline (needs FILL).  FILL is a color, or\n"
-        "#RRGGBBAA with AA >= 80 for an opaque fill (default none).\n"
+        "or #RRGGBB; 0 = no outline (needs FILL).  FILL is a color\n"
+        "(35%% interior opacity), or #RRGGBBAA with AA = the interior\n"
+        "alpha, 00-FF (59 = 35%%, FF = opaque; default no fill).\n"
         "WIDTH is the stroke width 1-8, DASH is solid, dashed or dotted.\n"
         "\n"
         "  --box X1,Y1,X2,Y2[,COLOR[,FILL[,WIDTH[,DASH]]]]\n"
@@ -5463,7 +5484,7 @@ def usage(stream):
         "        the style - outline (use, color), stroke width (1-8 px)\n"
         "        and type (solid/dashed/dotted) for lines and outlines\n"
         "        alike, the black halo around strokes (on/off) and the\n"
-        "        box/ellipse fill (use, color, opaque/translucent); one\n"
+        "        box/ellipse fill (use, color, opacity 1-100%%); one\n"
         "        of outline/fill always stays on and texts style\n"
         "        themselves; Shift while clicking = square/circle/\n"
         "        45-degree line; a path adds a vertex per click and\n"

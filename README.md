@@ -198,7 +198,8 @@ line red    dashed metal route
   line/path 도형을 고르면 행 라벨이 "line"으로 바뀌어 선 색이 된다)과 fill
   색(박스·타원 내부)을 공통 팔레트(black·white·red·orange·green·sky·pink,
   색 견본 표시)에서 고르고, 각 행의 "use" 체크로 윤곽선/채우기 사용 여부를,
-  "opaque" 체크로 채우기의 불투명/반투명(0.35)을 정한다. "black halo" 체크는
+  "% opacity" 스핀(1~100%, 기본 35%)으로 채우기의 불투명도를 정한다 —
+  100%면 완전 불투명, 낮을수록 이미지가 더 비쳐 보인다. "black halo" 체크는
   윤곽선·라인을 둘러싸는 검은 테두리 여부다 (색이 배경에 묻히지 않게 하는
   용도, 기본 켜짐). 도형이 안 보이는 조합을 막기 위해 윤곽선과 채우기 중
   마지막 남은 하나는 끌 수 없고, 선(line·path)은 항상 라인 색으로 그려진다.
@@ -320,8 +321,9 @@ flateyes --json annos.json image.png
   ruler와 동일). 스택 레벨 간 공용 좌표계와 맞추기 위한 설계다.
 - **COLOR**: 팔레트 이름(black·white·red·orange·green·sky·pink) 또는
   `#RRGGBB`. 생략하면 red. `0`이면 윤곽선 없음 (FILL 필수).
-- **FILL**(박스·타원 내부): 색 이름/`#RRGGBB`는 반투명(0.35),
-  `#RRGGBBAA`로 주면 AA가 `80` 이상일 때 불투명. 생략하면 채우기 없음.
+- **FILL**(박스·타원 내부): 색 이름/`#RRGGBB`는 반투명(35%),
+  `#RRGGBBAA`로 주면 AA(16진수 `00`~`FF`)가 그대로 내부 불투명도가 된다
+  (`59`=35%, `FF`=불투명). 생략하면 채우기 없음.
 - **WIDTH**: 굵기 1~8px (기본 1). **DASH**: `solid`/`dashed`/`dotted`
   (또는 0/1/2, 기본 solid).
 - `--path`는 나열한 좌표를 순서대로 잇는 연속 선분(꼭짓점 2개 이상)이다 —
@@ -405,7 +407,8 @@ note·legend까지 파일 하나에 담을 수 있다 (모든 키 선택,
     {"kind": "box", "x1": 40, "y1": 40, "x2": 90, "y2": 90,
      "outline": false, "fill": "orange", "fill_opaque": true},
     {"kind": "ellipse", "a": [500, 100], "b": [640, 200],
-     "color": "#35C5FF", "fill": "sky", "casing": false},
+     "color": "#35C5FF", "fill": "sky", "fill_alpha": 128,
+     "casing": false},
     {"kind": "line", "x1": 0, "y1": 0, "x2": 300, "y2": 200,
      "color": "green", "width": 4, "dash": "dotted"},
     {"kind": "path", "points": [[30, 300], [120, 260], [120, 380], [260, 380]],
@@ -424,7 +427,7 @@ black·white·red·orange·green·sky·pink 또는 `#RRGGBB`):
 | kind | 필수 | 선택 |
 |---|---|---|
 | 최상위 객체 | — | *ppu*(>0, ruler 환산 배율), *unit*(기본 um), *note*(이미지 메모, `\n` 줄바꿈), *legend*(범례 정의 줄의 배열 — "Legend 오버레이" 절의 문법), *annotations*(배열) |
-| `box` / `ellipse` | 좌표 | *color*(기본 red), *width*(1~8, 기본 1), *dash*(`solid`/`dashed`/`dotted`, 기본 solid), *casing*(검은 테두리, 기본 true), *fill*(채움 색, 기본 없음), *fill_opaque*(기본 false=반투명), *outline*(false면 윤곽선 없음 — fill 필수) |
+| `box` / `ellipse` | 좌표 | *color*(기본 red), *width*(1~8, 기본 1), *dash*(`solid`/`dashed`/`dotted`, 기본 solid), *casing*(검은 테두리, 기본 true), *fill*(채움 색, 기본 없음), *fill_alpha*(내부 알파 0~255, 기본 89=35%), *fill_opaque*(구형 스위치, true=255 — fill_alpha가 우선), *outline*(false면 윤곽선 없음 — fill 필수) |
 | `line` | 좌표 | *color*, *width*, *dash*, *casing* (box와 동일) |
 | `path` | `points`(`[[x, y], ...]` 2개 이상, 순서대로 잇는 연속 선분) | *color*, *width*, *dash*, *casing* (line과 동일) |
 | `ruler` | 좌표 | 없음 (ppu/unit로 환산 표시) |

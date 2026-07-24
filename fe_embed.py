@@ -22,6 +22,7 @@ Library use:
     import fe_embed as fe
     fe.embed("shot_0001.png", [
         fe.box(120, 80, 420, 300, color="red", width=2),
+        fe.box(-60, -50, 60, 50, fill="sky", fill_alpha=0x30),
         fe.text(120, 60, "DEFECT #17", size=20, color="white"),
     ], ppu=8.0, unit="um", note="capture rig #3")
 
@@ -111,7 +112,7 @@ def _dash(value):
 
 
 def _shape(kind, x1, y1, x2, y2, color, fill, fill_opaque, outline,
-           width, dash, casing):
+           width, dash, casing, fill_alpha=None):
     anno = {"kind": kind,
             "a": (float(x1), float(y1)), "b": (float(x2), float(y2)),
             "color": _color(color)}
@@ -123,9 +124,19 @@ def _shape(kind, x1, y1, x2, y2, color, fill, fill_opaque, outline,
         anno["casing"] = False
     if kind == "line":
         return anno
+    if fill_alpha is not None:
+        try:
+            fill_alpha = int(fill_alpha)
+        except (TypeError, ValueError):
+            fill_alpha = -1
+        if not 0 <= fill_alpha <= 255:
+            raise ValueError("fill_alpha must be 0-255")
     if fill is not None:
         anno["fill"] = _color(fill, "fill")
-        anno["fill_opaque"] = bool(fill_opaque)
+        # fill_alpha (exact interior alpha) wins over the legacy
+        # fill_opaque switch (255 vs the translucent 89)
+        anno["fill_alpha"] = fill_alpha if fill_alpha is not None \
+            else (255 if fill_opaque else TRANSLUCENT_ALPHA)
     if not outline:
         if fill is None:
             raise ValueError("outline=False needs a fill")
@@ -134,18 +145,19 @@ def _shape(kind, x1, y1, x2, y2, color, fill, fill_opaque, outline,
 
 
 def box(x1, y1, x2, y2, color=DEFAULT_LINE, fill=None, fill_opaque=False,
-        outline=True, width=1, dash="solid", casing=True):
+        outline=True, width=1, dash="solid", casing=True,
+        fill_alpha=None):
     """Rectangle from (x1,y1) to (x2,y2) in center-origin image px."""
     return _shape("box", x1, y1, x2, y2, color, fill, fill_opaque,
-                  outline, width, dash, casing)
+                  outline, width, dash, casing, fill_alpha)
 
 
 def ellipse(x1, y1, x2, y2, color=DEFAULT_LINE, fill=None,
             fill_opaque=False, outline=True, width=1, dash="solid",
-            casing=True):
+            casing=True, fill_alpha=None):
     """Ellipse inscribed in the (x1,y1)-(x2,y2) rectangle."""
     return _shape("ellipse", x1, y1, x2, y2, color, fill, fill_opaque,
-                  outline, width, dash, casing)
+                  outline, width, dash, casing, fill_alpha)
 
 
 def line(x1, y1, x2, y2, color=DEFAULT_LINE, width=1, dash="solid",
@@ -296,8 +308,12 @@ def serialize_anno(anno):
                 % (anno["at"][0], anno["at"][1], anno["size"], color,
                    backdrop, escape_meta(anno["text"])))
     if anno.get("fill"):
-        fill = "%s%02X" % (anno["fill"], 255 if anno.get("fill_opaque")
-                           else TRANSLUCENT_ALPHA)
+        # AA is the interior alpha verbatim (older builds read >= 80
+        # as their opaque, anything else as their translucent 0.35)
+        fill = "%s%02X" % (anno["fill"],
+                           anno.get("fill_alpha",
+                                    255 if anno.get("fill_opaque")
+                                    else TRANSLUCENT_ALPHA))
     else:
         fill = "0"
     if not anno.get("outline", True):
@@ -408,7 +424,7 @@ def parse_anno_line(key, value):
         try:
             int(fill[1:9], 16)
             anno["fill"] = fill[:7]
-            anno["fill_opaque"] = int(fill[7:9], 16) >= 0x80
+            anno["fill_alpha"] = int(fill[7:9], 16)
         except ValueError:
             pass
     if len(parts) > 6:
@@ -704,7 +720,7 @@ def parse_anno_option(kind, value):
             kwargs["outline"] = False
         elif color:
             kwargs["color"] = color
-    if rest and kind != "line":  # 6th: fill, #RRGGBBAA makes it opaque
+    if rest and kind != "line":  # 6th: fill, AA of #RRGGBBAA = alpha
         fill = rest.pop(0)
         if fill.startswith("#") and len(fill) == 9:
             try:
@@ -712,7 +728,7 @@ def parse_anno_option(kind, value):
             except ValueError:
                 raise ValueError("bad fill: %s" % fill)
             kwargs["fill"] = fill[:7]
-            kwargs["fill_opaque"] = int(fill[7:9], 16) >= 0x80
+            kwargs["fill_alpha"] = int(fill[7:9], 16)
         elif fill not in ("", "0"):
             kwargs["fill"] = fill
     if rest:  # then WIDTH 1-8 and DASH solid/dashed/dotted
@@ -970,6 +986,7 @@ def _sample_annos():
         box(10, 20, 200, 120, color="red", width=2),
         box(30, 40, 90, 80, fill="orange", fill_opaque=True,
             outline=False),
+        box(-60, -50, -10, -5, fill="sky", fill_alpha=0x30),
         ellipse(50.5, 60.25, 150, 160, color="#123ABC", fill="sky",
                 dash="dashed", casing=False),
         line(0, 0, 199, 99, color="green", width=8, dash="dotted"),
@@ -1075,6 +1092,7 @@ def selftest():
             options = [
                 ("box", "10,20,200,120,red,0,2"),
                 ("box", "30,40,90,80,0,orange"),
+                ("box", "-60,-50,-10,-5,sky,#35C5FF30"),
                 ("ellipse", "50.5,60.25,150,160,#123ABC,sky,1,dashed"),
                 ("line", "0,0,199,99,green,8,dotted"),
                 ("path", "5,5,60,40.5,60,90,110.25,90,pink,3,dashed"),
@@ -1098,6 +1116,8 @@ def selftest():
                 {"kind": "ellipse", "a": [1, 2], "b": [30, 40],
                  "fill": "#FF9F1A", "fill_opaque": True,
                  "outline": False},
+                {"kind": "box", "x1": -60, "y1": -50, "x2": -10,
+                 "y2": -5, "fill": "sky", "fill_alpha": 48},
                 {"kind": "line", "x1": 0, "y1": 0, "x2": 9, "y2": 9,
                  "dash": "dotted", "casing": False},
                 {"kind": "path", "points": [[1, 2], [30, 2], [30, 44]],
