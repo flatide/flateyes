@@ -37,11 +37,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.12.1"
+VERSION = "1.13.0"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
-Gtk = Gdk = GdkPixbuf = GLib = None
+Gtk = Gdk = GdkPixbuf = GLib = Pango = None
 
 
 # ---------------------------------------------------------------------------
@@ -447,20 +447,20 @@ class TextViewEditable(object):
 # ---------------------------------------------------------------------------
 
 def import_gtk():
-    global Gtk, Gdk, GdkPixbuf, GLib
+    global Gtk, Gdk, GdkPixbuf, GLib, Pango
     try:
         import gi
         gi.require_version("Gtk", "3.0")
         gi.require_version("GdkPixbuf", "2.0")
         from gi.repository import Gtk as _Gtk, Gdk as _Gdk, \
-            GdkPixbuf as _GdkPixbuf, GLib as _GLib
+            GdkPixbuf as _GdkPixbuf, GLib as _GLib, Pango as _Pango
     except (ImportError, ValueError) as exc:
         sys.stderr.write(
             "%s: PyGObject/GTK3 is required to open a window (%s)\n"
             "  verify with: python3 -c 'import gi; gi.require_version(\"Gtk\", \"3.0\")'\n"
             % (APP, exc))
         sys.exit(3)
-    Gtk, Gdk, GdkPixbuf, GLib = _Gtk, _Gdk, _GdkPixbuf, _GLib
+    Gtk, Gdk, GdkPixbuf, GLib, Pango = _Gtk, _Gdk, _GdkPixbuf, _GLib, _Pango
     # PyGObject already ran gtk_init_check() while importing; when it
     # failed (DISPLAY set but the X server unreachable: dead or restarted
     # session, xauth mismatch, ...) the first widget would raise a
@@ -945,6 +945,7 @@ class Viewer(object):
         self.legend_image = Gtk.Image()
         # Text legend rows: pixbuf swatch + Gtk.Label (no cairo, so the
         # text cannot be stamped into a pixbuf; widgets do the type).
+        self.legend_labels = []   # (label, full text) for hover tooltips
         self.legend_grid = Gtk.Grid()
         self.legend_grid.set_column_spacing(7)
         self.legend_grid.set_row_spacing(4)
@@ -1904,11 +1905,17 @@ class Viewer(object):
     # -- legend overlay ------------------------------------------------------
 
     LEGEND_SWATCH = (36, 14)  # swatch pixbuf size in the text legend
+    LEGEND_LABEL_CHARS = 24   # labels ellipsize past this width
 
     def build_text_legend(self):
-        """Rebuild the swatch/label rows from self.legend_entries."""
+        """Rebuild the swatch/label rows from self.legend_entries.
+        Long labels ellipsize at a fixed width instead of widening the
+        legend; hovering shows the full text (per-label tooltips when
+        the scroller takes events, the overlay handler answers while
+        events pass through)."""
         for child in self.legend_grid.get_children():
             child.destroy()
+        del self.legend_labels[:]
         if not self.legend_entries:
             return
         for row, entry in enumerate(self.legend_entries):
@@ -1920,9 +1927,31 @@ class Viewer(object):
                 '<span foreground="#f0f0f0" size="small">%s</span>'
                 % GLib.markup_escape_text(entry["label"]))
             label.set_halign(Gtk.Align.START)
+            label.set_max_width_chars(self.LEGEND_LABEL_CHARS)
+            label.set_ellipsize(Pango.EllipsizeMode.END)
+            label.set_has_tooltip(True)
+            label.connect("query-tooltip", self.on_legend_label_tooltip)
+            self.legend_labels.append((label, entry["label"]))
             self.legend_grid.attach(swatch, 0, row, 1, 1)
             self.legend_grid.attach(label, 1, row, 1, 1)
         self.legend_grid.show_all()
+
+    def legend_label_tooltip(self, label):
+        """The full text for an ellipsized legend label, else None."""
+        layout = label.get_layout()
+        if layout is None or not layout.is_ellipsized():
+            return None
+        for widget, full in self.legend_labels:
+            if widget is label:
+                return full
+        return None
+
+    def on_legend_label_tooltip(self, label, x, y, keyboard_mode, tooltip):
+        text = self.legend_label_tooltip(label)
+        if text is None:
+            return False
+        tooltip.set_text(text)
+        return True
 
     def legend_swatch(self, entry):
         """One swatch pixbuf; the interior stays transparent so the
@@ -2261,16 +2290,29 @@ class Viewer(object):
         self.fit_info_overlays(allocation)
 
     def on_overlay_query_tooltip(self, widget, x, y, keyboard_mode, tooltip):
-        if self.path_tooltip is None or not self.path_label.get_visible():
-            return False
-        coords = widget.translate_coordinates(self.path_label, int(x), int(y))
-        if not coords:
-            return False
-        lx, ly = coords[-2], coords[-1]
-        alloc = self.path_label.get_allocation()
-        if 0 <= lx < alloc.width and 0 <= ly < alloc.height:
+        def hit(target):
+            coords = widget.translate_coordinates(target, int(x), int(y))
+            if not coords:
+                return False
+            tx, ty = coords[-2], coords[-1]
+            alloc = target.get_allocation()
+            return 0 <= tx < alloc.width and 0 <= ty < alloc.height
+
+        if self.path_tooltip is not None and self.path_label.get_visible() \
+                and hit(self.path_label):
             tooltip.set_text(self.path_tooltip)
             return True
+        # Ellipsized legend labels: while events pass through to the
+        # image, the labels never see the pointer, so answer here.
+        if self.legend_frame.get_visible() \
+                and self.legend_scroll.get_visible():
+            for label, _ in self.legend_labels:
+                if hit(label):
+                    text = self.legend_label_tooltip(label)
+                    if text is None:
+                        return False
+                    tooltip.set_text(text)
+                    return True
         return False
 
     # -- ruler ---------------------------------------------------------------
