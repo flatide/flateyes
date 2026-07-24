@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.13.1"
+VERSION = "1.13.2"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -5145,8 +5145,32 @@ class Viewer(object):
             return not self.anno_dirty  # a failed save keeps the window
         return response == Gtk.ResponseType.REJECT
 
+    def command_key(self, event):
+        """Key name for shortcut matching.  When a non-Latin layout
+        owns the keyboard (e.g. a Hangul xkb group, or the OS IME on a
+        remote client), the keyval is a jamo and "q"/"d"/... would go
+        dead - so re-translate the hardware keycode against the
+        keymap's groups and take the first Latin result.  Special keys
+        (Escape, F1, arrows: no unicode) keep their name as is."""
+        name = Gdk.keyval_name(event.keyval) or ""
+        uni = Gdk.keyval_to_unicode(event.keyval)
+        if not uni or uni < 0x80:
+            return name  # ASCII or a special key: usable as is
+        try:
+            keymap = Gdk.Keymap.get_for_display(
+                self.window.get_display())
+            shift = event.state & Gdk.ModifierType.SHIFT_MASK
+            for group in range(4):
+                res = keymap.translate_keyboard_state(
+                    event.hardware_keycode, shift, group)
+                if res[0] and 0 < Gdk.keyval_to_unicode(res[1]) < 0x80:
+                    return Gdk.keyval_name(res[1])
+        except (AttributeError, TypeError):
+            pass  # keymap API surprises: fall back to the raw name
+        return name
+
     def on_key(self, widget, event):
-        key = Gdk.keyval_name(event.keyval)
+        key = self.command_key(event)
         if self.browser_active:  # the thumbnail browser has its own keys
             if key in ("q", "Q"):
                 self.request_quit()
@@ -5169,7 +5193,7 @@ class Viewer(object):
             self.update_note_overlay()
             self.apply_legend_visibility()
             self.update_mode_toast()
-        elif key == "question":  # "?": help strip, readouts, level outline
+        elif key in ("question", "slash"):  # help, readouts, level outline
             self.info_visible = not self.info_visible
             self.apply_help_visibility()
             self.update_hint_overlay()
@@ -5248,7 +5272,7 @@ class Viewer(object):
                 self.ask_ppu()
         elif key in ("plus", "equal", "KP_Add"):
             self.set_view_scale(self.current_view_scale() * self.ZOOM_STEP)
-        elif key in ("minus", "KP_Subtract"):
+        elif key in ("minus", "underscore", "KP_Subtract"):
             self.set_view_scale(self.current_view_scale() / self.ZOOM_STEP)
         elif key in ("0", "KP_0"):
             self.set_view_scale(self.active_level()["ppu"])
