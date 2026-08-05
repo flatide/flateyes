@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.13.2"
+VERSION = "1.14.0"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -742,12 +742,26 @@ class Viewer(object):
         self.browser_scroll.set_policy(Gtk.PolicyType.AUTOMATIC,
                                        Gtk.PolicyType.AUTOMATIC)
         self.browser_scroll.add(self.browser_view)
+        # Breadcrumb path bar: one button per component of the current
+        # folder, so any ancestor is one click away.
+        self.browser_crumbs = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        self.browser_crumb_scroll = Gtk.ScrolledWindow()
+        self.browser_crumb_scroll.set_policy(Gtk.PolicyType.AUTOMATIC,
+                                             Gtk.PolicyType.NEVER)
+        self.browser_crumb_scroll.add(self.browser_crumbs)
+        # A rebuild or resize changes the range ("changed", not the
+        # user's "value-changed"): keep the deepest folder in view.
+        self.browser_crumb_scroll.get_hadjustment().connect(
+            "changed", lambda adj: adj.set_value(
+                max(0.0, adj.get_upper() - adj.get_page_size())))
         self.browser_status = Gtk.Label()
         self.browser_status.set_halign(Gtk.Align.START)
         self.browser_status.set_margin_start(8)
         self.browser_status.set_margin_top(2)
         self.browser_status.set_margin_bottom(2)
         self.browser_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.browser_box.pack_start(self.browser_crumb_scroll,
+                                    False, False, 0)
         self.browser_box.pack_start(self.browser_scroll, True, True, 0)
         self.browser_box.pack_start(self.browser_status, False, False, 0)
         self.browser_box.set_no_show_all(True)
@@ -1314,6 +1328,38 @@ class Viewer(object):
         self.update_title()
         self.pump_warm()   # resume any cache warming the browser paused
 
+    def update_browser_crumbs(self, folder):
+        """Rebuild the path bar: a flat button per component, each a
+        direct jump; clicking the current (bold) one re-reads it."""
+        for child in self.browser_crumbs.get_children():
+            child.destroy()
+        parts = []
+        path = folder
+        while True:
+            head, tail = os.path.split(path)
+            if not tail:              # reached the root ("/")
+                parts.append((head or path, head or path))
+                break
+            parts.append((tail, path))
+            if head == path:          # safety net against odd paths
+                break
+            path = head
+        parts.reverse()
+        for index, (name, target) in enumerate(parts):
+            if index and not parts[index - 1][0].endswith(os.sep):
+                self.browser_crumbs.pack_start(
+                    Gtk.Label(label=os.sep), False, False, 0)
+            button = Gtk.Button(label=name)
+            button.set_relief(Gtk.ReliefStyle.NONE)
+            button.set_can_focus(False)  # keys stay on the icon view
+            if target == folder:
+                button.get_child().set_markup(
+                    "<b>%s</b>" % GLib.markup_escape_text(name))
+            button.connect("clicked",
+                           lambda _b, p=target: self.populate_browser(p))
+            self.browser_crumbs.pack_start(button, False, False, 0)
+        self.browser_crumbs.show_all()
+
     def populate_browser(self, folder, select=None):
         """One os.scandir deep: subfolders first, then this folder's
         images.  The scan runs on a worker thread and the rows land via
@@ -1335,7 +1381,8 @@ class Viewer(object):
         self.warm_folder = folder
         self.scan_generation += 1
         self.window.set_title("%s - %s" % (folder, APP_TITLE))
-        self.browser_status.set_text("%s   reading..." % folder)
+        self.update_browser_crumbs(folder)
+        self.browser_status.set_text("reading...")
         parent = os.path.dirname(folder)
         if parent and parent != folder:
             self.browser_store.append(
@@ -1432,9 +1479,9 @@ class Viewer(object):
         if not error:
             ndirs = len(self.browser_dir_keys)
             self.browser_status.set_text(
-                "%s   %d folder%s, %d image%s   "
+                "%d folder%s, %d image%s   "
                 "(Enter opens, BackSpace up, Esc back, q quits)"
-                % (folder, ndirs, "" if ndirs == 1 else "s",
+                % (ndirs, "" if ndirs == 1 else "s",
                    len(images), "" if len(images) == 1 else "s"))
         return False
 
