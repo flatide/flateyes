@@ -298,7 +298,18 @@ def parse_legend_line(value):
     styles = LEGEND_BOX_STYLES if kind == "box" else LEGEND_LINE_STYLES
     style = "solid"
     rest = parts[2:]
-    if rest and rest[0].lower() in styles:
+    if kind == "box" and rest and rest[0].lower().startswith("pat:"):
+        # floe fill-pattern swatch: 16x16 bitmap as 16 u16 rows,
+        # 4 hex chars each, MSB = leftmost pixel (the
+        # fillpatterns.def convention)
+        hexs = rest[0][4:].lower()
+        if len(hexs) != 64 or any(c not in "0123456789abcdef"
+                                  for c in hexs):
+            raise ValueError("bad pat: style (need 64 hex chars = "
+                             "16x16 bitmap, MSB left)")
+        style = "pat:" + hexs
+        rest = rest[1:]
+    elif rest and rest[0].lower() in styles:
         style = styles[rest[0].lower()]
         rest = rest[1:]
     if not rest:
@@ -1098,6 +1109,7 @@ def selftest():
                      "box green hatch 산화막 layer",
                      "box #FFFF66 dots via",
                      "box sky solid dots",   # label = a style word
+                     "box #D6FF3F pat:%s M4 fill" % ("aaaa5555" * 8),
                      "line red dashed metal route",
                      "line #35C5FF boundary"]
     blob = _sample_png()

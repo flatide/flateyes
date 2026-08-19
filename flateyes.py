@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.14.0"
+VERSION = "1.15.0"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -242,7 +242,18 @@ def parse_legend_entry(line):
     styles = LEGEND_BOX_STYLES if kind == "box" else LEGEND_LINE_STYLES
     style = "solid"
     rest = parts[2:]
-    if rest and rest[0].lower() in styles:
+    if kind == "box" and rest and rest[0].lower().startswith("pat:"):
+        # floe fill-pattern swatch: 16x16 bitmap as 16 u16 rows,
+        # 4 hex chars each, MSB = leftmost pixel (the
+        # fillpatterns.def convention)
+        hexs = rest[0][4:].lower()
+        if len(hexs) != 64 or any(c not in "0123456789abcdef"
+                                  for c in hexs):
+            return None, ("bad pat: style (need 64 hex chars = "
+                          "16x16 bitmap, MSB left)")
+        style = "pat:" + hexs
+        rest = rest[1:]
+    elif rest and rest[0].lower() in styles:
         style = styles[rest[0].lower()]
         rest = rest[1:]
     if not rest:
@@ -262,7 +273,10 @@ def parse_legend_text(text, origin):
     """Parse a text legend definition: one entry per line, "#" comments.
 
       box COLOR [STYLE] LABEL...     STYLE: solid (default), none
-                                     (outline only), hatch, cross, dots
+                                     (outline only), hatch, cross, dots,
+                                     pat:HEX64 (floe fill pattern:
+                                     16x16 bitmap, 16 u16 rows, MSB
+                                     = leftmost pixel)
       line COLOR [STYLE] LABEL...    STYLE: solid (default), dashed,
                                      dotted
 
@@ -2029,7 +2043,18 @@ class Viewer(object):
         if style == "solid":
             buf.fill(rgba)
             return buf
-        if style in ("hatch", "cross"):
+        if style.startswith("pat:"):
+            # floe fill pattern: tile the 16x16 bitmap over the
+            # swatch, on-bits in the entry color (MSB = leftmost)
+            hexs = style[4:]
+            rows = [int(hexs[i * 4:i * 4 + 4], 16)
+                    for i in range(16)]
+            for y in range(h):
+                r = rows[y % 16]
+                for x in range(w):
+                    if (r >> (15 - (x % 16))) & 1:
+                        self.fill_rect(buf, x, y, 1, 1, rgba)
+        elif style in ("hatch", "cross"):
             for x in range(w):
                 for y in range(h):
                     if (x + y) % 5 == 0 or \
@@ -5720,7 +5745,8 @@ def usage(stream):
         "                              line COLOR [STYLE] LABEL...\n"
         "                            COLOR as in the DRAW options; box\n"
         "                            STYLE: solid (default), none (outline\n"
-        "                            only), hatch, cross, dots; line STYLE:\n"
+        "                            only), hatch, cross, dots, pat:HEX64\n"
+        "                            (floe 16x16 fill); line STYLE:\n"
         "                            solid (default), dashed, dotted.\n"
         "                            A text legend joins the metadata like\n"
         "                            the drawn shapes: Ctrl+S embeds it\n"
