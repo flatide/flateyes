@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.16.1"
+VERSION = "1.17.0"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -740,7 +740,7 @@ class Viewer(object):
                  ("Ctrl+C", "copy"), ("Ctrl+Shift+C", "path"),
                  ("Ctrl+S", "save"), ("p", "PPU"),
                  ("o", "outline"), ("[/]", "level"),
-                 ("i", "legend/note"), ("?", "help"),
+                 ("i", "info"), ("?", "help"),
                  ("Tab", "overlays"), ("q", "quit"))
 
     def __init__(self, server_sock, first_path, first_legend=None,
@@ -768,8 +768,9 @@ class Viewer(object):
         # Overlay visibility, two groups: "i" toggles the info overlays
         # (help strip, legend, next-level outline), Tab the drawing
         # overlays (ruler, annotations).  "o" keeps its own switch.
-        self.info_visible = True    # "?": help strip, readouts, outline
-        self.meta_visible = True    # "i": legend + note
+        self.help_visible = False   # "?": the key-help strip alone
+        self.meta_visible = True    # "i": legend, note, readouts, path,
+                                    #      and the stack level outline
         self.draw_visible = True    # Tab
         self.hint_enabled = True    # "o"
         self.anno_highlight = False  # "h": emphasize the drawn shapes
@@ -2240,7 +2241,7 @@ class Viewer(object):
 
     def toasts_allowed(self):
         """Tab hides every overlay, the toast included."""
-        return self.draw_visible or self.info_visible
+        return self.draw_visible or self.meta_visible or self.help_visible
 
     def show_toast(self, text, markup=False):
         if not self.toasts_allowed():
@@ -2336,12 +2337,12 @@ class Viewer(object):
         return "  ".join(parts)
 
     def apply_help_visibility(self):
-        if self.info_visible:
-            self.help_label.show()
+        # "?" owns the key strip alone; "i" owns the readouts and path
+        self.help_label.set_visible(self.help_visible)
+        if self.meta_visible:
             self.status_label.show()
             self.path_label.show()
         else:
-            self.help_label.hide()
             self.status_label.hide()
             self.path_label.hide()
         self.update_note_overlay()
@@ -5122,7 +5123,7 @@ class Viewer(object):
     def update_hint_overlay(self):
         """Outline the area the next magnification level covers."""
         if not self.stack_mode or not self.hint_enabled \
-                or not self.info_visible or self.rendered_size is None \
+                or not self.meta_visible or self.rendered_size is None \
                 or self.level_index >= len(self.levels) - 1:
             self.hint_drawn = None
             self.hint_image.hide()
@@ -5315,15 +5316,15 @@ class Viewer(object):
             return True
         if key in ("q", "Q"):
             self.request_quit()
-        elif key in ("i", "I"):  # image metadata overlays: legend + note
+        elif key in ("i", "I"):  # legend, note, readouts, path, outline
             self.meta_visible = not self.meta_visible
-            self.update_note_overlay()
+            self.apply_help_visibility()   # readouts + path (+ note)
             self.apply_legend_visibility()
-            self.update_mode_toast()
-        elif key in ("question", "slash"):  # help, readouts, level outline
-            self.info_visible = not self.info_visible
-            self.apply_help_visibility()
             self.update_hint_overlay()
+            self.update_mode_toast()
+        elif key in ("question", "slash"):  # the key-help strip alone
+            self.help_visible = not self.help_visible
+            self.apply_help_visibility()
             self.update_mode_toast()
         elif key == "Escape":  # leaves selection/tool modes; quitting is "q"
             if self.valid_selection() is not None:
@@ -5438,10 +5439,12 @@ class Viewer(object):
                 self.hint_enabled = not self.hint_enabled
                 self.update_hint_overlay()
         elif key == "Tab":  # every overlay: drawings, info and the toast
-            visible = self.draw_visible or self.info_visible \
+            visible = self.draw_visible or self.help_visible \
                 or self.meta_visible
-            self.draw_visible = self.info_visible = self.meta_visible \
-                = not visible
+            self.draw_visible = self.meta_visible = not visible
+            if visible:
+                self.help_visible = False  # hide-all hides the strip too;
+                # showing again leaves it to "?" (off is its default)
             self.apply_help_visibility()
             self.apply_legend_visibility()
             self.update_view_overlays()
