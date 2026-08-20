@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.16.0"
+VERSION = "1.16.1"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -785,7 +785,6 @@ class Viewer(object):
         # so deep trees stay fast (the old Shift+,/. walked them all).
         self.browser_active = False
         self.browser_folder = None
-        self.from_browser = False   # image reached via the browser: Esc back
         self.thumb_queue = []       # (row index, path) pending thumbnails
         self.thumb_source = None    # idle handler feeding them
         self.thumb_pending = 0      # decode jobs in flight
@@ -1390,7 +1389,6 @@ class Viewer(object):
         """Back to the image screen (only reachable with an image)."""
         self.reset_thumb_work()
         self.browser_active = False
-        self.from_browser = True    # so Esc on the image screen goes back
         self.browser_box.hide()
         self.overlay.show()
         self.scroll.grab_focus()  # arrow keys pan again
@@ -5346,9 +5344,8 @@ class Viewer(object):
                 self.update_anno_overlay()
             elif self.anno_tool is not None:
                 self.set_anno_tool(None)
-            elif self.from_browser and not self.stack_mode:
-                # nothing left to cancel: go back to the browser we came from
-                self.enter_browser(select=self.path)
+            # deliberately NOT a way back to the browser: an Esc reflex
+            # with nothing left to cancel must never switch screens ("b")
         elif key in ("r", "R"):
             self.set_ruler_active(not self.ruler_active)
         elif key in ("b", "B"):
