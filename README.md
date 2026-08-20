@@ -149,6 +149,11 @@ line red    dashed metal route
 - **색상**: 팔레트 이름(`black`/`white`/`red`/`orange`/`green`/`sky`/`pink`) 또는 `#RRGGBB`.
 - **box 스타일** (채우기 방식): `solid`(기본, 전체 채움), `none`(외곽선만), `hatch`(사선),
   `cross`(교차 사선), `dots`(점 패턴). `solid` 외에는 같은 색의 외곽선이 함께 그려진다.
+- **floe fill 패턴**: floe의 `fillpatterns.def` 이름을 그대로 스타일로 쓸 수 있다
+  (`speckle`, `brick`, `diagonal_1`, … — 내장 `FILL_PATTERNS` 표; `clear`는 `none`과 동일).
+  16×16 비트맵이 항목 색으로 스와치에 타일된다. 표에 없는 커스텀 비트맵은
+  `pat:HEX64`(u16 16행, 행당 4 hex, MSB=왼쪽 픽셀)로 직접 실을 수 있다.
+  floe의 DRC 스냅샷 legend가 이 이름들을 임베드한다.
 - **line 스타일**: `solid`(기본), `dashed`(파선), `dotted`(점선).
 - 라벨은 줄 끝까지이며 공백을 포함할 수 있다 (한글 가능 — 대상 리눅스에서 표시됨).
   스타일 단어로 시작하는 라벨을 쓰려면 스타일을 명시한다 (`box red solid dots`).

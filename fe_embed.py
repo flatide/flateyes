@@ -76,10 +76,59 @@ DASHES = {"solid": 0, "dashed": 1, "dotted": 2}
 
 # Legend swatch styles (mirrors the flateyes tables, synonyms included).
 LEGEND_BOX_STYLES = {"solid": "solid", "none": "none", "outline": "none",
-                     "empty": "none", "hatch": "hatch", "cross": "cross",
-                     "crosshatch": "cross", "dots": "dots", "dotted": "dots"}
+                     "empty": "none", "clear": "none", "hatch": "hatch",
+                     "cross": "cross", "crosshatch": "cross", "dots": "dots",
+                     "dotted": "dots"}
 LEGEND_LINE_STYLES = {"solid": "solid", "dash": "dashed", "dashed": "dashed",
                       "dot": "dotted", "dotted": "dotted"}
+
+# floe fill patterns BY NAME (copy of floe's fillpatterns.def:
+# 16 u16 rows as 64 hex chars, MSB = leftmost pixel). A box legend
+# entry can name one of these instead of carrying a pat:HEX64
+# bitmap; keep the table in sync with flateyes.py / floe when the
+# .def re-bases. solid/clear resolve through LEGEND_BOX_STYLES.
+FILL_PATTERNS = {
+    "diagonal_right_wide":
+        "0101020204040808101020204040808001010202040408081010202040408080",
+    "diagonal_1":
+        "1111222244448888111122224444888811112222444488881111222244448888",
+    "diagonal_left_wide":
+        "8080404020201010080804040202010180804040202010100808040402020101",
+    "diagonal_2":
+        "8888444422221111888844442222111188884444222211118888444422221111",
+    "carets":
+        "0000100028004400004400280010000000001000280044000044002800100000",
+    "light_speckle":
+        "8888000022220000888800002222000088880000222200008888000022220000",
+    "speckle":
+        "aaaa5555aaaa5555aaaa5555aaaa5555aaaa5555aaaa5555aaaa5555aaaa5555",
+    "alt_light_speckle":
+        "2222555588885555222255558888555522225555888855552222555588885555",
+    "alt_speckle":
+        "5555aaaa5555aaaa5555aaaa5555aaaa5555aaaa5555aaaa5555aaaa5555aaaa",
+    "triangle_small":
+        "00000000100038007c000000000000000000000000100038007c000000000000",
+    "wave_small":
+        "8888444422224444888844442222444488884444222244448888444422224444",
+    "wave":
+        "0808101020204040808040402020101008081010202040408080404020201010",
+    "right_slope":
+        "0003000c003000c003000c003000c0000003000c003000c003000c003000c000",
+    "left_slope":
+        "c00030000c00030000c00030000c0003c00030000c00030000c00030000c0003",
+    "plus":
+        "20002000f800200020000000000000000020002000f800200020000000000000",
+    "brick":
+        "ffff8000800080008000800080008000ffff0080008000800080008000800080",
+    "circles":
+        "10041004100408080808063001c00000000000000000000001c0063008080808",
+    "carpet_1":
+        "4444222211112282444488281111228244448828101128224444828811118888",
+    "solid":
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "clear":
+        "0000000000000000000000000000000000000000000000000000000000000000",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +360,11 @@ def parse_legend_line(value):
         rest = rest[1:]
     elif rest and rest[0].lower() in styles:
         style = styles[rest[0].lower()]
+        rest = rest[1:]
+    elif kind == "box" and rest and rest[0].lower() in FILL_PATTERNS:
+        # floe fill pattern BY NAME (speckle, brick, ...): the name
+        # itself is the style; the bitmap comes from FILL_PATTERNS
+        style = rest[0].lower()
         rest = rest[1:]
     if not rest:
         raise ValueError("missing label")
@@ -943,7 +997,8 @@ def build_parser():
     parser.add_argument("--legend", metavar="FILE",
                         help="legend definition text file, one entry "
                              "per line (\"#\" comments): \"box COLOR "
-                             "[solid|none|hatch|cross|dots] LABEL\" or "
+                             "[solid|none|hatch|cross|dots|<floe fill "
+                             "name>|pat:HEX64] LABEL\" or "
                              "\"line COLOR [solid|dashed|dotted] "
                              "LABEL\"; flateyes draws it as a swatch "
                              "table at the bottom-right (with --append "
@@ -1110,6 +1165,8 @@ def selftest():
                      "box #FFFF66 dots via",
                      "box sky solid dots",   # label = a style word
                      "box #D6FF3F pat:%s M4 fill" % ("aaaa5555" * 8),
+                     "box #FF3F3F speckle BOUNDARY 0/0",
+                     "box pink clear NW 3/0",   # floe clear -> none
                      "line red dashed metal route",
                      "line #35C5FF boundary"]
     blob = _sample_png()

@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.15.0"
+VERSION = "1.16.0"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -216,10 +216,59 @@ def parse_stack_file(path):
 
 
 LEGEND_BOX_STYLES = {"solid": "solid", "none": "none", "outline": "none",
-                     "empty": "none", "hatch": "hatch", "cross": "cross",
-                     "crosshatch": "cross", "dots": "dots", "dotted": "dots"}
+                     "empty": "none", "clear": "none", "hatch": "hatch",
+                     "cross": "cross", "crosshatch": "cross", "dots": "dots",
+                     "dotted": "dots"}
 LEGEND_LINE_STYLES = {"solid": "solid", "dash": "dashed", "dashed": "dashed",
                       "dot": "dotted", "dotted": "dotted"}
+
+# floe fill patterns BY NAME (copy of floe's fillpatterns.def:
+# 16 u16 rows as 64 hex chars, MSB = leftmost pixel). A box legend
+# entry can name one of these instead of carrying a pat:HEX64
+# bitmap; keep the table in sync with floe when the .def re-bases.
+# solid/clear resolve through LEGEND_BOX_STYLES first.
+FILL_PATTERNS = {
+    "diagonal_right_wide":
+        "0101020204040808101020204040808001010202040408081010202040408080",
+    "diagonal_1":
+        "1111222244448888111122224444888811112222444488881111222244448888",
+    "diagonal_left_wide":
+        "8080404020201010080804040202010180804040202010100808040402020101",
+    "diagonal_2":
+        "8888444422221111888844442222111188884444222211118888444422221111",
+    "carets":
+        "0000100028004400004400280010000000001000280044000044002800100000",
+    "light_speckle":
+        "8888000022220000888800002222000088880000222200008888000022220000",
+    "speckle":
+        "aaaa5555aaaa5555aaaa5555aaaa5555aaaa5555aaaa5555aaaa5555aaaa5555",
+    "alt_light_speckle":
+        "2222555588885555222255558888555522225555888855552222555588885555",
+    "alt_speckle":
+        "5555aaaa5555aaaa5555aaaa5555aaaa5555aaaa5555aaaa5555aaaa5555aaaa",
+    "triangle_small":
+        "00000000100038007c000000000000000000000000100038007c000000000000",
+    "wave_small":
+        "8888444422224444888844442222444488884444222244448888444422224444",
+    "wave":
+        "0808101020204040808040402020101008081010202040408080404020201010",
+    "right_slope":
+        "0003000c003000c003000c003000c0000003000c003000c003000c003000c000",
+    "left_slope":
+        "c00030000c00030000c00030000c0003c00030000c00030000c00030000c0003",
+    "plus":
+        "20002000f800200020000000000000000020002000f800200020000000000000",
+    "brick":
+        "ffff8000800080008000800080008000ffff0080008000800080008000800080",
+    "circles":
+        "10041004100408080808063001c00000000000000000000001c0063008080808",
+    "carpet_1":
+        "4444222211112282444488281111228244448828101128224444828811118888",
+    "solid":
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "clear":
+        "0000000000000000000000000000000000000000000000000000000000000000",
+}
 
 
 def parse_legend_entry(line):
@@ -256,6 +305,11 @@ def parse_legend_entry(line):
     elif rest and rest[0].lower() in styles:
         style = styles[rest[0].lower()]
         rest = rest[1:]
+    elif kind == "box" and rest and rest[0].lower() in FILL_PATTERNS:
+        # floe fill pattern BY NAME (speckle, brick, ...): the name
+        # itself is the style; the bitmap comes from FILL_PATTERNS
+        style = rest[0].lower()
+        rest = rest[1:]
     if not rest:
         return None, "missing label"
     return {"kind": kind, "color": color, "style": style,
@@ -274,9 +328,10 @@ def parse_legend_text(text, origin):
 
       box COLOR [STYLE] LABEL...     STYLE: solid (default), none
                                      (outline only), hatch, cross, dots,
-                                     pat:HEX64 (floe fill pattern:
-                                     16x16 bitmap, 16 u16 rows, MSB
-                                     = leftmost pixel)
+                                     a floe fill-pattern NAME (speckle,
+                                     brick, ... - FILL_PATTERNS), or
+                                     pat:HEX64 (literal 16x16 bitmap,
+                                     16 u16 rows, MSB = leftmost pixel)
       line COLOR [STYLE] LABEL...    STYLE: solid (default), dashed,
                                      dotted
 
@@ -2043,10 +2098,12 @@ class Viewer(object):
         if style == "solid":
             buf.fill(rgba)
             return buf
-        if style.startswith("pat:"):
-            # floe fill pattern: tile the 16x16 bitmap over the
-            # swatch, on-bits in the entry color (MSB = leftmost)
-            hexs = style[4:]
+        hexs = (style[4:] if style.startswith("pat:")
+                else FILL_PATTERNS.get(style))
+        if hexs is not None:
+            # floe fill pattern (named or pat:HEX64 literal): tile
+            # the 16x16 bitmap over the swatch, on-bits in the
+            # entry color (MSB = leftmost)
             rows = [int(hexs[i * 4:i * 4 + 4], 16)
                     for i in range(16)]
             for y in range(h):
@@ -5745,9 +5802,11 @@ def usage(stream):
         "                              line COLOR [STYLE] LABEL...\n"
         "                            COLOR as in the DRAW options; box\n"
         "                            STYLE: solid (default), none (outline\n"
-        "                            only), hatch, cross, dots, pat:HEX64\n"
-        "                            (floe 16x16 fill); line STYLE:\n"
-        "                            solid (default), dashed, dotted.\n"
+        "                            only), hatch, cross, dots, a floe\n"
+        "                            fill-pattern name (speckle, brick, ...)\n"
+        "                            or pat:HEX64 (literal 16x16 fill);\n"
+        "                            line STYLE: solid (default), dashed,\n"
+        "                            dotted.\n"
         "                            A text legend joins the metadata like\n"
         "                            the drawn shapes: Ctrl+S embeds it\n"
         "                            (legend= lines), and a file opened\n"
