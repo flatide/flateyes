@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.17.0"
+VERSION = "1.17.1"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -710,8 +710,11 @@ class Viewer(object):
     ZOOM_MIN = 0.05
     ZOOM_MAX = 2.0
     LEGEND_FRACTION = 1.0 / 3.0  # max legend size relative to the window
-    RULER_CASING = 0x000000B4    # guide line outline, 0xRRGGBBAA
-    RULER_CORE = 0xFFD819FF      # guide line core
+    RULER_CORE = 0xFFFFFFFF      # plain white solid ruler, no casing
+                                 # (matches floe)
+    HANDLE_CASING = 0x000000B4   # selection handles, 0xRRGGBBAA
+    HANDLE_CORE = 0xFFD819FF     # yellow, so the white active anchor
+                                 # ("e") stays distinguishable
     HINT_CASING = 0x00000090     # next-level coverage outline
     HINT_CORE = 0x33BBFFFF
     DRAG_SLOP = 4                # px: press-release within this is a click
@@ -2774,9 +2777,6 @@ class Viewer(object):
             buf.fill(0x00000000)
             # Four arms with an open centre, so the snapped pixel itself
             # stays visible through the gap.
-            for rect in ((0, c - 1, c - 2, 3), (c + 3, c - 1, c - 2, 3),
-                         (c - 1, 0, 3, c - 2), (c - 1, c + 3, 3, c - 2)):
-                self.fill_rect(buf, *rect, rgba=self.RULER_CASING)
             for rect in ((0, c, c - 2, 1), (c + 3, c, c - 2, 1),
                          (c, 0, 1, c - 2), (c, c + 3, 1, c - 2)):
                 self.fill_rect(buf, *rect, rgba=self.RULER_CORE)
@@ -2858,13 +2858,9 @@ class Viewer(object):
         bx, by = b[0] - x0, b[1] - y0
         if a != b:
             if ay == by:    # horizontal
-                self.fill_rect(buf, min(ax, bx), ay - 1,
-                               abs(bx - ax) + 1, 3, self.RULER_CASING)
                 self.fill_rect(buf, min(ax, bx), ay,
                                abs(bx - ax) + 1, 1, self.RULER_CORE)
             elif ax == bx:  # vertical
-                self.fill_rect(buf, ax - 1, min(ay, by),
-                               3, abs(by - ay) + 1, self.RULER_CASING)
                 self.fill_rect(buf, ax, min(ay, by),
                                1, abs(by - ay) + 1, self.RULER_CORE)
             else:           # free angle: 1px-spaced dabs, 2x2 solid core
@@ -2878,13 +2874,9 @@ class Viewer(object):
                                ay + (by - ay) * i / steps)
                               for i in range(steps + 1)]
                     for x, y in points:
-                        self.fill_rect(buf, x - 1, y - 1, 3, 3,
-                                       self.RULER_CASING)
-                    for x, y in points:
                         self.fill_rect(buf, x - 1, y - 1, 2, 2,
                                        self.RULER_CORE)
         for x, y in ((ax, ay), (bx, by)):
-            self.fill_rect(buf, x - 3, y - 3, 7, 7, self.RULER_CASING)
             self.fill_rect(buf, x - 2, y - 2, 5, 5, self.RULER_CORE)
         self.ruler_line.set_from_pixbuf(buf)
         self.ruler_line.set_margin_start(x0)
@@ -3258,7 +3250,7 @@ class Viewer(object):
         # never paint over a chip -- the placement above keeps leaders and
         # foreign chips apart instead.
         for end, foot in leaders:
-            self.stamp_segment(buf, end, foot, self.RULER_CASING,
+            self.stamp_segment(buf, end, foot, None,
                                self.RULER_CORE, 1, 2)
         self.anno_image.set_from_pixbuf(buf)
         self.anno_image.set_margin_start(0)
@@ -3441,10 +3433,8 @@ class Viewer(object):
         a = self.image_px_to_view(self.px_from_world(shape["a"]))
         b = self.image_px_to_view(self.px_from_world(shape["b"]))
         if shape["kind"] == "ruler":
-            self.stamp_segment(buf, a, b, self.RULER_CASING,
-                               self.RULER_CORE)
+            self.stamp_segment(buf, a, b, None, self.RULER_CORE)
             for x, y in (a, b):  # endpoint markers
-                self.fill_rect(buf, x - 3, y - 3, 7, 7, self.RULER_CASING)
                 self.fill_rect(buf, x - 2, y - 2, 5, 5, self.RULER_CORE)
             return
         core = self.color_rgba(shape["color"])
@@ -3547,11 +3537,11 @@ class Viewer(object):
         """Corner handles marking the keyboard-selected annotation; the
         anchor the arrows drag ("e") grows a white core."""
         for x, y in points:
-            self.fill_rect(buf, x - 5, y - 5, 11, 11, self.RULER_CASING)
-            self.fill_rect(buf, x - 3, y - 3, 7, 7, self.RULER_CORE)
+            self.fill_rect(buf, x - 5, y - 5, 11, 11, self.HANDLE_CASING)
+            self.fill_rect(buf, x - 3, y - 3, 7, 7, self.HANDLE_CORE)
         if active is not None:
             x, y = active
-            self.fill_rect(buf, x - 6, y - 6, 13, 13, self.RULER_CASING)
+            self.fill_rect(buf, x - 6, y - 6, 13, 13, self.HANDLE_CASING)
             self.fill_rect(buf, x - 4, y - 4, 9, 9, 0xFFFFFFFF)
 
     def restore_focus(self):
