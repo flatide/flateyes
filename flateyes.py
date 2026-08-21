@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.17.1"
+VERSION = "1.17.2"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -2876,8 +2876,12 @@ class Viewer(object):
                     for x, y in points:
                         self.fill_rect(buf, x - 1, y - 1, 2, 2,
                                        self.RULER_CORE)
-        for x, y in ((ax, ay), (bx, by)):
-            self.fill_rect(buf, x - 2, y - 2, 5, 5, self.RULER_CORE)
+        if a != b:  # outward arrowheads, direction survives clipping
+            ang = math.atan2(by - ay, bx - ax)
+            self.stamp_arrow(buf, (bx, by), ang, self.RULER_CORE)
+            self.stamp_arrow(buf, (ax, ay), ang + math.pi, self.RULER_CORE)
+        else:       # single anchor point: no direction yet
+            self.fill_rect(buf, ax - 2, ay - 2, 5, 5, self.RULER_CORE)
         self.ruler_line.set_from_pixbuf(buf)
         self.ruler_line.set_margin_start(x0)
         self.ruler_line.set_margin_top(y0)
@@ -2934,6 +2938,15 @@ class Viewer(object):
                 for x, y in points:
                     self.fill_rect(buf, x - off, y - off,
                                    width + 1, width + 1, core)
+
+    def stamp_arrow(self, buf, tip, ang, rgba, size=11, half=4):
+        """Solid triangular arrowhead, tip at the given point and
+        pointing along ang in screen radians (floe's ruler ends)."""
+        ux, uy = math.cos(ang), math.sin(ang)
+        bx, by = tip[0] - size * ux, tip[1] - size * uy
+        self.fill_polygon(buf, [(tip[0], tip[1]),
+                                (bx - half * uy, by + half * ux),
+                                (bx + half * uy, by - half * ux)], rgba)
 
     @staticmethod
     def clip_segment(a, b, width, height, pad=4):
@@ -3434,8 +3447,13 @@ class Viewer(object):
         b = self.image_px_to_view(self.px_from_world(shape["b"]))
         if shape["kind"] == "ruler":
             self.stamp_segment(buf, a, b, None, self.RULER_CORE)
-            for x, y in (a, b):  # endpoint markers
-                self.fill_rect(buf, x - 2, y - 2, 5, 5, self.RULER_CORE)
+            if a != b:  # outward arrowheads at both ends (floe's look)
+                ang = math.atan2(b[1] - a[1], b[0] - a[0])
+                self.stamp_arrow(buf, b, ang, self.RULER_CORE)
+                self.stamp_arrow(buf, a, ang + math.pi, self.RULER_CORE)
+            else:
+                self.fill_rect(buf, a[0] - 2, a[1] - 2, 5, 5,
+                               self.RULER_CORE)
             return
         core = self.color_rgba(shape["color"])
         casing = self.ANNO_CASING if shape.get("casing", True) else None
