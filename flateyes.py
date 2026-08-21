@@ -20,6 +20,7 @@ Usage:
 
 import bisect
 import errno
+import glob
 import hashlib
 import json
 import math
@@ -37,7 +38,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.18.0"
+VERSION = "1.19.0"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -799,6 +800,7 @@ class Viewer(object):
         self.window.connect("delete-event", self.on_delete_event)
         self.window.connect("key-press-event", self.on_key)
         self.window.connect("focus-in-event", self.on_focus_in)
+        self.window.connect("window-state-event", self.on_window_state)
 
         # Thumbnail browser ("b"): a second screen listing one folder's
         # subfolders and images.  Only a single level is read at a time,
@@ -1113,7 +1115,11 @@ class Viewer(object):
         self.overlay.set_has_tooltip(True)
         self.overlay.connect("query-tooltip", self.on_overlay_query_tooltip)
         self.overlay.connect("size-allocate", self.on_overlay_allocate)
+        # Menu bar: the same commands as the keys, laid out for
+        # discovery (build_menubar); it hides while fullscreen.
+        self.menubar = self.build_menubar()
         root_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        root_box.pack_start(self.menubar, False, False, 0)
         root_box.pack_start(self.overlay, True, True, 0)
         root_box.pack_start(self.browser_box, True, True, 0)
         self.window.add(root_box)
@@ -1833,8 +1839,10 @@ class Viewer(object):
         # Follow the image's aspect ratio so the window opens without
         # large empty margins on either axis.
         scale = min(float(max_w) / img_w, float(max_h) / img_h, 1.0)
-        self.window.set_default_size(max(int(img_w * scale) + 4, 320),
-                                     max(int(img_h * scale) + 4, 240))
+        menu_h = self.menubar.get_preferred_height()[1]
+        self.window.set_default_size(
+            max(int(img_w * scale) + 4, 320),
+            max(int(img_h * scale) + 4, 240) + menu_h)
 
     # -- scaling -----------------------------------------------------------
 
@@ -5288,14 +5296,517 @@ class Viewer(object):
         self.hint_image.show()
 
     def show_about(self, *args):
-        """About dialog: F1 or the right-click menu."""
+        """About dialog: F1, Help menu or the right-click menu."""
         dialog = Gtk.AboutDialog(transient_for=self.window, modal=True)
         dialog.set_keep_above(True)  # stay over a fullscreen parent
         dialog.set_program_name(APP_TITLE)
         dialog.set_version(VERSION)
+        dialog.set_comments(
+            "Image viewer with ruler measuring and annotations\n"
+            "Python %s  \u00b7  GTK %d.%d.%d"
+            % (sys.version.split()[0], Gtk.get_major_version(),
+               Gtk.get_minor_version(), Gtk.get_micro_version()))
         # Plain text on purpose: a website link cannot open anything on
         # the closed network, so the URL is only shown, not clickable.
         dialog.set_copyright("2026 FLATIDE LC.\nhttp://flatide.com")
+        dialog.run()
+        dialog.destroy()
+        self.restore_focus()
+
+    # -- menu bar ------------------------------------------------------------
+
+    def build_menubar(self):
+        """The top menu bar.  An item with a key runs run_command with
+        that very key, so the menus are a discoverable mirror of the
+        shortcuts, not a second code path; check marks and sensitivity
+        are refreshed each time a menu opens (sync_menus).  Entries:
+        (mnemonic label, accelerator, check-state getter, enabled
+        getter[, action]) or None for a separator."""
+        image = lambda: not self.browser_active           # noqa: E731
+        flat = lambda: image() and not self.stack_mode    # noqa: E731
+        stack = lambda: image() and self.stack_mode       # noqa: E731
+        picked = lambda: image() and self.valid_selection() is not None
+        drawn = lambda: image() and bool(self.annotations)  # noqa: E731
+        spec = (
+            ("_File", (
+                ("_Open...", "<Control>o", None, None),
+                ("Thumbnail _Browser", "b", lambda: self.browser_active,
+                 lambda: not self.stack_mode and (
+                     not self.browser_active or self.pixbuf is not None
+                     or self.animation is not None)),
+                ("Pa_rent Folder", "BackSpace", None,
+                 lambda: self.browser_active),
+                None,
+                ("_Previous Image", "comma", None, flat),
+                ("_Next Image", "period", None, flat),
+                None,
+                ("_Save Annotations", "<Control>s", None, image),
+                None,
+                ("_Quit", "q", None, None),
+            )),
+            ("_Edit", (
+                ("_Undo", "u", None, lambda: image() and bool(self.anno_undo)),
+                ("_Redo", "y", None, lambda: image() and bool(self.anno_redo)),
+                None,
+                ("Select _Next Annotation", "s", None, drawn),
+                ("Select Pre_vious Annotation", "<Shift>s", None, drawn),
+                ("_Edit Selection", "e", None, picked),
+                ("_Delete Selection", "Delete", None, picked),
+                None,
+                ("_Copy View", "<Control>c", None, image),
+                ("Copy _Path", "<Control><Shift>c", None, image),
+            )),
+            ("_View", (
+                ("Zoom _In", "plus", None, image),
+                ("Zoom _Out", "minus", None, image),
+                ("_Actual Size", "0", None, image),
+                ("_Fit to Window", "f", None, image),
+                None,
+                ("F_ullscreen", "F11", self.is_fullscreen, None),
+                None,
+                ("I_nfo Overlays", "i", lambda: self.meta_visible, image),
+                ("_Key Help Strip", "question",
+                 lambda: self.help_visible, image),
+                ("A_ll Overlays", "Tab",
+                 lambda: self.draw_visible or self.help_visible
+                 or self.meta_visible, image),
+                ("_Highlight Shapes", "h",
+                 lambda: self.anno_highlight, image),
+                None,
+                ("Ne_xt Level", "bracketright", None, stack),
+                ("_Previous Level", "bracketleft", None, stack),
+                ("Level Ou_tline", "o", lambda: self.hint_enabled, stack),
+            )),
+            ("_Annotate", (
+                ("_Ruler", "r", lambda: self.ruler_active, image),
+                ("Ruler Edge _Snap", "m", lambda: self.snap_enabled, image),
+                None,
+                ("_Draw Shape...", "d", None, image),
+                ("_Text", "t", lambda: self.anno_tool == "text", image),
+                None,
+                ("_Note...", "n", None, image),
+                ("Set _PPU...", "p", None, flat),
+            )),
+            ("_Help", (
+                ("_Keyboard Shortcuts...", None, None, None,
+                 self.show_shortcuts),
+                None,
+                ("Open Source _Licenses...", None, None, None,
+                 self.show_licenses),
+                ("_About %s" % APP_TITLE, "F1", None, None),
+            )),
+        )
+        self.menu_items = []      # (item, check getter, enabled getter)
+        self.menu_syncing = False
+        bar = Gtk.MenuBar()
+        for title, entries in spec:
+            menu = Gtk.Menu()
+            menu.connect("show", lambda *a: self.sync_menus())
+            for entry in entries:
+                if entry is None:
+                    menu.append(Gtk.SeparatorMenuItem())
+                    continue
+                label, accel, check, enabled = entry[:4]
+                action = entry[4] if len(entry) > 4 else None
+                if check is not None:
+                    item = Gtk.CheckMenuItem.new_with_mnemonic(label)
+                else:
+                    item = Gtk.MenuItem.new_with_mnemonic(label)
+                if accel:
+                    keyval, mods = Gtk.accelerator_parse(accel)
+                    try:   # shown beside the label; the keys themselves
+                        item.get_child().set_accel(keyval, mods)  # 3.6+
+                    except AttributeError:  # are handled by on_key
+                        pass
+                    if action is None:
+                        action = lambda k=Gdk.keyval_name(keyval), m=mods: \
+                            self.run_command(k, m)
+                item.connect("activate", self.on_menu_activate, action)
+                self.menu_items.append((item, check, enabled))
+                menu.append(item)
+            head = Gtk.MenuItem.new_with_mnemonic(title)
+            head.set_submenu(menu)
+            bar.append(head)
+        return bar
+
+    def on_menu_activate(self, item, action):
+        if not self.menu_syncing:  # set_active() in a sync fires it too
+            action()
+
+    def sync_menus(self):
+        """Reflect the live state in the check marks and grey out what
+        the current screen or mode cannot do."""
+        self.menu_syncing = True
+        try:
+            for item, check, enabled in self.menu_items:
+                if enabled is not None:
+                    item.set_sensitive(bool(enabled()))
+                if check is not None:
+                    item.set_active(bool(check()))
+        finally:
+            self.menu_syncing = False
+
+    def is_fullscreen(self):
+        win = self.window.get_window()
+        return bool(win is not None
+                    and win.get_state() & Gdk.WindowState.FULLSCREEN)
+
+    def toggle_fullscreen(self):
+        if self.is_fullscreen():
+            self.window.unfullscreen()
+        else:
+            self.window.fullscreen()
+
+    def on_window_state(self, widget, event):
+        # Fullscreen is for the picture: the menu bar leaves with the
+        # window frame and returns with it (every key keeps working).
+        self.menubar.set_visible(
+            not event.new_window_state & Gdk.WindowState.FULLSCREEN)
+        return False
+
+    def ask_open_file(self):
+        """File > Open (Ctrl+O): a file chooser that starts in the folder
+        on screen.  Stack manifests (.tds) open as stacks."""
+        dialog = Gtk.FileChooserDialog(title="Open", transient_for=self.window,
+                                       modal=True,
+                                       action=Gtk.FileChooserAction.OPEN)
+        dialog.set_keep_above(True)  # stay over a fullscreen parent
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Open", Gtk.ResponseType.OK)
+        dialog.set_default_response(Gtk.ResponseType.OK)
+        folder = self.browser_folder if self.browser_active \
+            else os.path.dirname(os.path.abspath(self.path or ""))
+        if folder and os.path.isdir(folder):
+            dialog.set_current_folder(folder)
+        images = Gtk.FileFilter()
+        images.set_name("Images and stacks")
+        images.add_pixbuf_formats()
+        images.add_pattern("*.tds")
+        dialog.add_filter(images)
+        everything = Gtk.FileFilter()
+        everything.set_name("All files")
+        everything.add_pattern("*")
+        dialog.add_filter(everything)
+        response = dialog.run()
+        path = dialog.get_filename()
+        dialog.destroy()
+        self.restore_focus()
+        if response != Gtk.ResponseType.OK or not path:
+            return
+        if not self.confirm_unsaved():
+            return  # keep the image and its unsaved changes
+        result = self.open_request(path,
+                                   stack=path.lower().endswith(".tds"))
+        if result != "OK":
+            if self.browser_active:
+                self.browser_status.set_text(result)
+            else:
+                self.show_toast(result)
+
+    # -- help dialogs --------------------------------------------------------
+
+    SHORTCUTS = (
+        ("Viewing", (
+            ("+ / -,  Ctrl+wheel", "zoom in / out"),
+            ("0", "actual size (100%)"),
+            ("f", "fit to window"),
+            ("Enter / F11", "fullscreen (remote clients may swallow F11)"),
+            ("arrows, wheel, drag", "pan"),
+            (", / .", "previous / next image in the folder"),
+            ("b", "thumbnail browser  (Esc/b back, BackSpace parent)"),
+            ("[ / ]", "previous / next magnification level (stacks)"),
+            ("Ctrl+O", "open an image or stack manifest"),
+        )),
+        ("Overlays", (
+            ("i", "info: legend, note, readouts, path, level outline"),
+            ("?", "key help strip"),
+            ("Tab", "every overlay on / off"),
+            ("o", "next-level outline (stacks)"),
+            ("h", "highlight the drawn shapes"),
+        )),
+        ("Measuring and drawing", (
+            ("r", "ruler: click two points  (Shift free angle,"
+                  " Ctrl locks the direction)"),
+            ("m", "ruler edge snap on / off"),
+            ("d", "draw a box, ellipse, line, path or polygon"
+                  "  (Shift constrains)"),
+            ("click,  double-click / Enter", "path, polygon: add a point,"
+                                              " finish"),
+            ("t", "text annotation: click to place"),
+            ("n", "note for the whole image"),
+            ("p", "pixels per unit for the ruler"),
+            ("Esc", "leave the selection, ruler or drawing mode"),
+        )),
+        ("Editing annotations", (
+            ("s / Shift+S", "select, newest first / backwards"),
+            ("arrows,  Shift+arrows", "move the selection by 1 / 10 px"),
+            ("e", "resize anchors, or the text dialog again"),
+            ("Delete / BackSpace", "delete the selection"),
+            ("u / y", "undo / redo"),
+        )),
+        ("File and clipboard", (
+            ("Ctrl+S", "save annotations  (PNG: embedded; else .fe sidecar)"),
+            ("Ctrl+C", "copy the view as an image"),
+            ("Ctrl+Shift+C", "copy the image path"),
+            ("F1", "about"),
+            ("q", "quit"),
+        )),
+    )
+
+    def show_shortcuts(self, *args):
+        """Help > Keyboard Shortcuts: the full key and mouse reference
+        (the "?" strip lists only the essentials)."""
+        dialog = Gtk.Dialog(title="Keyboard Shortcuts",
+                            transient_for=self.window, modal=True)
+        self.cancel_on_escape(dialog)
+        dialog.set_keep_above(True)  # stay over a fullscreen parent
+        dialog.add_button("Close", Gtk.ResponseType.CLOSE)
+        dialog.set_default_response(Gtk.ResponseType.CLOSE)
+        grid = Gtk.Grid()
+        grid.set_column_spacing(18)
+        grid.set_row_spacing(3)
+        grid.set_border_width(12)
+        row = 0
+        for section, pairs in self.SHORTCUTS:
+            head = Gtk.Label()
+            head.set_markup("<b>%s</b>" % GLib.markup_escape_text(section))
+            head.set_halign(Gtk.Align.START)
+            head.set_margin_top(10 if row else 0)
+            grid.attach(head, 0, row, 2, 1)
+            row += 1
+            for keys, desc in pairs:
+                key_label = Gtk.Label()
+                key_label.set_markup("<tt>%s</tt>"
+                                     % GLib.markup_escape_text(keys))
+                key_label.set_halign(Gtk.Align.START)
+                desc_label = Gtk.Label(label=desc)
+                desc_label.set_halign(Gtk.Align.START)
+                grid.attach(key_label, 0, row, 1, 1)
+                grid.attach(desc_label, 1, row, 1, 1)
+                row += 1
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.add(grid)
+        box = dialog.get_content_area()
+        box.pack_start(scroll, True, True, 0)
+        dialog.show_all()
+        # Natural height while it fits the parent window, scrolling after
+        # (measured once shown: hidden widgets request no size).
+        natural = grid.get_preferred_height()[1] + 4
+        limit = max(240, int(self.window.get_allocation().height * 0.85))
+        scroll.set_size_request(-1, min(natural, limit))
+        dialog.run()
+        dialog.destroy()
+        self.restore_focus()
+
+    # Open-source components the viewer runs on: name, version, license,
+    # homepage, and the package names that locate its license text on
+    # the host (rpm/deb layouts) or in the portable bundle (conda names).
+    LICENSE_ROOTS = ("/usr/share/licenses", "/usr/share/doc")
+    LICENSE_NAMES = ("COPYING*", "LICENSE*", "copyright")
+
+    def oss_components(self):
+        import gi
+        core = (
+            ("Python", sys.version.split()[0], "PSF-2.0",
+             "https://www.python.org/",
+             ("python3", "python", "libpython3*"),
+             (os.path.join(os.path.dirname(os.__file__), "LICENSE.txt"),)),
+            ("PyGObject", "%d.%d.%d" % tuple(gi.version_info[:3]),
+             "LGPL-2.1-or-later", "https://pygobject.gnome.org/",
+             ("pygobject3", "pygobject", "python3-gobject", "python3-gi"),
+             (os.path.join(os.path.dirname(os.path.dirname(gi.__file__)),
+                           "[Pp]y[Gg][Oo]bject*.dist-info", "*COPYING*"),
+              os.path.join(os.path.dirname(os.path.dirname(gi.__file__)),
+                           "[Pp]y[Gg][Oo]bject*.dist-info", "licenses",
+                           "*"))),
+            ("GTK", "%d.%d.%d" % (Gtk.get_major_version(),
+                                  Gtk.get_minor_version(),
+                                  Gtk.get_micro_version()),
+             "LGPL-2.1-or-later", "https://www.gtk.org/",
+             ("gtk3", "gtk+3", "gtk+3.0", "libgtk-3-0"), ()),
+            ("GLib", "%d.%d.%d" % (GLib.MAJOR_VERSION, GLib.MINOR_VERSION,
+                                   GLib.MICRO_VERSION),
+             "LGPL-2.1-or-later", "https://gitlab.gnome.org/GNOME/glib",
+             ("glib2", "glib", "libglib2.0-0"), ()),
+            ("GdkPixbuf", getattr(GdkPixbuf, "PIXBUF_VERSION", ""),
+             "LGPL-2.1-or-later",
+             "https://gitlab.gnome.org/GNOME/gdk-pixbuf",
+             ("gdk-pixbuf2", "gdk-pixbuf", "libgdk-pixbuf2.0-0",
+              "libgdk-pixbuf-2.0-0"), ()),
+            ("Pango", Pango.version_string(), "LGPL-2.1-or-later",
+             "https://pango.gnome.org/", ("pango", "libpango-1.0-0"), ()),
+            ("cairo", "", "LGPL-2.1-only OR MPL-1.1",
+             "https://www.cairographics.org/", ("cairo", "libcairo2"), ()),
+        )
+        bundled = self.bundle_licenses()
+        by_name = dict((entry[0], entry) for entry in bundled)
+        used = set()
+        comps = []
+        for name, version, license_id, url, pkgs, extra in core:
+            source = None
+            for pkg in pkgs:
+                if pkg in by_name:   # the portable runtime's own copy
+                    version = by_name[pkg][1] or version
+                    source = by_name[pkg][3]
+                    used.add(pkg)
+                    break
+            else:
+                source = self.find_license_file(pkgs, extra)
+            comps.append({"name": name, "version": version,
+                          "license": license_id, "url": url,
+                          "source": source})
+        for name, version, license_id, folder in bundled:
+            if name not in used:  # the rest of the bundled runtime
+                comps.append({"name": name, "version": version,
+                              "license": license_id, "url": "",
+                              "source": folder})
+        return comps
+
+    @classmethod
+    def find_license_file(cls, packages, extra=()):
+        """First license text found for any of the package names in the
+        usual distro places: /usr/share/licenses/<pkg>[-ver]/ (rpm),
+        /usr/share/doc/<pkg>[-ver]/ (older rpm, deb)."""
+        patterns = list(extra)
+        for pkg in packages:
+            for root in cls.LICENSE_ROOTS:
+                for folder in (pkg, pkg + "-[0-9]*"):
+                    for name in cls.LICENSE_NAMES:
+                        patterns.append(os.path.join(root, folder, name))
+        for pattern in patterns:
+            hits = sorted(path for path in glob.glob(pattern)
+                          if os.path.isfile(path))
+            if hits:
+                return hits[0]
+        return None
+
+    @staticmethod
+    def bundle_licenses():
+        """The portable bundle ships its runtime's license files in
+        licenses/ next to flateyes.py; make_portable.sh writes INDEX.tsv
+        there (name, version, license, folder per package)."""
+        root = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "licenses")
+        entries = []
+        try:
+            with open(os.path.join(root, "INDEX.tsv"), "rb") as fh:
+                lines = fh.read().decode("utf-8", "replace").splitlines()
+        except OSError:
+            return entries
+        for line in lines:
+            parts = line.split("\t")
+            if len(parts) >= 4 and parts[0]:
+                folder = os.path.join(root, parts[3]) if parts[3] else None
+                entries.append((parts[0], parts[1], parts[2], folder))
+        return entries
+
+    @staticmethod
+    def license_text(source, limit=400000):
+        """The license text behind a component: one file, or every file
+        of a bundle folder (each under its name); None when absent."""
+        if not source:
+            return None
+        paths = [source] if os.path.isfile(source) else sorted(
+            os.path.join(source, name) for name in os.listdir(source)
+            if os.path.isfile(os.path.join(source, name))) \
+            if os.path.isdir(source) else []
+        chunks = []
+        for path in paths:
+            try:
+                with open(path, "rb") as fh:
+                    text = fh.read(limit).decode("utf-8", "replace")
+            except OSError:
+                continue
+            if len(paths) > 1:
+                chunks.append("===== %s =====\n\n" % os.path.basename(path))
+            chunks.append(text.rstrip() + "\n\n")
+        return "".join(chunks) or None
+
+    def show_licenses(self, *args):
+        """Help > Open Source Licenses: the components the viewer runs
+        on, with their license texts as found on this host."""
+        comps = self.oss_components()
+        dialog = Gtk.Dialog(title="Open Source Licenses",
+                            transient_for=self.window, modal=True)
+        self.cancel_on_escape(dialog)
+        dialog.set_keep_above(True)  # stay over a fullscreen parent
+        dialog.add_button("Close", Gtk.ResponseType.CLOSE)
+        dialog.set_default_response(Gtk.ResponseType.CLOSE)
+        alloc = self.window.get_allocation()
+        dialog.set_default_size(max(640, int(alloc.width * 0.8)),
+                                max(420, int(alloc.height * 0.8)))
+        intro = Gtk.Label(label=(
+            "%s is built with the open source software below.  Each "
+            "component is the work of its own authors and comes under "
+            "its own license; the license texts found on this host are "
+            "shown on the right." % APP_TITLE))
+        intro.set_line_wrap(True)
+        intro.set_xalign(0)
+        intro.set_margin_start(10)
+        intro.set_margin_end(10)
+        intro.set_margin_top(8)
+        intro.set_margin_bottom(8)
+        store = Gtk.ListStore(str, str, str, int)
+        for index, comp in enumerate(comps):
+            store.append([comp["name"], comp["version"], comp["license"],
+                          index])
+        tree = Gtk.TreeView(model=store)
+        for column, title in enumerate(("Component", "Version", "License")):
+            tree.append_column(Gtk.TreeViewColumn(
+                title, Gtk.CellRendererText(), text=column))
+        left = Gtk.ScrolledWindow()
+        left.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        left.set_shadow_type(Gtk.ShadowType.IN)
+        left.add(tree)
+        view = Gtk.TextView()
+        view.set_editable(False)
+        view.set_cursor_visible(False)
+        view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        view.set_left_margin(8)
+        view.set_right_margin(8)
+        buf = view.get_buffer()
+        bold = buf.create_tag("head", weight=700)
+        mono = buf.create_tag("mono", family="monospace")
+        right = Gtk.ScrolledWindow()
+        right.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        right.set_shadow_type(Gtk.ShadowType.IN)
+        right.add(view)
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        paned.pack1(left, False, False)
+        paned.pack2(right, True, False)
+        paned.set_position(330)
+        paned.set_border_width(10)
+
+        def on_select(selection):
+            model, it = selection.get_selected()
+            if it is None:
+                return
+            comp = comps[model[it][3]]
+            buf.set_text("")
+            head = "%s %s\nLicense: %s\n" % (comp["name"], comp["version"],
+                                             comp["license"] or "-")
+            if comp["url"]:
+                head += "Homepage: %s\n" % comp["url"]
+            buf.insert_with_tags(buf.get_end_iter(), head, bold)
+            text = self.license_text(comp["source"])
+            if text is None:
+                buf.insert(buf.get_end_iter(),
+                           "\nThe full license text was not found on this "
+                           "host.  It is distributed with the component "
+                           "itself (system package documentation or the "
+                           "project's homepage).\n")
+            else:
+                buf.insert(buf.get_end_iter(),
+                           "Text: %s\n\n" % comp["source"])
+                buf.insert_with_tags(buf.get_end_iter(), text, mono)
+
+        tree.get_selection().connect("changed", on_select)
+        box = dialog.get_content_area()
+        box.pack_start(intro, False, False, 0)
+        box.pack_start(paned, True, True, 0)
+        dialog.show_all()
+        tree.get_selection().select_path(Gtk.TreePath.new_first())
         dialog.run()
         dialog.destroy()
         self.restore_focus()
@@ -5418,7 +5929,16 @@ class Viewer(object):
         return name
 
     def on_key(self, widget, event):
-        key = self.command_key(event)
+        if event.state & Gdk.ModifierType.MOD1_MASK:
+            return False  # Alt+letter: the menu bar's mnemonics
+        return self.run_command(self.command_key(event), event.state)
+
+    def run_command(self, key, state):
+        """One dispatcher for the keyboard and the menu bar: key is a
+        Gdk key name (already layout-corrected, see command_key), state
+        the modifier mask.  True when the command was handled."""
+        ctrl = state & Gdk.ModifierType.CONTROL_MASK
+        shift = state & Gdk.ModifierType.SHIFT_MASK
         if self.browser_active:  # the thumbnail browser has its own keys
             if key in ("q", "Q"):
                 self.request_quit()
@@ -5431,6 +5951,10 @@ class Viewer(object):
                     self.populate_browser(parent)
             elif key == "F1":
                 self.show_about()
+            elif key == "F11":
+                self.toggle_fullscreen()
+            elif key in ("o", "O") and ctrl:
+                self.ask_open_file()  # Ctrl+O
             else:
                 return False  # arrows/Enter/typeahead: the icon view's
             return True
@@ -5487,18 +6011,20 @@ class Viewer(object):
         elif key in ("y", "Y"):
             self.redo_annotation()
         elif key in ("c", "C") \
-                and event.state & Gdk.ModifierType.CONTROL_MASK \
-                and event.state & Gdk.ModifierType.SHIFT_MASK:
+                and ctrl \
+                and shift:
             self.copy_path_to_clipboard()  # Ctrl+Shift+C
         elif key in ("c", "C") \
-                and event.state & Gdk.ModifierType.CONTROL_MASK:
+                and ctrl:
             self.copy_view_to_clipboard()  # Ctrl+C
         elif key in ("s", "S") \
-                and event.state & Gdk.ModifierType.CONTROL_MASK:
+                and ctrl:
             self.save_annotations()  # Ctrl+S
+        elif key in ("o", "O") and ctrl:
+            self.ask_open_file()     # Ctrl+O
         elif key in ("s", "S"):      # plain s: cycle-select annotations
             self.cycle_selection(
-                -1 if event.state & Gdk.ModifierType.SHIFT_MASK else 1)
+                -1 if shift else 1)
         elif key in ("Delete", "KP_Delete", "BackSpace") \
                 and self.valid_selection() is not None:
             self.delete_selection()
@@ -5509,7 +6035,7 @@ class Viewer(object):
             self.move_selection(
                 key.endswith("Right") - key.endswith("Left"),
                 key.endswith("Down") - key.endswith("Up"),
-                bool(event.state & Gdk.ModifierType.SHIFT_MASK))
+                bool(shift))
         elif key in ("p", "P"):
             if self.stack_mode:  # the manifest is authoritative for stacks
                 self.show_toast("PPU from stack manifest: %s px/%s"
@@ -5577,11 +6103,7 @@ class Viewer(object):
             self.finish_path()  # commit with the points placed so far
         elif key in ("F11", "Return", "KP_Enter"):
             # Enter as well: remote/VNC clients often swallow F11.
-            state = self.window.get_window().get_state() if self.window.get_window() else 0
-            if state & Gdk.WindowState.FULLSCREEN:
-                self.window.unfullscreen()
-            else:
-                self.window.fullscreen()
+            self.toggle_fullscreen()
         else:
             return False
         return True

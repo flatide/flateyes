@@ -67,6 +67,9 @@ tar xzf flateyes-portable-*.tar.gz -C /opt    # 위치는 자유
   교체하면 된다 (런타임 재사용).
 - RHEL6(glibc 2.12)은 지원 불가 — `selfcheck`가 즉시 판별해 준다. 상세한 설치·문제
   해결 안내는 번들 안의 `README-PORTABLE.txt` 참조.
+- 번들에 포함된 런타임 패키지들의 라이선스 전문은 `licenses/` 폴더에 함께 들어가며
+  (`INDEX.tsv`: 이름·버전·라이선스·폴더), 뷰어의 Help > Open Source Licenses에서도
+  볼 수 있다.
 
 ## 사용법
 
@@ -568,6 +571,24 @@ sudo -u tduser DISPLAY=:1 XAUTHORITY=/home/tduser/.Xauthority \
 
 같은 명령을 몇 번을 실행해도 창은 디스플레이당 1개만 유지된다. 두 번째 실행부터는 이미 떠 있는 인스턴스에 경로만 넘기고 바로 끝나므로 `&` 없이 호출해도 무방하다.
 
+## 메뉴
+
+창 상단의 메뉴 바(File · Edit · View · Annotate · Help)에서 모든 기능을 마우스로도
+쓸 수 있다. 각 항목은 같은 단축키와 완전히 동일하게 동작하며(항목 오른쪽에 키 표시),
+상태가 있는 기능(ruler, 엣지 스냅, 정보 표시, 전체 화면 등)은 체크 표시로 현재
+상태를 보여 준다. 현재 화면·모드에서 쓸 수 없는 항목(스택 전용, 선택이 없을 때의
+삭제 등)은 비활성으로 표시된다. `Alt+F`처럼 밑줄 글자로 메뉴를 열 수 있고 `F10`은
+메뉴 바에 포커스를 준다. **전체 화면에서는 메뉴 바가 숨겨지며** 단축키는 그대로
+동작한다.
+
+| 메뉴 | 항목 |
+|---|---|
+| File | Open... (`Ctrl+O`, 파일 선택 대화상자 — `.tds`는 스택으로 열림), Thumbnail Browser (`b`), Parent Folder (`BackSpace`, 브라우저에서), Previous/Next Image (`,` `.`), Save Annotations (`Ctrl+S`), Quit (`q`) |
+| Edit | Undo/Redo (`u` `y`), Select Next/Previous Annotation (`s` `Shift+S`), Edit Selection (`e`), Delete Selection (`Delete`), Copy View (`Ctrl+C`), Copy Path (`Ctrl+Shift+C`) |
+| View | Zoom In/Out (`+` `-`), Actual Size (`0`), Fit to Window (`f`), Fullscreen (`F11`/`Enter`), Info Overlays (`i`), Key Help Strip (`?`), All Overlays (`Tab`), Highlight Shapes (`h`), Next/Previous Level (`]` `[`), Level Outline (`o`) |
+| Annotate | Ruler (`r`), Ruler Edge Snap (`m`), Draw Shape... (`d`), Text (`t`), Note... (`n`), Set PPU... (`p`) |
+| Help | Keyboard Shortcuts... (키·마우스 조작 전체 목록), Open Source Licenses... (뷰어가 사용하는 오픈소스 구성 요소와 라이선스 — 이 호스트에서 찾은 라이선스 전문을 함께 표시: 시스템 패키지의 `/usr/share/licenses`·`/usr/share/doc`, 포터블 번들의 `licenses/`), About (`F1`) |
+
 ## 키 조작
 
 좌하단에 배율·해상도·PPU(스택은 레벨 포함) 상태가, 우하단에 파일 전체 경로가
@@ -585,8 +606,9 @@ legend·노트와 함께 `i`로 숨김/복원한다. 창 상단의 키 안내는
 | `+` / `-` (Ctrl+휠) | 확대 / 축소 (최대 200%) |
 | `0` | 원본 크기 (100%) |
 | `f` | 창 크기에 맞춤 (기본값, 축소만 하고 확대는 안 함) |
-| `Enter` / `F11` | 전체 화면 토글 (원격 환경에서는 F11이 클라이언트에 가로채일 수 있어 `Enter` 권장) |
+| `Enter` / `F11` | 전체 화면 토글 (원격 환경에서는 F11이 클라이언트에 가로채일 수 있어 `Enter` 권장). 전체 화면에서는 메뉴 바가 숨겨진다 (`F11`은 브라우저 화면에서도 동작) |
 | 방향키 / 휠 / 마우스 드래그 | 스크롤(패닝) |
+| `Ctrl+O` | 파일 선택 대화상자로 이미지(또는 `.tds` 스택 manifest) 열기 — 브라우저 화면에서도 동작 |
 | `,` / `.` | 같은 폴더의 이전/다음 이미지 열기 (이름 자연 정렬 순서, 끝에서 순환. 스택 모드에서는 비활성) |
 | `b` | 썸네일 브라우저 — 현재 폴더의 하위 폴더와 이미지를 썸네일로 표시하고 탐색한다 (`Enter`/더블클릭 열기, `BackSpace`/`..` 상위 폴더, 상단 경로 표시줄의 폴더 클릭으로 임의 상위 폴더 바로 이동, `Esc`/`b` 복귀, 스택 모드에서는 비활성). 폴더를 인자로 실행하면 이 화면으로 시작한다. 이미지를 보는 중에는 `b`로 그 이미지가 선택된 브라우저로 되돌아간다 (`Esc`는 화면을 바꾸지 않는다) |
 | `i` | 정보 표시(우하단 legend·좌상단 노트·좌하단 배율/해상도/PPU 상태·우하단 경로·다음 레벨 외곽선) 숨김/복원 — `o` 개별 상태는 유지 |
@@ -606,7 +628,7 @@ legend·노트와 함께 `i`로 숨김/복원한다. 창 상단의 키 안내는
 | `Ctrl+S` | 주석·PPU·텍스트 범례 메타데이터 저장 — 자동 저장이 없으므로 이 명시적 저장이 유일한 보존 수단이다. PNG는 원본 파일 안에 `iTXt` 청크로 내장하고(픽셀은 그대로, 다른 뷰어에서도 평범한 PNG로 열리며 파일을 복사하면 주석이 함께 이동), 그 외 포맷은 `<이미지경로>.fe` 사이드카에 저장한다(읽기 전용이면 `~/.cache/flateyes/`). 주석이 없는 상태에서 누르면 저장된 메타데이터를 제거한다 |
 | `p` | PPU(pixels per unit) 입력 — `Ctrl+S`로 저장하면 파일별로 복원된다 (스택 모드에서는 manifest 값 사용) |
 | `[` / `]` | 스택 이전/다음 배율 레벨로 이동 |
-| `F1` / 우클릭 메뉴 | About (프로그램 정보) |
+| `F1` / Help 메뉴 / 우클릭 메뉴 | About (프로그램 정보). 키·마우스 조작 전체 목록과 오픈소스 라이선스는 Help 메뉴에서 |
 | `q` | 종료 — 저장 안 된 주석이 있으면(창 제목 파일명 앞 `*` 표시) Save/Discard/Cancel 대화상자로 묻는다. 측정(ruler)만 바뀐 상태는 묻지 않고 종료한다. 창 닫기(X)도 동일 (`Esc`는 종료하지 않는다 — 선택·측정·도구 모드를 차례로 빠져나올 뿐, 더 빠져나올 것이 없으면 아무 일도 하지 않는다) |
 
 ## 지원 포맷

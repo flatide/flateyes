@@ -49,6 +49,38 @@ CONDA_OVERRIDE_GLIBC=2.${GLIBC_CEILING} ./micromamba create -y \
 [ -x "$WORK/runtime/bin/python3.11" ] || {
     echo "runtime extraction failed"; exit 1; }
 
+# -- 2b. collect the runtime's license files ----------------------------
+# Help > Open Source Licenses in the viewer lists them (licenses/INDEX.tsv
+# + one folder per package that ships texts), and the LGPL components
+# need their texts to travel with the binaries anyway.  Done before the
+# slimming step removes conda-meta.
+python3 - "$WORK/runtime/conda-meta" "$WORK/mmroot/pkgs" "$WORK/licenses" <<'PY'
+import glob, json, os, shutil, sys
+meta, pkgs, out = sys.argv[1:4]
+shutil.rmtree(out, ignore_errors=True)
+os.makedirs(out)
+rows = []
+for path in sorted(glob.glob(os.path.join(meta, "*.json"))):
+    with open(path, encoding="utf-8") as fh:
+        info = json.load(fh)
+    name, version = info.get("name", ""), info.get("version", "")
+    if not name:
+        continue
+    folder = ""
+    src = info.get("extracted_package_dir") or os.path.join(
+        pkgs, "%s-%s-%s" % (name, version, info.get("build", "")))
+    src = os.path.join(src, "info", "licenses")
+    if os.path.isdir(src) and os.listdir(src):
+        folder = name
+        shutil.copytree(src, os.path.join(out, folder))
+    rows.append((name, version, info.get("license") or "", folder))
+with open(os.path.join(out, "INDEX.tsv"), "w", encoding="utf-8") as fh:
+    for row in rows:
+        fh.write("\t".join(row) + "\n")
+print("licenses: %d packages, %d with texts"
+      % (len(rows), sum(1 for row in rows if row[3])))
+PY
+
 # -- 3. slim: build-time payloads never touched at runtime --------------
 cd "$WORK/runtime"
 rm -rf include share/gir-1.0 share/locale share/doc share/man \
@@ -119,6 +151,7 @@ B="$WORK/flateyes-portable"
 rm -rf "$B"
 mkdir -p "$B"
 mv "$WORK/runtime" "$B/runtime"
+mv "$WORK/licenses" "$B/licenses"
 cp "$REPO/flateyes.py" "$B/flateyes.py"
 
 cat > "$B/flateyes" <<'EOF'
@@ -247,6 +280,12 @@ flateyes.py 업데이트
 --------------------
 새 버전의 flateyes.py를 이 폴더의 flateyes.py에 덮어쓰기만 하면
 됩니다. 런타임은 그대로 재사용됩니다.
+
+오픈소스 라이선스
+-----------------
+runtime/ 에 포함된 각 패키지의 라이선스 전문은 licenses/ 폴더에
+들어 있으며(INDEX.tsv: 이름·버전·라이선스·폴더), 뷰어의
+Help > Open Source Licenses 메뉴에서도 볼 수 있습니다.
 
 문제 해결
 ---------
