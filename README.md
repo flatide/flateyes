@@ -154,6 +154,11 @@ line red    dashed metal route
   16×16 비트맵이 항목 색으로 스와치에 타일된다. 표에 없는 커스텀 비트맵은
   `pat:HEX64`(u16 16행, 행당 4 hex, MSB=왼쪽 픽셀)로 직접 실을 수 있다.
   floe의 DRC 스냅샷 legend가 이 이름들을 임베드한다.
+- **polygon 주석의 패턴 채움**: polygon의 FILL 값에 `:패턴이름`(또는 `:pat:HEX64`)을
+  붙이면(예 `--polygon …,red,red:speckle,2`, 메타데이터 `#FF5252FF:speckle`,
+  JSON `"fill_pat": "speckle"`) 내부가 반투명 워시 대신 **불투명 패턴 픽셀**로
+  채워진다(알파 기본 FF; on-비트만 칠하고 off-비트는 이미지가 그대로 보임 —
+  floe 뷰어의 DRC 에러 채움과 동일). 패턴은 화면 원점 기준으로 타일된다.
 - **line 스타일**: `solid`(기본), `dashed`(파선), `dotted`(점선).
 - 라벨은 줄 끝까지이며 공백을 포함할 수 있다 (한글 가능 — 대상 리눅스에서 표시됨).
   스타일 단어로 시작하는 라벨을 쓰려면 스타일을 명시한다 (`box red solid dots`).

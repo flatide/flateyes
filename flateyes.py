@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.17.2"
+VERSION = "1.18.0"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -269,6 +269,22 @@ FILL_PATTERNS = {
     "clear":
         "0000000000000000000000000000000000000000000000000000000000000000",
 }
+
+
+def fill_pattern_token(value):
+    """A polygon-fill pattern token: a FILL_PATTERNS name (speckle,
+    brick, ...) or a literal pat:HEX64 bitmap.  Returns the canonical
+    lowercase token; raises ValueError on anything else."""
+    tok = str(value).strip().lower()
+    if tok in FILL_PATTERNS:
+        return tok
+    if tok.startswith("pat:"):
+        hexs = tok[4:]
+        if len(hexs) == 64 and all(c in "0123456789abcdef"
+                                   for c in hexs):
+            return tok
+    raise ValueError("bad fill pattern: %s (use a floe fill name or "
+                     "pat:HEX64)" % value)
 
 
 def parse_legend_entry(line):
@@ -3010,6 +3026,64 @@ class Viewer(object):
         if w > 0 and h > 0:
             buf.new_subpixbuf(x, y, w, h).fill(rgba)
 
+    _pat_strips = {}   # (bitmap hex, rgba) -> tiled strip pixbuf
+
+    @classmethod
+    def _pat_strip(cls, hexs, rgba, width):
+        """Width-spanning 16-row strip of a fill pattern in rgba
+        (on-bits colored, off-bits transparent), tiled from one
+        16x16 pixbuf and cached per (pattern, color) - so a masked
+        polygon fill costs one composite per span, not per pixel."""
+        strip = cls._pat_strips.get((hexs, rgba))
+        if strip is not None and strip.get_width() >= width:
+            return strip
+        w = ((max(width, 16) + 15) // 16) * 16
+        tile = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8,
+                                    16, 16)
+        tile.fill(0x00000000)
+        for y in range(16):
+            r = int(hexs[y * 4:y * 4 + 4], 16)
+            for x in range(16):
+                if (r >> (15 - x)) & 1:   # MSB = leftmost pixel
+                    tile.new_subpixbuf(x, y, 1, 1).fill(rgba)
+        strip = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8,
+                                     w, 16)
+        strip.fill(0x00000000)
+        for x in range(0, w, 16):
+            tile.composite(strip, x, 0, 16, 16, x, 0, 1, 1,
+                           GdkPixbuf.InterpType.NEAREST, 255)
+        cls._pat_strips[(hexs, rgba)] = strip
+        return strip
+
+    @classmethod
+    def fill_polygon_pat(cls, buf, pts, rgba, pat):
+        """fill_polygon through a 16x16 fill-pattern mask (a floe
+        FILL_PATTERNS name or pat:HEX64): on-bits paint rgba, off-bits
+        leave the image - a pattern of opaque pixels instead of a
+        translucent wash (the floe viewer's DRC error fill).  The
+        pattern anchors to the view origin, MSB = leftmost."""
+        hexs = pat[4:] if pat.startswith("pat:") else FILL_PATTERNS[pat]
+        top = max(int(min(p[1] for p in pts)), 0)
+        bottom = min(int(max(p[1] for p in pts)) + 1, buf.get_height())
+        if bottom <= top:
+            return
+        strip = cls._pat_strip(hexs, rgba, buf.get_width())
+        edges = list(zip(pts, pts[1:] + pts[:1]))
+        for row in range(top, bottom):
+            yc = row + 0.5  # half-open rule: vertices count once
+            xs = []
+            for (x1, y1), (x2, y2) in edges:
+                if (y1 <= yc < y2) or (y2 <= yc < y1):
+                    xs.append(x1 + (yc - y1) * (x2 - x1) / (y2 - y1))
+            xs.sort()
+            for i in range(0, len(xs) - 1, 2):
+                x0 = max(int(round(xs[i])), 0)
+                x1 = min(int(round(xs[i + 1])), buf.get_width())
+                if x1 > x0:
+                    strip.composite(buf, x0, row, x1 - x0, 1,
+                                    0, row - (row % 16), 1, 1,
+                                    GdkPixbuf.InterpType.NEAREST, 255)
+
     # -- next-level coverage hint --------------------------------------------
 
     def update_view_overlays(self):
@@ -3427,8 +3501,13 @@ class Viewer(object):
                 # interior first so the outline stays on top (like the
                 # box/ellipse fills)
                 if shape.get("fill") and len(pts) >= 3:
-                    self.fill_polygon(buf, pts, self.color_rgba(
-                        shape["fill"], shape.get("fill_alpha", 0x59)))
+                    rgba = self.color_rgba(
+                        shape["fill"], shape.get("fill_alpha", 0x59))
+                    if shape.get("fill_pat"):
+                        self.fill_polygon_pat(buf, pts, rgba,
+                                              shape["fill_pat"])
+                    else:
+                        self.fill_polygon(buf, pts, rgba)
                 if not shape.get("outline", True):
                     return
                 segments = list(zip(pts, pts[1:] + pts[:1]))  # closed
@@ -4364,6 +4443,9 @@ class Viewer(object):
             if anno["kind"] == "polygon" and anno.get("fill"):
                 fill = "%s%02X" % (anno["fill"],
                                    anno.get("fill_alpha", 89))
+                if anno.get("fill_pat"):
+                    # ":PATTERN" rides inside the comma-free fill slot
+                    fill += ":" + anno["fill_pat"]
             else:
                 fill = "0"
             if not anno.get("outline", True):
@@ -4637,13 +4719,19 @@ class Viewer(object):
             tail = parts[index + 1:]   # fill, width, dash, halo (the
             if tail and key == "polygon":  # fill slot is "0" for paths)
                 fill = tail[0].strip()
+                pat = None
+                if ":" in fill:   # "#RRGGBBAA:PATTERN" fill mask
+                    fill, pat = fill.split(":", 1)
                 if fill.startswith("#") and len(fill) == 9:
                     try:
                         int(fill[1:9], 16)
-                        anno["fill"] = fill[:7]
-                        anno["fill_alpha"] = int(fill[7:9], 16)
                     except ValueError:
                         pass
+                    else:
+                        anno["fill"] = fill[:7]
+                        anno["fill_alpha"] = int(fill[7:9], 16)
+                        if pat:
+                            anno["fill_pat"] = fill_pattern_token(pat)
             if len(tail) > 1:
                 try:
                     anno["width"] = max(1, min(int(float(tail[1])), 8))
@@ -4829,9 +4917,19 @@ class Viewer(object):
             if kind == "polygon" and parts:  # FILL, like a box
                 fill = parts.pop(0)
                 if fill not in ("", "0"):
+                    pat = None
+                    if ":" in fill:   # "COLOR:PATTERN" fill mask
+                        fill, pat = fill.split(":", 1)
                     anno["fill"], embedded = Viewer.option_fill(fill)
-                    anno["fill_alpha"] = 89 if embedded is None \
-                        else embedded
+                    if pat:
+                        anno["fill_pat"] = fill_pattern_token(pat)
+                        # the pattern IS the transparency: opaque
+                        # pixels unless the value carries an alpha
+                        anno["fill_alpha"] = 255 if embedded is None \
+                            else embedded
+                    else:
+                        anno["fill_alpha"] = 89 if embedded is None \
+                            else embedded
             if not anno.get("outline", True) and "fill" not in anno:
                 raise ValueError("0 (no outline) needs a FILL")
             if parts:
@@ -4959,6 +5057,7 @@ class Viewer(object):
                 if kind == "polygon":
                     fill = obj.pop("fill", None)
                     fill_alpha = obj.pop("fill_alpha", None)
+                    fill_pat = obj.pop("fill_pat", None)
                     if fill_alpha is not None:
                         try:
                             fill_alpha = int(fill_alpha)
@@ -4968,12 +5067,25 @@ class Viewer(object):
                             raise ValueError("fill_alpha must be 0-255")
                     if fill is not None:
                         # "#RRGGBBAA" carries the alpha in the value;
-                        # an explicit fill_alpha wins over it
+                        # an explicit fill_alpha wins over it. A
+                        # ":PATTERN" suffix names the fill mask
+                        fill = str(fill)
+                        if ":" in fill:
+                            fill, tok = fill.split(":", 1)
+                            if fill_pat is None:
+                                fill_pat = tok
                         anno["fill"], embedded = Viewer.option_fill(
                             str(fill))
+                        if fill_pat is not None:
+                            anno["fill_pat"] = fill_pattern_token(
+                                str(fill_pat))
                         anno["fill_alpha"] = fill_alpha \
                             if fill_alpha is not None \
-                            else (89 if embedded is None else embedded)
+                            else (((255 if fill_pat is not None
+                                    else 89))
+                                  if embedded is None else embedded)
+                    elif fill_pat is not None:
+                        raise ValueError("fill_pat needs a fill")
                     if not obj.pop("outline", True):
                         if fill is None:
                             raise ValueError("outline=false needs a fill")
@@ -5841,6 +5953,9 @@ def usage(stream):
         "or #RRGGBB; 0 = no outline (needs FILL).  FILL is a color\n"
         "(35%% interior opacity), or #RRGGBBAA with AA = the interior\n"
         "alpha, 00-FF (59 = 35%%, FF = opaque; default no fill).\n"
+        "A polygon FILL may add :PATTERN (a floe fill name - speckle,\n"
+        "brick, ... - or pat:HEX64): the interior paints as opaque\n"
+        "pattern pixels instead of a translucent wash.\n"
         "WIDTH is the stroke width 1-8, DASH is solid, dashed or dotted.\n"
         "\n"
         "  --box X1,Y1,X2,Y2[,COLOR[,FILL[,WIDTH[,DASH]]]]\n"

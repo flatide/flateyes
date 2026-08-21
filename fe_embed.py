@@ -175,6 +175,22 @@ def _dash(value):
                      % (value,))
 
 
+def _fill_pat(value):
+    """A polygon-fill pattern token: a FILL_PATTERNS name (speckle,
+    brick, ...) or a literal pat:HEX64 bitmap.  Returns the canonical
+    lowercase token (mirror of flateyes.fill_pattern_token)."""
+    tok = str(value).strip().lower()
+    if tok in FILL_PATTERNS:
+        return tok
+    if tok.startswith("pat:"):
+        hexs = tok[4:]
+        if len(hexs) == 64 and all(c in "0123456789abcdef"
+                                   for c in hexs):
+            return tok
+    raise ValueError("bad fill pattern: %s (use a floe fill name or "
+                     "pat:HEX64)" % value)
+
+
 def _shape(kind, x1, y1, x2, y2, color, fill, outline, width, dash,
            casing, fill_alpha=None):
     anno = {"kind": kind,
@@ -244,8 +260,12 @@ def path(points, color=DEFAULT_LINE, width=1, dash="solid", casing=True):
 
 
 def polygon(points, color=DEFAULT_LINE, fill=None, outline=True, width=1,
-            dash="solid", casing=True, fill_alpha=None):
-    """Closed shape through 3+ (x, y) points, filled like a box."""
+            dash="solid", casing=True, fill_alpha=None, fill_pat=None):
+    """Closed shape through 3+ (x, y) points, filled like a box.
+    fill_pat (or a ":PATTERN" suffix on the fill value) names a floe
+    fill pattern (speckle, brick, ... or pat:HEX64): the interior
+    paints as OPAQUE pattern pixels - fill_alpha defaults to 255 -
+    instead of a translucent wash."""
     pts = [(float(p[0]), float(p[1])) for p in points]
     if len(pts) < 3:
         raise ValueError("polygon needs 3+ points")
@@ -262,10 +282,21 @@ def polygon(points, color=DEFAULT_LINE, fill=None, outline=True, width=1,
             fill_alpha = -1
         if not 0 <= fill_alpha <= 255:
             raise ValueError("fill_alpha must be 0-255")
+    if fill is not None and ":" in str(fill):
+        fill, tok = str(fill).split(":", 1)
+        if fill_pat is None:
+            fill_pat = tok
+    if fill_pat is not None:
+        if fill is None:
+            raise ValueError("fill_pat needs a fill color")
+        fill_pat = _fill_pat(fill_pat)
     if fill is not None:
         anno["fill"], embedded = _fill_color(fill)
         anno["fill_alpha"] = fill_alpha if fill_alpha is not None \
-            else (TRANSLUCENT_ALPHA if embedded is None else embedded)
+            else (((255 if fill_pat is not None else TRANSLUCENT_ALPHA))
+                  if embedded is None else embedded)
+        if fill_pat is not None:
+            anno["fill_pat"] = fill_pat
     if not outline:
         if fill is None:
             raise ValueError("outline=False needs a fill")
@@ -403,6 +434,9 @@ def serialize_anno(anno):
         if anno["kind"] == "polygon" and anno.get("fill"):
             fill = "%s%02X" % (anno["fill"],
                                anno.get("fill_alpha", TRANSLUCENT_ALPHA))
+            if anno.get("fill_pat"):
+                # ":PATTERN" rides inside the comma-free fill slot
+                fill += ":" + anno["fill_pat"]
         else:
             fill = "0"
         if not anno.get("outline", True):
@@ -509,13 +543,19 @@ def parse_anno_line(key, value):
         tail = parts[index + 1:]   # fill, width, dash, halo (the fill
         if tail and key == "polygon":  # slot is "0" for paths)
             fill = tail[0].strip()
+            pat = None
+            if ":" in fill:   # "#RRGGBBAA:PATTERN" fill mask
+                fill, pat = fill.split(":", 1)
             if fill.startswith("#") and len(fill) == 9:
                 try:
                     int(fill[1:9], 16)
-                    anno["fill"] = fill[:7]
-                    anno["fill_alpha"] = int(fill[7:9], 16)
                 except ValueError:
                     pass
+                else:
+                    anno["fill"] = fill[:7]
+                    anno["fill_alpha"] = int(fill[7:9], 16)
+                    if pat:
+                        anno["fill_pat"] = _fill_pat(pat)
         if len(tail) > 1:
             try:
                 anno["width"] = max(1, min(int(float(tail[1])), 8))
@@ -1143,6 +1183,11 @@ def _sample_annos():
                 color="sky", fill="sky", fill_alpha=0x30, width=2),
         polygon([(10, 100), (40, 100), (25, 130)], fill="orange",
                 outline=False),
+        polygon([(60, 100), (90, 100), (90, 130), (60, 130)],
+                color="red", fill="#FF5252", fill_pat="speckle",
+                width=2, casing=False),   # opaque pattern fill
+        polygon([(100, 100), (130, 100), (115, 130)],
+                fill="#00E67680:brick"),  # pattern via fill suffix
         ruler(5, 5, 105, 5),
         text(12, 14, "DEFECT #17\n불량 위치\\메모", size=20,
              color="white", bg_color="black", bg_opaque=True),
@@ -1254,6 +1299,10 @@ def selftest():
                 ("polygon", "100,10,150,60,125.5,90,75,60,sky,"
                             "#35C5FF30,2"),
                 ("polygon", "10,100,40,100,25,130,0,orange"),
+                ("polygon", "60,100,90,100,90,130,60,130,red,"
+                            "red:speckle,2"),
+                ("polygon", "100,100,130,100,115,130,0,"
+                            "#00E67680:brick"),
                 ("ruler", "5,5,105,5"),
                 ("text", "12,14,DEFECT #17"),
                 ("text", "12,14,size=20,color=white,bg=#000000FF,A"),
@@ -1291,6 +1340,13 @@ def selftest():
                 {"kind": "polygon",
                  "points": [[10, 100], [40, 100], [25, 130]],
                  "fill": "orange", "outline": False},
+                {"kind": "polygon",
+                 "points": [[60, 100], [90, 100], [90, 130], [60, 130]],
+                 "color": "red", "fill": "#FF5252",
+                 "fill_pat": "speckle", "width": 2, "casing": False},
+                {"kind": "polygon",
+                 "points": [[100, 100], [130, 100], [115, 130]],
+                 "fill": "#00E67680:brick"},
                 {"kind": "ruler", "x1": 1, "y1": 1, "x2": 8, "y2": 1},
                 {"kind": "text", "x": 5, "y": 32, "text": "불량 A",
                  "size": 12, "color": "white", "bg_opaque": True},
