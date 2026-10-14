@@ -3,6 +3,7 @@
 폐쇄망 리눅스 환경용 초경량 이미지 뷰어 (단일 파일 Python 스크립트).
 동봉된 [`fe_embed.py`](#캡처-시점에-png에-주석-심기-fe_embedpy)로는 뷰어 없이도
 PNG에 주석을 임베드할 수 있다 (대량 캡처 서비스 연동용, 역시 단일 파일).
+주석·legend를 픽셀에 그려 넣은 이미지로 [내보내기](#주석을-그려-넣은-이미지로-내보내기---export)도 된다.
 
 eog를 대체하기 위해 만들어졌으며, eog의 두 가지 문제를 동시에 해결한다:
 
@@ -128,6 +129,7 @@ LEGEND_FILE이 이미지면 그대로 표시하고, 이미지가 아니면 **텍
   이미지 범례를 주면 저장된 텍스트 범례를 가리고 그 위에 표시만 한다(저장 내용은 유지).
   내장된 범례를 지우려면 `fe_embed.py --strip`(메타데이터 전체 삭제) 또는 새 범례로 덮어쓴다.
 - 캡처 서비스는 `fe_embed.py --legend FILE`이나 JSON 문서의 `legend` 배열로 캡처 시점에 심을 수 있다 (아래 fe_embed.py 절 참고).
+- 범례를 이미지 자체에 그려 넣으려면 `fe_embed.py --export`(이미지 오른쪽을 넓힌 패널에 표시) 또는 `--export-legend`(범례만 별도 PNG)를 쓴다 ([내보내기](#주석을-그려-넣은-이미지로-내보내기---export) 참고).
 - `i` 키로 노트·상태(배율/해상도/PPU)·경로 표시와 함께 숨기거나 다시 표시할 수 있다 (상단 키 안내는 `?`로 따로 토글, 기본 숨김).
 - 범례는 그려진 주석(박스 등)보다 위에 표시되어 가려지지 않는다 (진행 중인 ruler 측정선은 범례 위에 보인다).
 - 텍스트 범례의 항목이 많아 창 높이의 60%를 넘으면 그 높이에서 잘리고 세로 스크롤바가 생긴다.
@@ -492,7 +494,91 @@ annos, ppu, unit, note, legend = fe.read("shot_0001.png")
 
 `python3 fe_embed.py --selftest`를 flateyes.py 옆에서 실행하면 모든 주석
 종류를 양쪽 구현으로 교차 왕복시켜 포맷 호환을 검증한다 (둘 중 한쪽의
-포맷을 수정했다면 반드시 실행).
+포맷을 수정했다면 반드시 실행). 아래 내보내기 기능(PNG 디코더·렌더링)과
+ruler 라벨 문구·배치가 뷰어와 같은지도 함께 검사한다.
+
+### 주석을 그려 넣은 이미지로 내보내기 (`--export`)
+
+`fe_embed.py`는 PNG에 내장된 주석을 **픽셀에 직접 그려 넣은 새 PNG**로
+내보낼 수 있다. 보고서·메일처럼 flateyes가 없는 곳에서도 주석과 범례가
+그대로 보이게 하는 용도이며, 원본 파일은 수정하지 않는다.
+
+```sh
+# 도형·ruler·텍스트·노트는 이미지 위에, legend는 오른쪽을 넓힌 패널에
+python3 fe_embed.py --export shot_view.png shot.png
+
+# legend만 별도 PNG로
+python3 fe_embed.py --export-legend shot_legend.png shot.png
+
+# 둘 다, 여러 파일 일괄 ({stem}=확장자 뺀 파일명, {name}=파일명, {dir}=원본 폴더)
+python3 fe_embed.py --export 'out/{stem}_view.png' \
+                    --export-legend 'out/{stem}_legend.png' shots/*.png
+
+# 큰 이미지: 선·글자·legend를 2배로 (뷰어에서 50%로 볼 때의 모양)
+python3 fe_embed.py --export big_view.png --scale 2 big.png
+```
+
+- **모양은 flateyes를 100% 배율로 볼 때와 같다**: 도형(box·ellipse·line·
+  path·polygon — 굵기·점선·검은 halo·채움 불투명도·floe 패턴 포함), ruler
+  (흰 선·양끝 화살촉·거리 라벨, 여러 개면 점선 리더), 텍스트 주석(크기·색·
+  배경), 노트(좌상단 칩)가 이미지 위에 그려진다. 좌표 변환·그리는 순서·
+  ruler 라벨 배치는 뷰어 코드를 그대로 옮긴 것이다. 이미지 밖으로 나가는
+  부분은 이미지 경계에서 잘린다.
+- **legend는 이미지를 가리지 않는다**: 이미지 오른쪽을 넓혀 만든 패널
+  (기본 검정)에 뷰어처럼 우하단 정렬로 그린다. 라벨은 생략(`…`) 없이 전체가
+  표시되고, 항목이 이미지 높이를 넘으면 여러 열로 나뉜다(열당 최소 8행 —
+  이미지가 그보다 낮으면 아래로도 늘어난다). legend가 없으면 이미지 크기는
+  그대로다.
+- `--export-legend`는 legend 표만 PNG로 만든다(패널에 그리는 것과 같은 모양).
+  legend가 없는 파일은 오류로 보고된다.
+- 옵션 (내보내기 전용):
+  - `--scale S` (0.25~16, 기본 1): 선 굵기·점선 간격·화살촉·패턴·글자·
+    legend의 크기 배율. 위치(좌표)는 그대로다. 1은 뷰어 100% 화면과 같으므로,
+    큰 이미지를 축소해서 보게 될 문서용이면 2~3이 읽기 좋다.
+  - `--legend-bg COLOR`: legend 패널/이미지 배경 — 팔레트 이름, `#RRGGBB`,
+    `none`(투명, RGBA로 저장). 기본 `black`.
+  - `--hide KIND[,KIND]`: `shapes`·`texts`·`rulers`·`note`·`legend` 중
+    빼고 그릴 것 (반복 가능). `legend`를 빼면 패널도 생기지 않는다.
+  - `--font FILE[:N]`: 텍스트 글꼴 파일 (반복 가능, TTC는 `:N`으로 face
+    선택). 지정한 글꼴에 없는 글자는 시스템 글꼴로 넘어간다.
+- 같은 명령에 `--box`·`--json`·`--note`·`--legend`·`--ppu` 등을 함께 주면
+  **뷰어 실행 옵션과 같은 규칙**으로 반영해 그린다 — 주석은 내장된 것 위에
+  추가되고 노트·legend·PPU는 대체된다. 원본에는 기록하지 않는다.
+- 결과 PNG에는 주석 메타데이터를 넣지 않는다(이미 픽셀에 그려져 있으므로
+  flateyes로 열어도 이중으로 그려지지 않는다). 단 PPU/단위는 남겨서 결과
+  이미지에서 측정해도 같은 환산이 된다. 원본의 색 공간 정보(sRGB·gAMA·
+  cHRM·iCCP)와 pHYs는 복사된다.
+- 출력 경로에 `-`를 주면 PNG를 표준 출력으로 내보낸다(파일 하나일 때).
+  출력 폴더가 없으면 만들고, 원본을 덮어쓰게 되는 경로는 거부한다. 여러
+  파일 중 일부가 실패해도 나머지는 계속 처리하고 종료 코드 1을 돌려준다.
+- **글꼴**: 시스템의 TrueType/OpenType 글꼴 파일(.ttf·.otf·.ttc, glyf·CFF
+  아웃라인)을 직접 읽어 안티앨리어싱으로 그린다. `fc-match`(fontconfig)가
+  있으면 뷰어(Pango)와 같은 순서로 글꼴을 고르고, 첫 글꼴에 없는 글자(한글
+  등)는 다음 글꼴로 넘어간다. fontconfig가 없으면 일반적인 글꼴 폴더에서
+  찾는다. 글꼴 파일이 하나도 없는 호스트에서는 내장 6x13 비트맵 글꼴
+  (ASCII 전용)로 그리며 경고를 출력한다 — 어떤 글꼴에도 없는 글자는 □로
+  그려지고 경고가 나오므로, 그때는 `--font`로 한글 글꼴 파일을 지정한다.
+- **크기 기준**: 뷰어가 96 dpi GNOME 데스크톱에서 보이는 크기 — 텍스트 주석은
+  pt × 96/72 픽셀, ruler 라벨은 11pt 굵게, legend 라벨은 그보다 한 단계 작게,
+  노트는 11px.
+- PNG 읽기/쓰기도 표준 라이브러리만으로 처리한다(모든 색 형식·비트 깊이·
+  인터레이스, 16비트는 8비트로 저장). 순수 파이썬이라 큰 이미지는 시간이
+  걸린다(2000×2000 사진 PNG 약 2초).
+
+파이썬에서는:
+
+```python
+import fe_embed as fe
+
+fe.export("shot.png", "shot_view.png", scale=2)        # 파일 -> 파일
+png = fe.export_bytes(png_bytes, hide=("note",))       # bytes -> bytes
+fe.export_legend("shot.png", "shot_legend.png")
+png = fe.legend_bytes(["box green hatch oxide",        # 정의 줄 -> legend PNG
+                       "line red dashed metal route"], legend_bg="none")
+```
+
+`export_bytes`/`export`도 `annos`·`ppu`·`unit`·`note`·`legend`를 받아 CLI와
+같은 규칙(주석은 추가, 나머지는 대체)으로 그린다.
 
 ### 썸네일 브라우저
 
