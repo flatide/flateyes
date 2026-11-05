@@ -38,7 +38,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.20.0"
+VERSION = "1.20.1"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -726,6 +726,9 @@ class Viewer(object):
     ZOOM_STEP = 1.25
     ZOOM_MIN = 0.05
     ZOOM_MAX = 2.0
+    TILE_WHOLE_MAX = 1 << 23     # rendered px shown as one piece; above,
+                                 # only the part around the viewport
+    TILE_MARGIN = 512            # screen px rendered past each view edge
     LEGEND_FRACTION = 1.0 / 3.0  # max legend size relative to the window
     RULER_CORE = 0xFFFFFFFF      # plain white solid ruler, no casing
                                  # (matches floe)
@@ -856,10 +859,18 @@ class Viewer(object):
         self.browser_box.pack_start(self.browser_status, False, False, 0)
         self.browser_box.set_no_show_all(True)
 
+        # The scroller holds a canvas the size of the rendered image; the
+        # Gtk.Image on it shows the rendered pixels (a tile, see
+        # update_tile).  Centered when smaller than the viewport.
         self.image = Gtk.Image()
+        self.canvas = Gtk.Fixed()
+        self.canvas.set_halign(Gtk.Align.CENTER)
+        self.canvas.set_valign(Gtk.Align.CENTER)
+        self.canvas.put(self.image, 0, 0)
+        self.tile = None  # (pixbuf, rendered size, (x, y, w, h) shown)
         self.scroll = Gtk.ScrolledWindow()
         self.scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        self.scroll.add(self.image)
+        self.scroll.add(self.canvas)
         self.scroll.add_events(Gdk.EventMask.SCROLL_MASK |
                                Gdk.EventMask.SMOOTH_SCROLL_MASK |
                                Gdk.EventMask.BUTTON_PRESS_MASK |
@@ -876,7 +887,7 @@ class Viewer(object):
         self.drag_origin = None
         self.drag_panned = False
         self.rescale_pending = None
-        self.image.connect("size-allocate", self.on_image_allocate)
+        self.canvas.connect("size-allocate", self.on_image_allocate)
 
         # Ruler: points live in world coordinates so they stay
         # anchored to the picture across zooming and scrolling.  The line
@@ -1046,8 +1057,7 @@ class Viewer(object):
 
         for adj in (self.scroll.get_hadjustment(),
                     self.scroll.get_vadjustment()):
-            adj.connect("value-changed",
-                        lambda *a: self.update_view_overlays())
+            adj.connect("value-changed", self.on_view_moved)
 
         # Legend: optional second image, or a text-defined swatch table,
         # overlaid at the bottom-right corner.
@@ -1277,6 +1287,7 @@ class Viewer(object):
         self.view_scale = levels[0]["ppu"]
         self.pending_center = None
         self.rendered_size = None
+        self.tile = None
         self.set_ruler_active(False)
         self.clear_annotations()
         self.load_annotations()  # may restore this file's saved ppu/unit
@@ -1309,6 +1320,8 @@ class Viewer(object):
         if self.pixbuf is not None:
             self.rescale()
         else:
+            self.canvas.set_size_request(-1, -1)  # sized by the animation
+            self.canvas.move(self.image, 0, 0)
             self.image.set_from_animation(self.animation)
             self.scale_shown = 1.0
             self.update_title()
@@ -1867,12 +1880,98 @@ class Viewer(object):
             return
         self.rendered_size = (width, height)
         self.scale_shown = scale
-        if (width, height) == (img_w, img_h):
-            self.image.set_from_pixbuf(self.pixbuf)
-        else:
-            self.image.set_from_pixbuf(self.pixbuf.scale_simple(
-                width, height, GdkPixbuf.InterpType.BILINEAR))
+        self.canvas.set_size_request(width, height)
+        self.update_tile(force=True)
         self.update_title()
+        self.update_view_overlays()
+
+    def update_tile(self, force=False):
+        """Put the rendered pixels on the canvas.  Up to TILE_WHOLE_MAX
+        the whole image is one piece; a larger rendering is cut to the
+        viewport plus TILE_MARGIN around it, re-cut once scrolling
+        leaves it.  So zooming into a large image never allocates the
+        whole scaled picture: a 16-megapixel image at 200% would take a
+        64-megapixel buffer plus GTK's copy of it."""
+        if self.pixbuf is None or self.rendered_size is None:
+            return
+        rend_w, rend_h = self.rendered_size
+        if rend_w * rend_h <= self.TILE_WHOLE_MAX:
+            need = want = (0, 0, rend_w, rend_h)
+        else:
+            need = self.visible_rect()
+            m = self.TILE_MARGIN
+            x0, y0 = max(0, need[0] - m), max(0, need[1] - m)
+            want = (x0, y0,
+                    min(rend_w, need[0] + need[2] + m) - x0,
+                    min(rend_h, need[1] + need[3] + m) - y0)
+        tile = self.tile
+        if not force and tile is not None and tile[0] is self.pixbuf \
+                and tile[1] == self.rendered_size:
+            x, y, w, h = tile[2]
+            if x <= need[0] and y <= need[1] \
+                    and need[0] + need[2] <= x + w \
+                    and need[1] + need[3] <= y + h:
+                return
+        x, y, w, h = want
+        img_w, img_h = self.pixbuf.get_width(), self.pixbuf.get_height()
+        if (rend_w, rend_h) == (img_w, img_h):
+            piece = self.pixbuf if (w, h) == (img_w, img_h) \
+                else self.pixbuf.new_subpixbuf(x, y, w, h)
+        elif (w, h) == (rend_w, rend_h):
+            piece = self.pixbuf.scale_simple(
+                w, h, GdkPixbuf.InterpType.BILINEAR)
+        else:
+            # The same pixels scale_simple() would give for this part.
+            piece = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB,
+                                         self.pixbuf.get_has_alpha(), 8,
+                                         w, h)
+            if piece is not None:
+                self.pixbuf.scale(piece, 0, 0, w, h, -x, -y,
+                                  float(rend_w) / img_w,
+                                  float(rend_h) / img_h,
+                                  GdkPixbuf.InterpType.BILINEAR)
+        if piece is None:  # allocation failed
+            self.tile = None
+            self.image.clear()
+            self.show_toast("Not enough memory to draw %dx%d pixels"
+                            % (w, h))
+            return
+        self.tile = (self.pixbuf, self.rendered_size, want)
+        self.canvas.move(self.image, x, y)
+        self.image.set_from_pixbuf(piece)
+
+    def visible_rect(self):
+        """(x, y, w, h) of the rendered image the viewport shows - or
+        will show once a pending re-center lands.  The scroller's full
+        allocation stands in for the page, so scrollbars never make it
+        come out short."""
+        rend_w, rend_h = self.rendered_size
+        view = self.scroll.get_allocation()
+        if self.pending_center is not None:
+            px = self.px_from_world(self.pending_center)
+            left = px[0] * self.scale_shown - view.width / 2.0
+            top = px[1] * self.scale_shown - view.height / 2.0
+        else:
+            origin = self.image_origin()
+            left = self.scroll.get_hadjustment().get_value() - origin[0]
+            top = self.scroll.get_vadjustment().get_value() - origin[1]
+        x = int(min(max(left, 0), max(rend_w - view.width, 0)))
+        y = int(min(max(top, 0), max(rend_h - view.height, 0)))
+        return (x, y, min(view.width, rend_w - x),
+                min(view.height, rend_h - y))
+
+    def image_origin(self, alloc=None):
+        """The rendered image's top-left in the scrolled (canvas parent)
+        coordinates: the canvas sits centered while it is smaller than
+        the viewport."""
+        if alloc is None:
+            alloc = self.canvas.get_allocation()
+        rend_w, rend_h = self.rendered_size
+        return (alloc.x + max(0, (alloc.width - rend_w) // 2),
+                alloc.y + max(0, (alloc.height - rend_h) // 2))
+
+    def on_view_moved(self, adjustment):
+        self.update_tile()
         self.update_view_overlays()
 
     def active_level(self):
@@ -1978,14 +2077,11 @@ class Viewer(object):
     def viewport_center_world(self):
         if self.rendered_size is None:
             return None
-        alloc = self.image.get_allocation()
-        rend_w, rend_h = self.rendered_size
+        origin = self.image_origin()
         hadj = self.scroll.get_hadjustment()
         vadj = self.scroll.get_vadjustment()
-        x = hadj.get_value() + hadj.get_page_size() / 2.0 \
-            - max(0, (alloc.width - rend_w) // 2)
-        y = vadj.get_value() + vadj.get_page_size() / 2.0 \
-            - max(0, (alloc.height - rend_h) // 2)
+        x = hadj.get_value() + hadj.get_page_size() / 2.0 - origin[0]
+        y = vadj.get_value() + vadj.get_page_size() / 2.0 - origin[1]
         return self.world_from_px((x / self.scale_shown,
                                    y / self.scale_shown))
 
@@ -1994,23 +2090,20 @@ class Viewer(object):
             return
         center = self.pending_center
         self.pending_center = None
-        if alloc is None:
-            alloc = self.image.get_allocation()
+        origin = self.image_origin(alloc)
         px = self.px_from_world(center)
-        rend_w, rend_h = self.rendered_size
         hadj = self.scroll.get_hadjustment()
         vadj = self.scroll.get_vadjustment()
-        hadj.set_value(max(0, (alloc.width - rend_w) // 2)
-                       + px[0] * self.scale_shown
+        hadj.set_value(origin[0] + px[0] * self.scale_shown
                        - hadj.get_page_size() / 2.0)
-        vadj.set_value(max(0, (alloc.height - rend_h) // 2)
-                       + px[1] * self.scale_shown
+        vadj.set_value(origin[1] + px[1] * self.scale_shown
                        - vadj.get_page_size() / 2.0)
 
     def on_image_allocate(self, widget, allocation):
         # Fires after a rescaled/swapped pixbuf got its new allocation and
         # the scroll adjustments were refreshed; safe to re-center now.
         self.apply_pending_center(allocation)
+        self.update_tile()
 
     @staticmethod
     def shorten_path(path):
@@ -2502,7 +2595,7 @@ class Viewer(object):
 
     def event_to_image_px(self, event):
         """Map a pointer event to image-pixel coordinates (clamped)."""
-        win = self.image.get_window()
+        win = self.canvas.get_window()
         if win is None or self.rendered_size is None:
             return None
         _, org_x, org_y = win.get_origin()
@@ -2511,13 +2604,9 @@ class Viewer(object):
 
     def win_to_image_px(self, x, y):
         """Image-window coordinates -> image pixels (clamped)."""
-        alloc = self.image.get_allocation()
-        x -= alloc.x
-        y -= alloc.y
-        # GtkImage centers the pixbuf inside its allocation.
-        rend_w, rend_h = self.rendered_size
-        x -= max(0, (alloc.width - rend_w) // 2)
-        y -= max(0, (alloc.height - rend_h) // 2)
+        origin = self.image_origin()
+        x -= origin[0]
+        y -= origin[1]
         img_w, img_h = self.image_size()
         return (min(max(x / self.scale_shown, 0.0), img_w),
                 min(max(y / self.scale_shown, 0.0), img_h))
@@ -2526,7 +2615,7 @@ class Viewer(object):
         """Current pointer position (image px) and modifier mask, read
         directly off the device: pressing/releasing a key generates no
         motion event, so snapping needs the position without one."""
-        win = self.image.get_window()
+        win = self.canvas.get_window()
         if win is None or self.rendered_size is None:
             return None
         display = self.window.get_display()
@@ -2810,12 +2899,9 @@ class Viewer(object):
         self.snap_marker.show()
 
     def image_px_to_widget(self, point):
-        alloc = self.image.get_allocation()
-        rend_w, rend_h = self.rendered_size
-        return (max(0, (alloc.width - rend_w) // 2) +
-                point[0] * self.scale_shown,
-                max(0, (alloc.height - rend_h) // 2) +
-                point[1] * self.scale_shown)
+        origin = self.image_origin()
+        return (origin[0] + point[0] * self.scale_shown,
+                origin[1] + point[1] * self.scale_shown)
 
     def image_px_to_view(self, point):
         """Image pixels -> coordinates inside the visible viewport."""
@@ -3225,7 +3311,7 @@ class Viewer(object):
         # change the overlays are drawn once against the STALE allocation,
         # and without it the corrected layout pass would hit the cache and
         # leave annotations displaced.
-        img_alloc = self.image.get_allocation()
+        img_alloc = self.canvas.get_allocation()
         key = (self.anno_rev, self.anno_line_color, self.anno_line_width,
                self.anno_line_dash, self.anno_casing, self.anno_outline,
                self.anno_fill, self.anno_fill_color, self.anno_fill_alpha,
@@ -3236,7 +3322,7 @@ class Viewer(object):
                self.scroll.get_vadjustment().get_value(),
                self.scale_shown, self.level_index, self.rendered_size,
                self.ppu, self.unit,  # the ruler readouts convert with them
-               img_alloc.width, img_alloc.height,
+               img_alloc.x, img_alloc.y, img_alloc.width, img_alloc.height,
                view.width, view.height)
         if key == self.anno_drawn:
             return  # also breaks the redraw->allocate->redraw cycle
@@ -5866,6 +5952,7 @@ class Viewer(object):
     def on_size_allocate(self, widget, allocation):
         if self.fit_mode:
             self.rescale(allocation)
+        self.update_tile()  # a larger window shows more of the image
         self.update_view_overlays()
 
     def request_quit(self):
