@@ -1413,6 +1413,44 @@ def _pattern_rows(token):
     return [int(hexs[i * 4:i * 4 + 4], 16) for i in range(16)]
 
 
+def _ellipse_dabs(cx, cy, rx, ry, buf_w, buf_h, margin, dash, on, period):
+    """Viewer.ellipse_dabs: dab centers ~1px apart along an ellipse
+    outline near the buffer, dashed by arc length; past 8000 samples
+    the perimeter goes in 64-sample blocks, each starting its dash count
+    at the sum of the block chords before it."""
+    steps = max(int(6.4 * max(rx, ry)), 16)
+    block = steps if steps <= 8000 else 64
+    points = []
+    base = 0.0
+    for lo in range(0, steps, block):
+        hi = min(lo + block, steps)
+        t0, t1 = 2 * math.pi * lo / steps, 2 * math.pi * hi / steps
+        ax, ay = cx + rx * math.cos(t0), cy + ry * math.sin(t0)
+        bx, by = cx + rx * math.cos(t1), cy + ry * math.sin(t1)
+        chord = math.hypot(bx - ax, by - ay)
+        pad = chord + margin
+        if block < steps and (
+                max(ax, bx) < -pad or min(ax, bx) > buf_w + pad
+                or max(ay, by) < -pad or min(ay, by) > buf_h + pad):
+            base += chord
+            continue
+        cum = base
+        prev = None
+        for i in range(lo, hi):
+            x = cx + rx * math.cos(2 * math.pi * i / steps)
+            y = cy + ry * math.sin(2 * math.pi * i / steps)
+            if prev is not None:
+                cum += math.hypot(x - prev[0], y - prev[1])
+            prev = (x, y)
+            if dash and cum % period >= on:
+                continue
+            if -margin <= x <= buf_w + margin \
+                    and -margin <= y <= buf_h + margin:
+                points.append((x, y))
+        base += chord
+    return points
+
+
 class _Painter(object):
     """flateyes' stamp_annotation and helpers, ported onto a _Layer in
     image pixels.  s=1 reproduces the viewer at 100% zoom; s=2 draws
@@ -1611,28 +1649,14 @@ class _Painter(object):
                 layer.fill_rect(ecx - half, row, 2 * half, 1, fill)
         if not outline:
             return
-        steps = max(int(6.4 * max(rx, ry)), 16)
         if dash == 1:
             on, period = (3 * width + 3) * self.s, (5 * width + 6) * self.s
         elif dash == 2:
             on, period = self.s, (3 * width + 3) * self.s
         else:
             on = period = 1
-        margin = 3 * one + stroke_w
-        points = []
-        prev = None
-        cum = 0.0
-        for i in range(steps):
-            x = ecx + rx * math.cos(2 * math.pi * i / steps)
-            y = ecy + ry * math.sin(2 * math.pi * i / steps)
-            if prev is not None:
-                cum += math.hypot(x - prev[0], y - prev[1])
-            prev = (x, y)
-            if dash and cum % period >= on:
-                continue
-            if -margin <= x <= layer.width + margin \
-                    and -margin <= y <= layer.height + margin:
-                points.append((x, y))
+        points = _ellipse_dabs(ecx, ecy, rx, ry, layer.width, layer.height,
+                               3 * one + stroke_w, dash, on, period)
         off = stroke_w // 2 + one
         if casing is not None:
             for x, y in points:
@@ -4186,6 +4210,16 @@ def selftest():
             check("ruler labels placed like flateyes",
                   spots == theirs_spots and single
                   == stub.avoid_label_overlap(500, -10, 120, 22, [], view))
+            # ellipse outlines: small, and zoomed far past the view
+            ellipses = ((320.0, 240.0, 150.0, 90.0, 0, 1, 1),
+                        (300.0, 200.0, 40.0, 25.0, 1, 6, 11),
+                        (5000.0, 240.0, 4800.0, 3000.0, 0, 1, 1),
+                        (-900.0, 9000.0, 9500.0, 8800.0, 2, 1, 6))
+            check("ellipse outlines sampled like flateyes",
+                  all(_ellipse_dabs(ex, ey, erx, ery, 640, 480, 4, d, on, p)
+                      == flateyes.Viewer.ellipse_dabs(ex, ey, erx, ery,
+                                                      640, 480, 4, d, on, p)
+                      for ex, ey, erx, ery, d, on, p in ellipses))
         finally:
             try:
                 os.unlink(target)

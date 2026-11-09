@@ -38,7 +38,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.20.1"
+VERSION = "1.21.0"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -723,9 +723,15 @@ def write_png_metadata(path, text):
 
 
 class Viewer(object):
-    ZOOM_STEP = 1.25
+    ZOOM_STEP = 1.25             # zoom step below 100%
     ZOOM_MIN = 0.05
-    ZOOM_MAX = 2.0
+    ZOOM_MAX = 16.0              # 1600%: an image pixel = 16x16 screen px
+    # Enlargements only in whole multiples, so every image pixel is an
+    # equal square: the +/- (Ctrl+wheel) steps above 100%.
+    ZOOM_LADDER = (1, 2, 3, 4, 5, 6, 8, 10, 12, 16)
+    LEVEL_UPSCALE_MAX = 2.0      # stacks: stretch a level covering the
+                                 # whole view this far before a sharper
+                                 # level showing only part of it wins
     TILE_WHOLE_MAX = 1 << 23     # rendered px shown as one piece; above,
                                  # only the part around the viewport
     TILE_MARGIN = 512            # screen px rendered past each view edge
@@ -758,6 +764,7 @@ class Viewer(object):
     HELP_KEYS = (("+/-", "zoom"), ("0", "1:1"), ("f", "fit"),
                  ("Enter", "full"), (",/.", "file"), ("b", "browse"),
                  ("drag", "pan"), ("Ctrl+wheel", "zoom"),
+                 ("right-drag", "zoom box"),
                  ("r", "ruler"), ("d", "draw"), ("t", "text"),
                  ("n", "note"), ("s", "select"), ("u/y", "undo/redo"),
                  ("Ctrl+C", "copy"), ("Ctrl+Shift+C", "path"),
@@ -886,6 +893,9 @@ class Viewer(object):
         self.scroll.connect("size-allocate", self.on_size_allocate)
         self.drag_origin = None
         self.drag_panned = False
+        # Right-drag zooms: viewport points where it began / is now.
+        self.zoom_drag = self.zoom_end = None
+        self.zoom_center = None     # world point the next zoom centers on
         self.rescale_pending = None
         self.canvas.connect("size-allocate", self.on_image_allocate)
 
@@ -913,11 +923,12 @@ class Viewer(object):
         self.snap_last = None       # (level, px point) hysteresis holds
         self.snap_cache = None      # (query key, result) of the last snap
         self.snap_marker = Gtk.Image()
+        self.zoom_box = Gtk.Image()  # rubber band of a right-drag zoom
         # Stack hint: outline of the area the next magnification covers.
         self.hint_drawn = None
         self.hint_image = Gtk.Image()
         for widget in (self.ruler_line, self.ruler_label, self.hint_image,
-                       self.snap_marker):
+                       self.snap_marker, self.zoom_box):
             widget.set_halign(Gtk.Align.START)
             widget.set_valign(Gtk.Align.START)
             widget.set_no_show_all(True)
@@ -1106,6 +1117,7 @@ class Viewer(object):
         self.overlay.add_overlay(self.ruler_line)
         self.overlay.add_overlay(self.ruler_label)
         self.overlay.add_overlay(self.snap_marker)
+        self.overlay.add_overlay(self.zoom_box)
         self.overlay.add_overlay(self.help_label)
         self.overlay.add_overlay(self.status_label)
         self.overlay.add_overlay(self.path_label)
@@ -1113,8 +1125,8 @@ class Viewer(object):
         self.overlay.add_overlay(self.toast_label)
         for child in (self.legend_frame, self.hint_image, self.anno_image,
                       self.ruler_line, self.ruler_label, self.snap_marker,
-                      self.help_label, self.status_label, self.path_label,
-                      self.note_scroll, self.toast_label):
+                      self.zoom_box, self.help_label, self.status_label,
+                      self.path_label, self.note_scroll, self.toast_label):
             try:
                 # Let clicks/wheel over the overlays fall through to the image.
                 self.overlay.set_overlay_pass_through(child, True)
@@ -1874,6 +1886,8 @@ class Viewer(object):
         else:
             scale = self.view_scale / self.active_level()["ppu"]
             scale = max(self.ZOOM_MIN, min(scale, self.ZOOM_MAX))
+            if scale > 1:  # a box zoom or a stack level switch lands
+                scale = self.ladder_floor(scale)  # between the rungs
         width = max(1, int(round(img_w * scale)))
         height = max(1, int(round(img_h * scale)))
         if (width, height) == self.rendered_size:
@@ -1891,7 +1905,9 @@ class Viewer(object):
         viewport plus TILE_MARGIN around it, re-cut once scrolling
         leaves it.  So zooming into a large image never allocates the
         whole scaled picture: a 16-megapixel image at 200% would take a
-        64-megapixel buffer plus GTK's copy of it."""
+        64-megapixel buffer plus GTK's copy of it.  Enlarged pixels are
+        drawn as plain squares (nearest neighbour, no blending) so every
+        image pixel can be read exactly; reductions are smoothed."""
         if self.pixbuf is None or self.rendered_size is None:
             return
         rend_w, rend_h = self.rendered_size
@@ -1914,12 +1930,13 @@ class Viewer(object):
                 return
         x, y, w, h = want
         img_w, img_h = self.pixbuf.get_width(), self.pixbuf.get_height()
+        interp = GdkPixbuf.InterpType.NEAREST if rend_w > img_w \
+            else GdkPixbuf.InterpType.BILINEAR
         if (rend_w, rend_h) == (img_w, img_h):
             piece = self.pixbuf if (w, h) == (img_w, img_h) \
                 else self.pixbuf.new_subpixbuf(x, y, w, h)
         elif (w, h) == (rend_w, rend_h):
-            piece = self.pixbuf.scale_simple(
-                w, h, GdkPixbuf.InterpType.BILINEAR)
+            piece = self.pixbuf.scale_simple(w, h, interp)
         else:
             # The same pixels scale_simple() would give for this part.
             piece = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB,
@@ -1928,8 +1945,7 @@ class Viewer(object):
             if piece is not None:
                 self.pixbuf.scale(piece, 0, 0, w, h, -x, -y,
                                   float(rend_w) / img_w,
-                                  float(rend_h) / img_h,
-                                  GdkPixbuf.InterpType.BILINEAR)
+                                  float(rend_h) / img_h, interp)
         if piece is None:  # allocation failed
             self.tile = None
             self.image.clear()
@@ -1983,9 +1999,40 @@ class Viewer(object):
             return self.view_scale
         return self.scale_shown * self.active_level()["ppu"]
 
-    def set_view_scale(self, value):
+    def ladder_floor(self, scale):
+        """The highest ZOOM_LADDER rung not above scale (>= 1)."""
+        scale *= 1 + 1e-9  # 2.9999999 after a ppu round trip is 3
+        return float(max(z for z in self.ZOOM_LADDER if z <= scale))
+
+    def ladder_above(self, scale):
+        """The lowest ZOOM_LADDER rung above scale (the top one at most)."""
+        return float(min([z for z in self.ZOOM_LADDER if z > scale + 1e-6]
+                         or [self.ZOOM_LADDER[-1]]))
+
+    def zoom_step(self, direction):
+        """+/- and Ctrl+wheel: 1.25x steps below 100% (landing on 100%
+        exactly), ZOOM_LADDER rungs above.  Relative to the level shown,
+        so a stack level's pixels are the ones enlarged whole."""
+        ppu = self.active_level()["ppu"]
+        scale = self.current_view_scale() / ppu
+        eps = 1e-6
+        if direction > 0:
+            if scale < 1 - eps:
+                scale = min(scale * self.ZOOM_STEP, 1.0)
+            else:
+                scale = self.ladder_above(scale)
+        elif scale > 1 + eps:
+            scale = max(z for z in self.ZOOM_LADDER if z < scale - eps)
+        else:
+            scale /= self.ZOOM_STEP
+        self.set_view_scale(scale * ppu)
+
+    def set_view_scale(self, value, center=None):
+        """Zoom to value screen px per world unit, about the viewport
+        center or the given world point."""
         if self.pixbuf is None:
             return
+        self.zoom_center = center
         self.fit_mode = False
         self.view_scale = max(self.ZOOM_MIN * self.levels[0]["ppu"],
                               min(value,
@@ -2000,10 +2047,12 @@ class Viewer(object):
         self.rescale_pending = None
         if self.pixbuf is None:
             return False
+        center, self.zoom_center = self.zoom_center, None
         if self.fit_mode:
             self.rescale()
             return False
-        center = self.viewport_center_world()
+        if center is None:
+            center = self.viewport_center_world()
         index = self.select_level(self.view_scale, center)
         if index != self.level_index:
             self.level_index = index
@@ -2046,8 +2095,9 @@ class Viewer(object):
             if self.levels[i]["ppu"] >= view_scale:
                 return i
         # No covering level is sharp enough.  Upscaling one beats showing
-        # a partial patch as long as it stays within the zoom ceiling.
-        if full and view_scale / self.levels[full[-1]]["ppu"] <= self.ZOOM_MAX:
+        # a partial patch as long as it stays within LEVEL_UPSCALE_MAX.
+        if full and view_scale / self.levels[full[-1]]["ppu"] \
+                <= self.LEVEL_UPSCALE_MAX:
             return full[-1]
         for i in partial:
             if self.levels[i]["ppu"] >= view_scale:
@@ -3087,6 +3137,51 @@ class Viewer(object):
         return ((a[0] + t0 * dx, a[1] + t0 * dy),
                 (a[0] + t1 * dx, a[1] + t1 * dy))
 
+    ELLIPSE_BLOCK = 64     # perimeter samples per visibility block
+
+    @classmethod
+    def ellipse_dabs(cls, cx, cy, rx, ry, buf_w, buf_h, margin, dash, on,
+                     period):
+        """Dab centers ~1px apart along an ellipse outline, those within
+        margin of the buffer; a dashed outline (dash != 0) keeps the
+        ones where the arc length mod period is under on.  Up to 8000
+        samples they are all walked; a bigger outline (zoomed in, far
+        larger than the view) goes in ELLIPSE_BLOCK-sample blocks and
+        only blocks near the buffer are sampled, each starting its dash
+        count at the sum of the block chords before it - fixed per
+        block, so the dashes hold still while panning."""
+        steps = max(int(6.4 * max(rx, ry)), 16)
+        block = steps if steps <= 8000 else cls.ELLIPSE_BLOCK
+        points = []
+        base = 0.0
+        for lo in range(0, steps, block):
+            hi = min(lo + block, steps)
+            t0, t1 = 2 * math.pi * lo / steps, 2 * math.pi * hi / steps
+            ax, ay = cx + rx * math.cos(t0), cy + ry * math.sin(t0)
+            bx, by = cx + rx * math.cos(t1), cy + ry * math.sin(t1)
+            chord = math.hypot(bx - ax, by - ay)
+            pad = chord + margin  # the arc strays less than its chord
+            if block < steps and (
+                    max(ax, bx) < -pad or min(ax, bx) > buf_w + pad
+                    or max(ay, by) < -pad or min(ay, by) > buf_h + pad):
+                base += chord
+                continue
+            cum = base
+            prev = None
+            for i in range(lo, hi):
+                x = cx + rx * math.cos(2 * math.pi * i / steps)
+                y = cy + ry * math.sin(2 * math.pi * i / steps)
+                if prev is not None:
+                    cum += math.hypot(x - prev[0], y - prev[1])
+                prev = (x, y)
+                if dash and cum % period >= on:
+                    continue
+                if -margin <= x <= buf_w + margin \
+                        and -margin <= y <= buf_h + margin:
+                    points.append((x, y))
+            base += chord
+        return points
+
     @classmethod
     def fill_polygon(cls, buf, pts, rgba):
         """Even-odd scanline fill of a polygon in view coordinates: one
@@ -3693,28 +3788,14 @@ class Viewer(object):
                 self.fill_rect(buf, cx - half, row, 2 * half, 1, fill_rgba)
         if not outline:
             return
-        steps = min(max(int(6.4 * max(rx, ry)), 16), 8000)
         if stroke_dash == 1:
             on, period = 3 * stroke_w + 3, 5 * stroke_w + 6
         elif stroke_dash == 2:
             on, period = 1, 3 * stroke_w + 3
         else:
             on = period = 1
-        margin = 3 + stroke_w
-        points = []
-        prev = None
-        cum = 0.0   # dash pattern runs along the arc length
-        for i in range(steps):
-            x = cx + rx * math.cos(2 * math.pi * i / steps)
-            y = cy + ry * math.sin(2 * math.pi * i / steps)
-            if prev is not None:
-                cum += math.hypot(x - prev[0], y - prev[1])
-            prev = (x, y)
-            if stroke_dash and cum % period >= on:
-                continue
-            if -margin <= x <= buf_w + margin \
-                    and -margin <= y <= buf_h + margin:
-                points.append((x, y))
+        points = self.ellipse_dabs(cx, cy, rx, ry, buf_w, buf_h,
+                                   3 + stroke_w, stroke_dash, on, period)
         off = stroke_w // 2 + 1
         if casing is not None:
             for x, y in points:
@@ -5382,7 +5463,7 @@ class Viewer(object):
         self.hint_image.show()
 
     def show_about(self, *args):
-        """About dialog: F1, Help menu or the right-click menu."""
+        """About dialog: F1 or the Help menu."""
         dialog = Gtk.AboutDialog(transient_for=self.window, modal=True)
         dialog.set_keep_above(True)  # stay over a fullscreen parent
         dialog.set_program_name(APP_TITLE)
@@ -5593,7 +5674,10 @@ class Viewer(object):
 
     SHORTCUTS = (
         ("Viewing", (
-            ("+ / -,  Ctrl+wheel", "zoom in / out"),
+            ("+ / -,  Ctrl+wheel", "zoom in / out  (above 100% in whole"
+                                   " steps: 2x 3x 4x 5x 6x 8x 10x 12x 16x)"),
+            ("right-drag", "zoom: down-right into the box, up-left out"
+                           " (the view shrinks into the box)"),
             ("0", "actual size (100%)"),
             ("f", "fit to window"),
             ("Enter / F11", "fullscreen (remote clients may swallow F11)"),
@@ -5897,19 +5981,6 @@ class Viewer(object):
         dialog.destroy()
         self.restore_focus()
 
-    def show_context_menu(self, event):
-        menu = Gtk.Menu()
-        item = Gtk.MenuItem(label="About %s" % APP_TITLE)
-        item.connect("activate", self.show_about)
-        menu.append(item)
-        menu.show_all()
-        self.context_menu = menu  # keep it referenced while it is up
-        try:
-            menu.popup_at_pointer(event)
-        except AttributeError:  # GTK < 3.22
-            menu.popup(None, None, None, None, event.button, event.time)
-        return True
-
     def ask_ppu(self):
         dialog = Gtk.Dialog(title="PPU", transient_for=self.window,
                             modal=True)
@@ -6058,7 +6129,9 @@ class Viewer(object):
             self.apply_help_visibility()
             self.update_mode_toast()
         elif key == "Escape":  # leaves selection/tool modes; quitting is "q"
-            if self.valid_selection() is not None:
+            if self.zoom_drag is not None:  # drop a right-drag zoom
+                self.end_zoom_drag()
+            elif self.valid_selection() is not None:
                 if self.anno_edit_anchor is not None:
                     self.anno_edit_anchor = None   # resize -> move mode
                     self.anno_rev += 1
@@ -6131,9 +6204,9 @@ class Viewer(object):
             else:
                 self.ask_ppu()
         elif key in ("plus", "equal", "KP_Add"):
-            self.set_view_scale(self.current_view_scale() * self.ZOOM_STEP)
+            self.zoom_step(1)
         elif key in ("minus", "underscore", "KP_Subtract"):
-            self.set_view_scale(self.current_view_scale() / self.ZOOM_STEP)
+            self.zoom_step(-1)
         elif key in ("0", "KP_0"):
             self.set_view_scale(self.active_level()["ppu"])
         elif key in ("f", "F"):
@@ -6207,17 +6280,15 @@ class Viewer(object):
             ok, _dx, dy = event.get_scroll_deltas()
             if ok and dy:
                 direction = 1 if dy < 0 else -1
-        if direction > 0:
-            self.set_view_scale(self.current_view_scale() * self.ZOOM_STEP)
-        elif direction < 0:
-            self.set_view_scale(self.current_view_scale() / self.ZOOM_STEP)
+        if direction:
+            self.zoom_step(direction)
         return True
 
     def tool_click(self, event):
         """True when the press/release places tool points.  Quartz (the
         mac dev environment) turns Ctrl+left-click into a button-3
         event; while measuring/drawing Ctrl is a modifier (direction
-        lock), so such an event is a click, not a context menu."""
+        lock), so such an event is a click, not a zoom drag."""
         return event.button == 1 or (
             event.button == 3
             and bool(event.state & Gdk.ModifierType.CONTROL_MASK)
@@ -6235,7 +6306,7 @@ class Viewer(object):
             return False
         if not self.tool_click(event):
             if event.button == 3:
-                return self.show_context_menu(event)
+                return self.start_zoom_drag(event)
             return False
         # Dragging pans in BOTH modes; the ruler places its point on the
         # release of a motionless click, so measuring and panning coexist.
@@ -6249,6 +6320,10 @@ class Viewer(object):
         return True
 
     def on_motion(self, widget, event):
+        if self.zoom_drag is not None:
+            self.zoom_end = self.event_to_view(event)
+            self.update_zoom_box()
+            return True
         if self.drag_origin is not None:
             x0, y0, h0, v0 = self.drag_origin
             if not self.drag_panned and \
@@ -6289,6 +6364,9 @@ class Viewer(object):
         return False
 
     def on_button_release(self, widget, event):
+        if event.button == 3 and self.zoom_drag is not None:
+            self.finish_zoom_drag(self.event_to_view(event))
+            return True
         if not self.tool_click(event) or self.drag_origin is None:
             return False
         self.drag_origin = None
@@ -6361,6 +6439,90 @@ class Viewer(object):
             self.update_anno_overlay()
             self.update_dirty()
         return True
+
+    def event_to_view(self, event):
+        """Pointer event -> viewport (overlay) coordinates."""
+        _, org_x, org_y = self.canvas.get_window().get_origin()
+        return (event.x_root - org_x
+                - self.scroll.get_hadjustment().get_value(),
+                event.y_root - org_y
+                - self.scroll.get_vadjustment().get_value())
+
+    def start_zoom_drag(self, event):
+        """Right button press: the start of a zoom box (finish_zoom_drag).
+        Works in every mode, so a measurement or drawing in progress can
+        zoom in on its next point."""
+        if self.pixbuf is None or self.rendered_size is None \
+                or self.drag_origin is not None \
+                or self.canvas.get_window() is None:
+            return True  # animations do not zoom; a pan is under way
+        self.zoom_drag = self.zoom_end = self.event_to_view(event)
+        self.set_viewport_cursor("crosshair")
+        return True
+
+    def update_zoom_box(self):
+        """Rubber band of the right-drag, clipped to the view: solid while
+        the drag zooms in (down-right), dashed while it zooms out."""
+        (x0, y0), (x1, y1) = self.zoom_drag, self.zoom_end
+        view = self.scroll.get_allocation()
+        left = int(round(max(min(x0, x1), 0)))
+        top = int(round(max(min(y0, y1), 0)))
+        right = int(round(min(max(x0, x1), view.width - 1)))
+        bottom = int(round(min(max(y0, y1), view.height - 1)))
+        if abs(x1 - x0) + abs(y1 - y0) <= self.DRAG_SLOP \
+                or right < left or bottom < top:
+            self.zoom_box.hide()
+            return
+        w, h = right - left + 3, bottom - top + 3  # 1px casing margin
+        buf = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, w, h)
+        buf.fill(0x00000000)
+        dash = 0 if (x1 - x0) + (y1 - y0) > 0 else 1
+        corners = ((1, 1), (w - 2, 1), (w - 2, h - 2), (1, h - 2))
+        edges = tuple(zip(corners, corners[1:] + corners[:1]))
+        for a, b in edges:  # all casing first, as for drawn boxes
+            self.stamp_segment(buf, a, b, self.ANNO_CASING, None, 1, dash)
+        for a, b in edges:
+            self.stamp_segment(buf, a, b, None, self.RULER_CORE, 1, dash)
+        self.zoom_box.set_from_pixbuf(buf)
+        self.zoom_box.set_margin_start(max(0, left - 1))
+        self.zoom_box.set_margin_top(max(0, top - 1))
+        self.zoom_box.show()
+
+    def end_zoom_drag(self):
+        self.zoom_drag = self.zoom_end = None
+        self.zoom_box.hide()
+        self.set_viewport_cursor(self.tool_cursor())
+
+    def finish_zoom_drag(self, end):
+        """Right button release.  Dragged down-right, the box is zoomed
+        to fill the view; up-left, the whole view shrinks into the box
+        (the reverse of zooming in with that box).  Above 100% both land
+        on a ZOOM_LADDER rung.  The box center becomes the view center.
+        A click without a drag does nothing."""
+        (x0, y0), (x1, y1) = self.zoom_drag, end
+        self.end_zoom_drag()
+        dx, dy = x1 - x0, y1 - y0
+        if abs(dx) + abs(dy) <= self.DRAG_SLOP or self.rendered_size is None:
+            return
+        hadj = self.scroll.get_hadjustment()
+        vadj = self.scroll.get_vadjustment()
+        fit = min(hadj.get_page_size() / max(abs(dx), 1.0),
+                  vadj.get_page_size() / max(abs(dy), 1.0))
+        origin = self.image_origin()
+        center = self.world_from_px(
+            (((x0 + x1) / 2.0 + hadj.get_value() - origin[0])
+             / self.scale_shown,
+             ((y0 + y1) / 2.0 + vadj.get_value() - origin[1])
+             / self.scale_shown))
+        ppu = self.active_level()["ppu"]
+        current = self.current_view_scale() / ppu
+        target = current * (fit if dx + dy > 0 else 1.0 / fit)
+        # Above 100% the rendering rounds down to a ZOOM_LADDER rung, which
+        # keeps the whole box in view; a zoom in still climbs one rung.
+        if current < target and 1 < target \
+                and self.ladder_floor(target) <= current + 1e-6:
+            target = self.ladder_above(current)
+        self.set_view_scale(target * ppu, center)
 
     def tool_cursor(self):
         """Cursor for the active tool, or None for the default pointer."""
@@ -6604,11 +6766,14 @@ def usage(stream):
         "                            legend is an array of the definition\n"
         "                            lines -l takes\n"
         "\n"
-        "keys: +/- zoom, 0 actual size, f fit, Enter/F11 fullscreen,\n"
+        "keys: +/- zoom (whole multiples above 100%%), 0 actual size,\n"
+        "      f fit, Enter/F11 fullscreen,\n"
         "      ,/. next/prev image in the folder,\n"
         "      b thumbnail browser: one folder's subfolders and images\n"
         "        (Enter opens, BackSpace goes up, Esc returns),\n"
-        "      Ctrl+wheel zoom, drag to pan, o next-level outline,\n"
+        "      Ctrl+wheel zoom, drag to pan, right-drag zoom box\n"
+        "        (down-right zooms into the box, up-left out),\n"
+        "      o next-level outline,\n"
         "      i legend and note overlays on/off,\n"
         "      ? key help, status/path readouts and the level outline\n"
         "        on/off,\n"
@@ -6650,7 +6815,7 @@ def usage(stream):
         "             embedded into a PNG image itself, to a .fe\n"
         "             sidecar file for other formats; browsing to\n"
         "             another image with unsaved changes asks first,\n"
-        "      F1/right-click About,\n"
+        "      F1 About,\n"
         "      q quit - with unsaved annotations (the title shows\n"
         "        *name) a dialog asks to save/discard/cancel first\n"
         % (APP, APP, APP,
