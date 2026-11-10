@@ -130,7 +130,7 @@ LEGEND_FILE이 이미지면 그대로 표시하고, 이미지가 아니면 **텍
   내장된 범례를 지우려면 `fe_embed.py --strip`(메타데이터 전체 삭제) 또는 새 범례로 덮어쓴다.
 - 캡처 서비스는 `fe_embed.py --legend FILE`이나 JSON 문서의 `legend` 배열로 캡처 시점에 심을 수 있다 (아래 fe_embed.py 절 참고).
 - 범례를 이미지 자체에 그려 넣으려면 `fe_embed.py --export`(이미지 오른쪽을 넓힌 패널에 표시) 또는 `--export-legend`(범례만 별도 PNG)를 쓴다 ([내보내기](#주석을-그려-넣은-이미지로-내보내기---export) 참고).
-- `i` 키로 노트·상태(배율/해상도/PPU)·경로 표시와 함께 숨기거나 다시 표시할 수 있다 (상단 키 안내는 `?`로 따로 토글, 기본 숨김).
+- `i` 키로 노트·다음 레벨 외곽선과 함께 숨기거나 다시 표시할 수 있다 (상단 키 안내와 하단 상태·경로 표시는 `?`로 따로 토글).
 - 범례는 그려진 주석(박스 등)보다 위에 표시되어 가려지지 않는다 (진행 중인 ruler 측정선은 범례 위에 보인다).
 - 텍스트 범례의 항목이 많아 창 높이의 60%를 넘으면 그 높이에서 잘리고 세로 스크롤바가 생긴다.
 - 라벨이 길어도 범례의 가로 폭은 고정 상한(약 24자)을 넘지 않는다 — 넘치는 라벨은 `…`으로
@@ -673,7 +673,7 @@ sudo -u tduser DISPLAY=:1 XAUTHORITY=/home/tduser/.Xauthority \
 |---|---|
 | File | Open... (`Ctrl+O`, 파일 선택 대화상자 — `.tds`는 스택으로 열림), Thumbnail Browser (`b`), Parent Folder (`BackSpace`, 브라우저에서), Previous/Next Image (`,` `.`), Save Annotations (`Ctrl+S`), Quit (`q`) |
 | Edit | Undo/Redo (`u` `y`), Select Next/Previous Annotation (`s` `Shift+S`), Edit Selection (`e`), Delete Selection (`Delete`), Copy View (`Ctrl+C`), Copy Path (`Ctrl+Shift+C`) |
-| View | Zoom In/Out (`+` `-`), Actual Size (`0`), Fit to Window (`f`), Fullscreen (`F11`/`Enter`), Info Overlays (`i`), Key Help Strip (`?`), All Overlays (`Tab`), Highlight Shapes (`h`), Next/Previous Level (`]` `[`), Level Outline (`o`) |
+| View | Zoom In/Out (`+` `-`), Actual Size (`0`), Fit to Window (`f`), Fullscreen (`F11`/`Enter`), Legend and Note (`i`), Key Help and Readouts (`?`), All Overlays (`Tab`), Highlight Shapes (`h`), Next/Previous Level (`]` `[`), Level Outline (`o`) |
 | Annotate | Ruler (`r`), Ruler Edge Snap (`m`), Draw Shape... (`d`), Text (`t`), Note... (`n`), Set PPU... (`p`) |
 | Help | Keyboard Shortcuts... (키·마우스 조작 전체 목록), Open Source Licenses... (뷰어가 사용하는 오픈소스 구성 요소와 라이선스 — 이 호스트에서 찾은 라이선스 전문을 함께 표시: 시스템 패키지의 `/usr/share/licenses`·`/usr/share/doc`, 포터블 번들의 `licenses/`), About (`F1`) |
 
@@ -681,8 +681,8 @@ sudo -u tduser DISPLAY=:1 XAUTHORITY=/home/tduser/.Xauthority \
 
 좌하단에 배율·해상도·PPU(스택은 레벨 포함) 상태가, 우하단에 파일 전체 경로가
 표시된다 (매우 긴 경로는 중간 생략, 마우스를 올리면 툴팁으로 전체 표시) —
-legend·노트와 함께 `i`로 숨김/복원한다. 창 상단의 키 안내는 `?`로 켜고 끈다
-(기본 숨김).
+창 상단의 키 안내와 함께 `?`로 숨김/복원한다 (기본 표시). legend·노트는
+`i`로 따로 숨긴다.
 
 같은 키의 Shift 조합은 동일하게 동작한다 (`+`/`=`, `-`/`_`, `?`/`/`, `,`/`<`,
 `.`/`>`). 키보드가 **한글 입력 상태여도 단축키는 그대로 동작한다** — 자판이
@@ -700,9 +700,9 @@ legend·노트와 함께 `i`로 숨김/복원한다. 창 상단의 키 안내는
 | `Ctrl+O` | 파일 선택 대화상자로 이미지(또는 `.tds` 스택 manifest) 열기 — 브라우저 화면에서도 동작 |
 | `,` / `.` | 같은 폴더의 이전/다음 이미지 열기 (이름 자연 정렬 순서, 끝에서 순환. 스택 모드에서는 비활성) |
 | `b` | 썸네일 브라우저 — 현재 폴더의 하위 폴더와 이미지를 썸네일로 표시하고 탐색한다 (`Enter`/더블클릭 열기, `BackSpace`/`..` 상위 폴더, 상단 경로 표시줄의 폴더 클릭으로 임의 상위 폴더 바로 이동, `Esc`/`b` 복귀, 스택 모드에서는 비활성). 폴더를 인자로 실행하면 이 화면으로 시작한다. 이미지를 보는 중에는 `b`로 그 이미지가 선택된 브라우저로 되돌아간다 (`Esc`는 화면을 바꾸지 않는다) |
-| `i` | 정보 표시(우하단 legend·좌상단 노트·좌하단 배율/해상도/PPU 상태·우하단 경로·다음 레벨 외곽선) 숨김/복원 — `o` 개별 상태는 유지 |
-| `?` | 상단 키 안내 표시/숨김 (기본 숨김) |
-| `Tab` | 모든 표시(측정·주석 + 정보 + 키 안내 + 토스트) 숨김/복원 — 하나라도 보이면 전부 숨긴다. 숨긴 동안에는 알림 토스트도 뜨지 않는다. 다시 표시할 때 키 안내는 기본대로 꺼진 채 두며(`?`로 켬), 도구 시작 시 드로잉 표시는 자동 복원 |
+| `i` | 정보 표시(우하단 legend·좌상단 노트·다음 레벨 외곽선) 숨김/복원 — `o` 개별 상태는 유지 |
+| `?` | 상단 키 안내·좌하단 배율/해상도/PPU 상태·우하단 파일 경로 표시/숨김 (기본 표시) |
+| `Tab` | 모든 표시(측정·주석 + 정보 + 키 안내·상태·경로 + 토스트) 숨김/복원 — 하나라도 보이면 전부 숨기고, 다시 누르면 전부 표시한다. 숨긴 동안에는 알림 토스트도 뜨지 않는다. 도구 시작 시 드로잉 표시는 자동 복원 |
 | `o` | 다음 레벨 영역 외곽선 표시/숨김 (`i` 정보 표시를 끄면 함께 숨는다) |
 | `r` | ruler 측정 모드 시작/종료 (`Shift` 자유 방향, `Ctrl` 진행 중인 방향 고정 — 스냅 축 또는 자유 각도). `m`으로 엣지 스냅을 켜면 측정점이 주변의 가장 뚜렷한 밝기 경계로 서브픽셀 정밀도로 붙으며, 첫 점은 십자 마커로 스냅 위치를 미리 보여준다 (평탄한 영역에서는 동작 안 함) |
 | `m` | ruler 엣지 스냅 켜기/끄기 (기본 꺼짐) — 켠 상태는 뷰어를 닫을 때까지 유지된다 |

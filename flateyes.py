@@ -38,7 +38,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.21.0"
+VERSION = "1.22.0"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -770,7 +770,7 @@ class Viewer(object):
                  ("Ctrl+C", "copy"), ("Ctrl+Shift+C", "path"),
                  ("Ctrl+S", "save"), ("p", "PPU"),
                  ("o", "outline"), ("[/]", "level"),
-                 ("i", "info"), ("?", "help"),
+                 ("i", "legend/note"), ("?", "help/status"),
                  ("Tab", "overlays"), ("q", "quit"))
 
     def __init__(self, server_sock, first_path, first_legend=None,
@@ -795,12 +795,13 @@ class Viewer(object):
         self.level_index = 0
         self.view_scale = 1.0
         self.pending_center = None  # world point to re-center on after render
-        # Overlay visibility, two groups: "i" toggles the info overlays
-        # (help strip, legend, next-level outline), Tab the drawing
-        # overlays (ruler, annotations).  "o" keeps its own switch.
-        self.help_visible = False   # "?": the key-help strip alone
-        self.meta_visible = True    # "i": legend, note, readouts, path,
-                                    #      and the stack level outline
+        # Overlay visibility in three switches: "?" the key strip and the
+        # bottom readouts (zoom/size at the left, path at the right), "i"
+        # the image's own info (legend, note, next-level outline), Tab the
+        # drawing overlays (ruler, annotations) - or all of them at once.
+        # "o" keeps its own switch.
+        self.help_visible = True    # "?": key strip, readouts, path
+        self.meta_visible = True    # "i": legend, note, level outline
         self.draw_visible = True    # Tab
         self.hint_enabled = True    # "o"
         self.anno_highlight = False  # "h": emphasize the drawn shapes
@@ -2507,14 +2508,9 @@ class Viewer(object):
         return "  ".join(parts)
 
     def apply_help_visibility(self):
-        # "?" owns the key strip alone; "i" owns the readouts and path
-        self.help_label.set_visible(self.help_visible)
-        if self.meta_visible:
-            self.status_label.show()
-            self.path_label.show()
-        else:
-            self.status_label.hide()
-            self.path_label.hide()
+        # "?" owns the key strip and both bottom readouts; "i" the note
+        for widget in (self.help_label, self.status_label, self.path_label):
+            widget.set_visible(self.help_visible)
         self.update_note_overlay()
 
     def update_note_overlay(self):
@@ -5531,8 +5527,8 @@ class Viewer(object):
                 None,
                 ("F_ullscreen", "F11", self.is_fullscreen, None),
                 None,
-                ("I_nfo Overlays", "i", lambda: self.meta_visible, image),
-                ("_Key Help Strip", "question",
+                ("Legend and _Note", "i", lambda: self.meta_visible, image),
+                ("_Key Help and Readouts", "question",
                  lambda: self.help_visible, image),
                 ("A_ll Overlays", "Tab",
                  lambda: self.draw_visible or self.help_visible
@@ -5688,8 +5684,8 @@ class Viewer(object):
             ("Ctrl+O", "open an image or stack manifest"),
         )),
         ("Overlays", (
-            ("i", "info: legend, note, readouts, path, level outline"),
-            ("?", "key help strip"),
+            ("i", "legend, note, level outline"),
+            ("?", "key help strip, zoom/size readout, file path"),
             ("Tab", "every overlay on / off"),
             ("o", "next-level outline (stacks)"),
             ("h", "highlight the drawn shapes"),
@@ -6118,13 +6114,13 @@ class Viewer(object):
             return True
         if key in ("q", "Q"):
             self.request_quit()
-        elif key in ("i", "I"):  # legend, note, readouts, path, outline
+        elif key in ("i", "I"):  # legend, note, level outline
             self.meta_visible = not self.meta_visible
-            self.apply_help_visibility()   # readouts + path (+ note)
+            self.update_note_overlay()
             self.apply_legend_visibility()
             self.update_hint_overlay()
             self.update_mode_toast()
-        elif key in ("question", "slash"):  # the key-help strip alone
+        elif key in ("question", "slash"):  # key strip, readouts, path
             self.help_visible = not self.help_visible
             self.apply_help_visibility()
             self.update_mode_toast()
@@ -6247,10 +6243,8 @@ class Viewer(object):
         elif key == "Tab":  # every overlay: drawings, info and the toast
             visible = self.draw_visible or self.help_visible \
                 or self.meta_visible
-            self.draw_visible = self.meta_visible = not visible
-            if visible:
-                self.help_visible = False  # hide-all hides the strip too;
-                # showing again leaves it to "?" (off is its default)
+            self.draw_visible = self.meta_visible = self.help_visible \
+                = not visible
             self.apply_help_visibility()
             self.apply_legend_visibility()
             self.update_view_overlays()
@@ -6774,10 +6768,10 @@ def usage(stream):
         "      Ctrl+wheel zoom, drag to pan, right-drag zoom box\n"
         "        (down-right zooms into the box, up-left out),\n"
         "      o next-level outline,\n"
-        "      i legend and note overlays on/off,\n"
-        "      ? key help, status/path readouts and the level outline\n"
-        "        on/off,\n"
-        "      Tab all overlays (drawings and info) on/off,\n"
+        "      i legend, note and level outline on/off,\n"
+        "      ? key help strip, zoom/size readout (bottom-left) and\n"
+        "        file path (bottom-right) on/off,\n"
+        "      Tab all overlays (drawings, info and readouts) on/off,\n"
         "      [/] stack level, p set PPU,\n"
         "      r ruler (Shift = free angle, Esc ends),\n"
         "      m edge snap for the ruler (off by default): the points\n"
