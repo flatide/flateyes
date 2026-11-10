@@ -38,7 +38,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 APP = "flateyes"        # lowercase: socket names, cache dir, CLI messages
 APP_TITLE = "FlatEyes"  # display name
-VERSION = "1.22.0"
+VERSION = "1.22.1"
 
 # GTK modules are imported lazily (only when this process becomes the window
 # owner) so the frequent "forward and exit" path stays fast.
@@ -2639,17 +2639,35 @@ class Viewer(object):
         self.update_view_overlays()
         self.update_mode_toast()
 
+    def view_window(self):
+        """The viewport's fixed GdkWindow (None before it is realized):
+        the reference for every pointer position.  The window the canvas
+        draws on scrolls inside it and so starts up to 65536 px outside
+        the toplevel, but X11 carries a window offset as INT16
+        (XTranslateCoordinates): past 32767 px of scrolling its
+        get_origin() comes back 65536 px off.  Hence the pointer is
+        located in this window and the scroll offset added by hand."""
+        viewport = self.scroll.get_child()
+        return None if viewport is None else viewport.get_view_window()
+
+    def scroll_offset(self):
+        """Where the canvas window sits inside view_window(), negated:
+        whole pixels, exactly as GtkViewport places it."""
+        return (int(self.scroll.get_hadjustment().get_value()),
+                int(self.scroll.get_vadjustment().get_value()))
+
     def event_to_image_px(self, event):
         """Map a pointer event to image-pixel coordinates (clamped)."""
-        win = self.canvas.get_window()
+        win = self.view_window()
         if win is None or self.rendered_size is None:
             return None
         _, org_x, org_y = win.get_origin()
-        return self.win_to_image_px(event.x_root - org_x,
-                                    event.y_root - org_y)
+        off_x, off_y = self.scroll_offset()
+        return self.win_to_image_px(event.x_root - org_x + off_x,
+                                    event.y_root - org_y + off_y)
 
     def win_to_image_px(self, x, y):
-        """Image-window coordinates -> image pixels (clamped)."""
+        """Canvas-window coordinates -> image pixels (clamped)."""
         origin = self.image_origin()
         x -= origin[0]
         y -= origin[1]
@@ -2661,7 +2679,7 @@ class Viewer(object):
         """Current pointer position (image px) and modifier mask, read
         directly off the device: pressing/releasing a key generates no
         motion event, so snapping needs the position without one."""
-        win = self.canvas.get_window()
+        win = self.view_window()
         if win is None or self.rendered_size is None:
             return None
         display = self.window.get_display()
@@ -2670,7 +2688,8 @@ class Viewer(object):
         except AttributeError:  # GTK < 3.20
             device = display.get_device_manager().get_client_pointer()
         _, x, y, state = win.get_device_position(device)
-        return self.win_to_image_px(x, y), state
+        off_x, off_y = self.scroll_offset()
+        return self.win_to_image_px(x + off_x, y + off_y), state
 
     def event_to_world(self, event):
         point = self.event_to_image_px(event)
@@ -6436,11 +6455,8 @@ class Viewer(object):
 
     def event_to_view(self, event):
         """Pointer event -> viewport (overlay) coordinates."""
-        _, org_x, org_y = self.canvas.get_window().get_origin()
-        return (event.x_root - org_x
-                - self.scroll.get_hadjustment().get_value(),
-                event.y_root - org_y
-                - self.scroll.get_vadjustment().get_value())
+        _, org_x, org_y = self.view_window().get_origin()
+        return (event.x_root - org_x, event.y_root - org_y)
 
     def start_zoom_drag(self, event):
         """Right button press: the start of a zoom box (finish_zoom_drag).
@@ -6448,7 +6464,7 @@ class Viewer(object):
         zoom in on its next point."""
         if self.pixbuf is None or self.rendered_size is None \
                 or self.drag_origin is not None \
-                or self.canvas.get_window() is None:
+                or self.view_window() is None:
             return True  # animations do not zoom; a pan is under way
         self.zoom_drag = self.zoom_end = self.event_to_view(event)
         self.set_viewport_cursor("crosshair")
@@ -6503,11 +6519,10 @@ class Viewer(object):
         fit = min(hadj.get_page_size() / max(abs(dx), 1.0),
                   vadj.get_page_size() / max(abs(dy), 1.0))
         origin = self.image_origin()
+        off_x, off_y = self.scroll_offset()
         center = self.world_from_px(
-            (((x0 + x1) / 2.0 + hadj.get_value() - origin[0])
-             / self.scale_shown,
-             ((y0 + y1) / 2.0 + vadj.get_value() - origin[1])
-             / self.scale_shown))
+            (((x0 + x1) / 2.0 + off_x - origin[0]) / self.scale_shown,
+             ((y0 + y1) / 2.0 + off_y - origin[1]) / self.scale_shown))
         ppu = self.active_level()["ppu"]
         current = self.current_view_scale() / ppu
         target = current * (fit if dx + dy > 0 else 1.0 / fit)
